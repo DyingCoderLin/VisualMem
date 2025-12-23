@@ -1,0 +1,258 @@
+/* theme.css - VisualMem 设计系统 */
+
+:root {
+  /* ---------- Color Palette (基于设计稿) ---------- */
+  /* 背景色 */
+  --bg-app: #121212;          /* 整个应用的最底层背景 */
+  --bg-panel: #1A1A1A;        /* 侧边栏、顶部栏、卡片的背景 */
+  --bg-panel-hover: #252525;  /* 卡片悬停时的背景 */
+  --bg-input: #2A2A2A;        /* 搜索框背景 */
+  --bg-scrollbar-track: #1a1a1a; /* 滚动条轨道背景 */
+  --bg-scrollbar-thumb: #333333; /* 滚动条滑块背景 */
+  
+  /* 强调色 (赛博黄) */
+  --accent-primary: #FFD700;  /* 核心高亮色：Logo，按钮，选中状态，边框 */
+  --accent-glow: rgba(255, 215, 0, 0.15); /* AI面板的辉光效果 */
+  
+  /* 文本色 */
+  --text-primary: #FFFFFF;    /* 主要文字 */
+  --text-secondary: #A0A0A0;  /* 次要文字、未选中状态 */
+  --text-accent: var(--accent-primary); /* 强调文字 */
+  --text-placeholder: #555555; /* 输入框占位符 */
+  
+  /* 边框色 */
+  --border-dim: #333333;      /* 分割线，普通边框 */
+  --border-accent: var(--accent-primary); /* 高亮边框 */
+  
+  /* ---------- Typography ---------- */
+  --font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-size-sm: 12px;
+  --font-size-base: 14px;
+  --font-size-lg: 16px;
+  --font-size-xl: 20px;
+  
+  /* ---------- Spacing & Radius ---------- */
+  --radius-sm: 8px;           /* 小组件圆角（如时间戳标签） */
+  --radius-md: 12px;          /* 标准组件圆角（如图片缩略图） */
+  --radius-lg: 16px;          /* 大容器圆角（如侧边栏、AI面板） */
+  
+  --spacing-xs: 4px;
+  --spacing-sm: 8px;
+  --spacing-md: 16px;
+  --spacing-lg: 24px;
+}
+
+/* 全局 Reset */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-family-base);
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+  user-select: none; 
+  overflow: hidden; /* 整个应用窗口不出现滚动条，滚动在内部容器 */
+}
+
+#root {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ---------- 核心组件样式 ---------- */
+
+/* 1. 侧边栏导航项 (Sidebar Nav Item) */
+.nav-item {
+  display: flex;
+  align-items: center;
+  padding: var(--spacing-sm) var(--spacing-md);
+  margin-bottom: var(--spacing-xs);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.nav-item:hover {
+  background-color: var(--bg-panel-hover);
+  color: var(--text-primary);
+}
+
+/* 选中状态：黄色文字 + 黄色左侧边条 */
+.nav-item.active {
+  background-color: rgba(255, 215, 0, 0.05);
+  color: var(--text-accent);
+  border-left: 3px solid var(--accent-primary);
+  padding-left: calc(var(--spacing-md) - 3px);
+}
+
+/* 2. 顶部搜索框 (Top Search Bar) */
+.search-input {
+  width: 100%;
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  color: var(--text-primary);
+  font-size: var(--font-size-lg);
+  outline: none;
+  transition: border-color 0.2s ease;
+}
+
+.search-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.search-input::placeholder {
+  color: var(--text-placeholder);
+}
+
+/* 3. AI 提取结果面板 (AI Extraction Panel) - 核心亮点 */
+.ai-panel-glow {
+  background-color: var(--bg-panel);
+  border: 2px solid var(--accent-primary);
+  /* 关键：利用 box-shadow 实现辉光感 */
+  box-shadow: 0 0 20px var(--accent-glow) inset, 0 0 10px var(--accent-glow);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-lg);
+  margin-bottom: var(--spacing-lg);
+}
+
+/* 4. 水平滚动容器 (Horizontal Scroll Container) */
+.horizontal-scroll-list {
+  display: flex;
+  gap: var(--spacing-md); /* 图片之间的间距 */
+  overflow-x: auto;      /* 允许水平滚动 */
+  overflow-y: hidden;
+  padding-bottom: var(--spacing-sm); /* 为滚动条留出空间 */
+  scroll-behavior: smooth; /* 平滑滚动 */
+  /* 关键：防止图片被压缩 */
+  flex-wrap: nowrap;
+}
+
+/* 列表中的单个图片项容器 */
+.scroll-item {
+  flex: 0 0 auto; /* 不许伸缩，保持原始宽度 */
+  width: 200px;   /* 根据需要设定一个固定宽度 */
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.scroll-item img {
+  width: 100%;
+  height: auto;
+  border-radius: var(--radius-sm);
+  border: 2px solid transparent; /* 预留边框位置 */
+  transition: border-color 0.2s ease;
+  cursor: pointer;
+}
+
+/* 鼠标 hover 图片高亮 */
+.scroll-item img:hover {
+  border-color: rgba(255, 215, 0, 0.5);
+}
+
+.scroll-item.active img {
+  border-color: var(--accent-primary);
+}
+
+/* 历史记录中，默认图片稍微暗一点 */
+.history-feed .scroll-item img {
+  opacity: 0.7;
+  filter: grayscale(30%);
+}
+
+.history-feed .scroll-item img:hover {
+  opacity: 1;
+  filter: grayscale(0%);
+  border-color: var(--accent-primary);
+}
+
+/* 时间戳标签 */
+.timestamp-label {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-align: center;
+  padding: var(--spacing-xs);
+}
+
+/* ---------- 5. 自定义滚动条样式 (Webkit Scrollbar) ---------- */
+::-webkit-scrollbar {
+  width: 8px;  /* 纵向滚动条宽度 */
+  height: 8px; /* 横向滚动条高度 */
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-scrollbar-track);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--bg-scrollbar-thumb);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #555555;
+}
+
+/* AI 面板内的高亮滚动条 */
+.ai-panel-glow ::-webkit-scrollbar-thumb {
+  background: var(--accent-primary); /* 使用黄色滑块强调 */
+}
+
+/* 按钮样式 */
+.btn {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background-color: var(--bg-panel);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: var(--font-size-base);
+}
+
+.btn:hover {
+  background-color: var(--bg-panel-hover);
+  border-color: var(--border-accent);
+}
+
+.btn-primary {
+  background-color: var(--accent-primary);
+  color: var(--bg-app);
+  border-color: var(--accent-primary);
+}
+
+.btn-primary:hover {
+  background-color: #FFC700;
+}
+
+/* 切换按钮组 */
+.toggle-group {
+  display: flex;
+  gap: var(--spacing-xs);
+}
+
+.toggle-btn {
+  padding: var(--spacing-xs) var(--spacing-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background-color: var(--bg-input);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.2s ease;
+  font-size: var(--font-size-sm);
+}
+
+.toggle-btn.active {
+  background-color: var(--accent-primary);
+  color: var(--bg-app);
+  border-color: var(--accent-primary);
+}
+

@@ -1,0 +1,9 @@
+{
+    "editor.fontFamily":"Maple Mono NF CN, 'Sarasa Mono SC', 'Fira Code', Menlo, Monaco, 'Courier New', monospace",
+    "editor.fontLigatures":"'calt', 'ss01', 'ss02', 'ss04', 'cv01', 'cv02', 'cv03', 'cv04', 'cv11'",
+    "editor.fontSize":14,
+    "terminal.integrated.fontFamily": "Maple Mono NF CN",
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": []
+}

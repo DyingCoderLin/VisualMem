@@ -1,0 +1,9 @@
+/venv/*
+*.pyc
+logs/*.log
+*.db
+*.tnx
+/visualmem_storage/*
+*.lance
+*.log
+.env

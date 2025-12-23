@@ -1,0 +1,38 @@
+{
+  "name": "memory-os-pro",
+  "version": "1.0.0",
+  "description": "VisualMem Professional - Advanced Electron UI",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "dev:no-devtools": "OPEN_DEVTOOLS=false electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "start": "electron ."
+  },
+  "keywords": [
+    "electron",
+    "memory",
+    "visual-search"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.18",
+    "@vitejs/plugin-react": "^4.2.1",
+    "electron": "^28.0.0",
+    "electron-vite": "^2.0.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.8"
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.10.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
+    "react-window": "^1.8.10",
+    "react-window-infinite-loader": "^1.0.9"
+  }
+}
