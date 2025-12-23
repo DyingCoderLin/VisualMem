@@ -16,7 +16,7 @@ This guide will walk you through the installation and setup of VisualMem.
 
 ### 1. Clone the Repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/DyingCoderLin/VisualMem.git
 cd VLM-research
 ```
 
