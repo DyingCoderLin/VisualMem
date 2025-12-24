@@ -58,7 +58,7 @@ VisualMem 不仅仅是一个录屏工具，它是你的**第二大脑**：
 ## 📺 演示视频
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/6ecdb98d-ec7f-4eb5-9177-fb6d3e8976ac" width="800" controls></video>
+  <video src="https://github.com/user-attachments/assets/1150db7c-4c93-4ed4-9a3c-a2fcf86f29fe" width="800" controls></video>
 </p>
 
 ## �🚀 快速开始

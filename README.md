@@ -58,7 +58,7 @@ To achieve precise retrieval, we've built a sophisticated visual RAG pipeline:
 ## 📺 Demo Video
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/6ecdb98d-ec7f-4eb5-9177-fb6d3e8976ac" width="800" controls></video>
+  <video src="https://github.com/user-attachments/assets/1150db7c-4c93-4ed4-9a3c-a2fcf86f29fe" width="800" controls></video>
 </p>
 
 ## 🚀 Get Started
