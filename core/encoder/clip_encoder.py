@@ -45,7 +45,7 @@ class CLIPEncoder(MultiModalEncoderInterface):
         self.model_name = model_name
         self.device = device
         
-        logger.info(f"Loading CLIP model: {model_name}")
+        logger.info(f"Loading CLIP model: {model_name} (this may take a while if downloading for the first time)")
         logger.info(f"Using device: {self.device}")
         
         try:

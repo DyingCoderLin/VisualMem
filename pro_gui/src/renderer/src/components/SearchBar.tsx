@@ -160,6 +160,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
           >
             Image
           </button>
+          {/* 
           <button
             className={`toggle-btn ${searchType === 'text' ? 'active' : ''}`}
             onClick={() => setSearchType('text')}
@@ -167,6 +168,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
           >
             Text
           </button>
+          */}
         </div>
 
         {/* 日期选择器已注释，保留以便后续使用 */}

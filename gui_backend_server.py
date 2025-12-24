@@ -35,6 +35,7 @@ from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
 from core.retrieval.reranker import Reranker
 from core.understand.api_vlm import ApiVLM
 from core.ocr import create_ocr_engine
+from utils.model_utils import ensure_model_downloaded
 
 
 logger = setup_logger("gui_backend_server")
@@ -99,12 +100,13 @@ def _format_size(bytes_size: int) -> str:
 
 
 def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
-    """确保 datetime 对象具有 UTC 时区信息"""
+    """确保 datetime 对象具有 UTC 时区信息，如果是 naive 则视为本地时间并转换"""
     if dt is None:
         return None
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt
+        # 如果没有时区信息，认为是本地时间，转换为 UTC
+        return dt.astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 # ============ 全局单例组件 ============
@@ -265,6 +267,13 @@ def _init_all_components():
     logger.info("=" * 60)
     logger.info("Initializing all backend components (startup preload)...")
     logger.info("=" * 60)
+
+    # 0. Pre-flight check: Ensure models are downloaded
+    # This provides better UX by explicitly showing download progress
+    ensure_model_downloaded(config.CLIP_MODEL, "CLIP Encoder")
+    
+    if config.ENABLE_RERANK:
+        ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
     
     # 1. Load CLIP encoder (embedding model)
     logger.info("[1/7] Loading CLIP encoder...")

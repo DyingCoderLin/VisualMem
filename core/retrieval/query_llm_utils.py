@@ -118,8 +118,8 @@ def rewrite_and_time(
         return dense_queries, sparse_queries, time_range
 
     prompt = _build_combined_prompt(expand_n, enable_rewrite, enable_time)
-    # 添加 /no_think 后缀以禁用思考过程（如果模型支持）
-    user_content = f"{query}, current time for reference: {datetime.now(timezone.utc).isoformat()} /no_think"
+    # Use local time for reference so LLM can correctly interpret relative time (e.g., "today")
+    user_content = f"{query}, current time for reference: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} /no_think"
     print(f"user_content: {user_content}")
     messages = [
         {"role": "system", "content": prompt},
@@ -175,6 +175,13 @@ def rewrite_and_time(
                                 try:
                                     start = datetime.fromisoformat(start_str.replace(" ", "T") if "T" not in start_str else start_str)
                                     end = datetime.fromisoformat(end_str.replace(" ", "T") if "T" not in end_str else end_str)
+                                    
+                                    # Convert local time to UTC (assuming LLM returns local time)
+                                    if start.tzinfo is None:
+                                        start = start.astimezone(timezone.utc)
+                                    if end.tzinfo is None:
+                                        end = end.astimezone(timezone.utc)
+                                        
                                     if start > end:
                                         start, end = end, start
                                     time_range = (start, end)
@@ -243,13 +250,18 @@ def extract_time_range(text: str) -> Optional[Tuple[datetime, datetime]]:
     # 处理"null"的情况    
     if text == "null":
         return None
-    pattern = r"(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}(?::\\d{2})?)"
+    pattern = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)"
     matches = re.findall(pattern, text)
     if len(matches) >= 2:
         try:
             start = datetime.fromisoformat(matches[0])
             end = datetime.fromisoformat(matches[1])
-            print(f"extracted time range: {start} - {end}")
+            
+            # Convert to UTC (if naive, assumes local time; if aware, converts to UTC)
+            start = start.astimezone(timezone.utc)
+            end = end.astimezone(timezone.utc)
+                
+            print(f"extracted time range (UTC): {start} - {end}")
             if start > end:
                 start, end = end, start
             return start, end

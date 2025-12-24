@@ -41,7 +41,7 @@ def _load_rerank_model():
             from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
             
             model_name = config.RERANK_MODEL or "Qwen/Qwen3-VL-2B-Instruct"
-            logger.info(f"Loading rerank model: {model_name}")
+            logger.info(f"Loading rerank model: {model_name} (this may take a while if downloading for the first time)")
             
             try:
                 import flash_attn  # noqa: F401

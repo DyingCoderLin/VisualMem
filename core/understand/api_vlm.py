@@ -5,7 +5,7 @@ from io import BytesIO
 import requests
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from PIL.Image import Image
 from .base_vlm import AbstractVLM
@@ -94,13 +94,28 @@ class ApiVLM(AbstractVLM):
             # 1. 如果有时间戳，先插入时间戳文本
             if timestamps and idx < len(timestamps):
                 ts = timestamps[idx]
-                # 格式化时间戳为可读格式
-                ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
-                ts_text = f"Image {idx+1} Timestamp: {ts_str}"
-                content.append({
-                    "type": "text",
-                    "text": ts_text
-                })
+                
+                # 确保 ts 是 datetime 对象
+                if isinstance(ts, str):
+                    try:
+                        ts = datetime.fromisoformat(ts)
+                    except:
+                        pass
+                
+                if isinstance(ts, datetime):
+                    # 将存储的 UTC 时间转换为本地时间
+                    if ts.tzinfo is None:
+                        # 假设无时区信息的 datetime 是 UTC
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    local_ts = ts.astimezone()  # 自动转换为本地时区
+                    
+                    # 格式化时间戳为可读格式
+                    ts_str = local_ts.strftime("%Y-%m-%d %H:%M:%S")
+                    ts_text = f"Image {idx+1} Timestamp (Local Time): {ts_str}"
+                    content.append({
+                        "type": "text",
+                        "text": ts_text
+                    })
             
             # 2. 插入图片
             content.append({
@@ -203,6 +218,10 @@ class ApiVLM(AbstractVLM):
             
             if num_images is None:
                 num_images = len(images)
+            
+            # 为 Prompt 补充当前本地时间，方便 VLM 理解相对时间（如“刚才”、“昨天”）
+            local_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            prompt = f"Current Local Time: {local_now}\n\n{prompt}"
             
             # 记录开始时间
             start_time = time.time()

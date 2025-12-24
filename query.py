@@ -45,6 +45,7 @@ elif config.STORAGE_MODE == "vector":
 
 # 2. VLM - 用于最终理解
 from core.understand.api_vlm import ApiVLM
+from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
 vlm = ApiVLM()
 
 logger.info("All query modules loaded")
@@ -352,8 +353,47 @@ def search_and_understand(query: str, top_k: int = None) -> str:
                 top_k = 10
             
             print(f"\n🔍 使用Vector模式：向量检索 top {top_k}...")
-            query_embedding = encoder.encode_text(query)
-            frames = storage.search(query_embedding, top_k=top_k)
+            
+            dense_queries = [query]
+            time_range = None
+            if config.ENABLE_LLM_REWRITE or config.ENABLE_TIME_FILTER:
+                print(f"   正在重写查询并提取时间范围...")
+                dense_queries, _, time_range = rewrite_and_time(
+                    query,
+                    enable_rewrite=config.ENABLE_LLM_REWRITE,
+                    enable_time=config.ENABLE_TIME_FILTER,
+                    expand_n=config.QUERY_REWRITE_NUM,
+                )
+            
+            # 提取时间范围
+            start_time = None
+            end_time = None
+            if time_range:
+                start_time, end_time = time_range
+                print(f"   ⏰ 时间范围: {start_time} - {end_time}")
+
+            # 执行检索
+            frames = []
+            for q in dense_queries:
+                query_embedding = encoder.encode_text(q)
+                res = storage.search(
+                    query_embedding, 
+                    top_k=top_k,
+                    start_time=start_time,
+                    end_time=end_time
+                )
+                frames.extend(res)
+            
+            # 如果有多个查询，去重并重新排序
+            if len(dense_queries) > 1:
+                # 按相似度排序并去重
+                seen_ids = set()
+                unique_frames = []
+                for f in sorted(frames, key=lambda x: x.get('similarity', 0), reverse=True):
+                    if f['frame_id'] not in seen_ids:
+                        unique_frames.append(f)
+                        seen_ids.add(f['frame_id'])
+                frames = unique_frames[:top_k]
             
             if not frames:
                 return "未找到相关的屏幕记录。"
@@ -401,9 +441,14 @@ Please analyze these screenshots and focus on:
 
 IMPORTANT: Please respond in Chinese (中文回答)."""
         
-        # 调用VLM - 传递所有图片！
-        # 提取所有图片对象
-        all_images = [frame['image'] for frame in frames if frame.get('image') is not None]
+        # 调用VLM - 传递所有图片和时间戳
+        # 提取所有图片对象和对应的时间戳
+        all_images = []
+        all_timestamps = []
+        for frame in frames:
+            if frame.get('image') is not None:
+                all_images.append(frame['image'])
+                all_timestamps.append(frame.get('timestamp'))
         
         if not all_images:
             return "错误: 无法加载图片"
@@ -411,8 +456,13 @@ IMPORTANT: Please respond in Chinese (中文回答)."""
         logger.info(f"将发送 {len(all_images)} 张图片给VLM进行分析")
         
         # 调用VLM（这里是关键：VLM只在查询时调用！）
-        # 传递所有图片
-        response = vlm._call_vlm(prompt, all_images, num_images=len(all_images))
+        # 传递所有图片和时间戳
+        response = vlm._call_vlm(
+            prompt, 
+            all_images, 
+            num_images=len(all_images), 
+            image_timestamps=all_timestamps
+        )
         
         logger.info("VLM analysis completed")
         return response

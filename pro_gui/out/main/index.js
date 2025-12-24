@@ -26,6 +26,8 @@ const __dirname$1 = path.dirname(url.fileURLToPath(require("url").pathToFileURL(
 const isDev = process.env.NODE_ENV === "development" || !electron.app.isPackaged;
 let mainWindow = null;
 let pythonProcess = null;
+let isDownloading = false;
+let isStartingUp = true;
 const BACKEND_PORT = 8080;
 function setupIPC() {
   electron.ipcMain.handle("desktop-capturer-get-sources", async (_event, options) => {
@@ -148,16 +150,23 @@ function checkBackendHealth() {
   });
 }
 async function waitForBackend(maxRetries = 60, interval = 1e3) {
-  console.log("Waiting for backend to be ready...");
-  for (let i = 0; i < maxRetries; i++) {
+  console.log("\nWaiting for backend to be ready...");
+  let retries = 0;
+  while (retries < maxRetries || isDownloading) {
     const isReady = await checkBackendHealth();
     if (isReady) {
       console.log("✅ Backend is ready!");
       return true;
     }
-    if (i < maxRetries - 1) {
-      await new Promise((resolve2) => setTimeout(resolve2, interval));
+    if (isDownloading) ;
+    else {
+      retries++;
     }
+    if (pythonProcess && pythonProcess.exitCode !== null) {
+      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}`);
+      return false;
+    }
+    await new Promise((resolve2) => setTimeout(resolve2, interval));
   }
   console.error("❌ Backend failed to start within timeout");
   return false;
@@ -185,9 +194,51 @@ function startPythonBackend() {
         shell: process.platform === "win32"
       });
       if (pythonProcess.stdout) {
+        pythonProcess.stdout.on("data", (data) => {
+          const str = data.toString();
+          if (isStartingUp) {
+            process.stdout.write(data);
+          }
+          if (str.includes("Starting download")) {
+            if (!isDownloading) {
+              isDownloading = true;
+              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
+            }
+          }
+          if (str.includes("download complete!")) {
+            console.log("✅ A model download has finished!");
+          }
+          if (str.includes("[1/7] Loading CLIP encoder...")) {
+            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
+            isDownloading = false;
+          }
+          if (str.includes("All backend components initialized successfully!")) {
+            isStartingUp = false;
+          }
+        });
         pythonProcess.stdout.pipe(logStream);
       }
       if (pythonProcess.stderr) {
+        pythonProcess.stderr.on("data", (data) => {
+          const str = data.toString();
+          if (isStartingUp) {
+            process.stderr.write(data);
+          }
+          if (str.includes("Starting download")) {
+            if (!isDownloading) {
+              isDownloading = true;
+              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
+            }
+          }
+          if (str.includes("download complete!")) {
+            console.log("✅ A model download has finished!");
+          }
+          if (str.includes("[1/7] Loading CLIP encoder...")) {
+            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
+            isDownloading = false;
+            isStartingUp = false;
+          }
+        });
         pythonProcess.stderr.pipe(logStream);
       }
       pythonProcess.on("error", (error) => {

@@ -5,8 +5,8 @@
 """
 
 from pathlib import Path
-from datetime import datetime
-from typing import List, Dict
+from datetime import datetime, timezone
+from typing import List, Dict, Tuple
 import base64
 import io
 import requests
@@ -291,6 +291,12 @@ class QueryWorker(QObject):
         - GUI_MODE=remote : 通过 HTTP 调用 backend_server，由后端完成检索+RAG+rerank+VLM
         """
         try:
+            # Ensure start_time and end_time are UTC for database queries
+            if start_time and start_time.tzinfo is None:
+                start_time = start_time.astimezone(timezone.utc)
+            if end_time and end_time.tzinfo is None:
+                end_time = end_time.astimezone(timezone.utc)
+
             self.progress_signal.emit(f"🔍 RAG语义检索（时间范围: {start_time.strftime('%m/%d %H:%M')} - {end_time.strftime('%m/%d %H:%M')}）...")
             logger.info(f"RAG时间范围查询: '{query_text}' ({start_time} - {end_time})")
 
@@ -663,6 +669,12 @@ Please directly answer the user's question first, then provide supporting eviden
     def query_time_summary(self, start_time: datetime, end_time: datetime):
         """模式2: 时间段总结"""
         try:
+            # Ensure start_time and end_time are UTC for database queries
+            if start_time and start_time.tzinfo is None:
+                start_time = start_time.astimezone(timezone.utc)
+            if end_time and end_time.tzinfo is None:
+                end_time = end_time.astimezone(timezone.utc)
+
             self.progress_signal.emit(f"📅 正在加载 {start_time} 到 {end_time} 的截图...")
             logger.info(f"时间段总结: {start_time} - {end_time}")
             
@@ -771,14 +783,14 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
             # 直接使用 SQLite 获取历史截图
             
             # 获取当前和历史图片
-            images = self._get_realtime_images()
+            images, timestamps = self._get_realtime_images()
             
             if not images:
                 self.error_signal.emit("无法获取屏幕截图")
                 return
             
             # VLM分析
-            response = self._analyze_realtime_with_vlm(question, images)
+            response = self._analyze_realtime_with_vlm(question, images, timestamps)
             result = self._format_realtime_result(response, images)
             
             self.result_signal.emit(result)
@@ -787,16 +799,17 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
             logger.error(f"实时问答失败: {e}", exc_info=True)
             self.error_signal.emit(f"问答失败: {str(e)}")
     
-    def _get_realtime_images(self) -> List[PILImage.Image]:
-        """获取当前和历史图片"""
+    def _get_realtime_images(self) -> tuple[List[PILImage.Image], List[datetime]]:
+        """获取当前和历史图片及其时间戳"""
         # 1. 当前屏幕截图
         capturer = ScreenshotCapturer()
         current_frame = capturer.capture()
         
         if not current_frame:
-            return []
+            return [], []
         
         images = [current_frame.image]
+        timestamps = [current_frame.timestamp]
         
         # 2. 从 SQLite 获取最近5张截图（不依赖 storage 的 load_recent 方法）
         self.progress_signal.emit("📂 加载最近5张截图...")
@@ -811,14 +824,15 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
                     if image_path.exists():
                         image = PILImage.open(image_path)
                         images.append(image)
+                        timestamps.append(frame_meta['timestamp'])
                 except Exception as e:
                     logger.warning(f"加载历史截图失败: {e}")
         except Exception as e:
             logger.warning(f"从SQLite获取历史截图失败: {e}")
         
-        return images
+        return images, timestamps
     
-    def _analyze_realtime_with_vlm(self, question: str, images: List[PILImage.Image]) -> str:
+    def _analyze_realtime_with_vlm(self, question: str, images: List[PILImage.Image], timestamps: List[datetime]) -> str:
         """使用VLM分析实时问题"""
         self.progress_signal.emit(f"🤖 正在使用VLM分析 {len(images)} 张图片...")
         
@@ -834,6 +848,7 @@ The first image is the current screen, and the remaining images are recent histo
             prompt, 
             images, 
             num_images=len(images),
+            image_timestamps=timestamps,
             system_prompt=system_prompt
         )
     
@@ -849,6 +864,12 @@ The first image is the current screen, and the remaining images are recent histo
     def query_ocr_rag(self, query_text: str, start_time: datetime, end_time: datetime):
         """OCR 模式 RAG 查询 - 基于 OCR 文本 embedding 检索（使用 LanceDB Pre-filtering）"""
         try:
+            # Ensure start_time and end_time are UTC for database queries
+            if start_time and start_time.tzinfo is None:
+                start_time = start_time.astimezone(timezone.utc)
+            if end_time and end_time.tzinfo is None:
+                end_time = end_time.astimezone(timezone.utc)
+
             self.progress_signal.emit("📝 OCR模式: 正在检索相关文本...")
             logger.info(f"OCR RAG查询: '{query_text}' ({start_time} - {end_time})")
             
@@ -1001,7 +1022,12 @@ If relevant content is found, please explain in detail:
                 for frame in recent_frames:
                     ocr_text = frame.get('ocr_text', '')
                     if ocr_text:
-                        ts = frame['timestamp'].strftime('%H:%M:%S')
+                        # 将存储的 UTC 时间转换为本地时间
+                        ts_obj = frame['timestamp']
+                        if ts_obj.tzinfo is None:
+                            ts_obj = ts_obj.replace(tzinfo=timezone.utc)
+                        ts = ts_obj.astimezone().strftime('%H:%M:%S')
+                        
                         ocr_texts.append({
                             'time': ts,
                             'text': ocr_text[:500]  # 截断

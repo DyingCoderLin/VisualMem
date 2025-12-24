@@ -16,9 +16,9 @@ import sys
 import shutil
 import threading
 import asyncio
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import config
 from utils.logger import setup_logger
@@ -444,19 +444,20 @@ OCR Records (sorted by relevance):
     print(response)
 
 
-def _collect_realtime_images() -> List:
-    """Get current screenshot + last 5 historical screenshots"""
+def _collect_realtime_images() -> Tuple[List, List]:
+    """Get current screenshot + last 5 historical screenshots and their timestamps"""
     if not ScreenshotCapturer:
         print("Screenshot module unavailable, please check dependencies.")
-        return []
+        return [], []
     
     capturer = ScreenshotCapturer()
     current = capturer.capture()
     if not current:
         print("Unable to get current screen screenshot.")
-        return []
+        return [], []
     
     images = [current.image]
+    timestamps = [current.timestamp]
     try:
         sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
         recent = sqlite_storage.get_recent_frames(limit=5)
@@ -466,18 +467,19 @@ def _collect_realtime_images() -> List:
                 if path.exists():
                     from PIL import Image
                     images.append(Image.open(path))
+                    timestamps.append(frame_meta["timestamp"])
             except Exception as e:  # pragma: no cover - failure doesn't affect main flow
                 logger.warning(f"Failed to load historical screenshot: {e}")
     except Exception as e:
         logger.warning(f"Failed to read historical screenshots: {e}")
     
-    return images
+    return images, timestamps
 
 
 def _realtime_visual(query: str):
     """Real-time Q&A (Visual)"""
     print("Mode: Real-time Q&A (Visual)")
-    images = _collect_realtime_images()
+    images, timestamps = _collect_realtime_images()
     if not images:
         print("No images obtained, cannot perform real-time Q&A.")
         return
@@ -495,6 +497,7 @@ The first image is the current screen, and the remaining images are recent histo
         prompt, 
         images, 
         num_images=len(images),
+        image_timestamps=timestamps,
         system_prompt=system_prompt
     )
     print("\n=== Real-time Response ===")
@@ -529,7 +532,12 @@ def _realtime_ocr(query: str):
         for frame in recent:
             text = frame.get("ocr_text", "")
             if text:
-                ts = frame["timestamp"].strftime("%H:%M:%S")
+                # 将存储的 UTC 时间转换为本地时间
+                ts_obj = frame["timestamp"]
+                if ts_obj.tzinfo is None:
+                    ts_obj = ts_obj.replace(tzinfo=timezone.utc)
+                ts = ts_obj.astimezone().strftime("%H:%M:%S")
+                
                 ocr_texts.append({"time": ts, "text": text[:500]})
     except Exception as e:
         logger.warning(f"Failed to get historical OCR: {e}")
