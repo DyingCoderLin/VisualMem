@@ -31,9 +31,12 @@ cd VisualMem
 
 ### 2. Create and Activate Virtual Environment
 ```bash
+# Make sure the python version is 3.12
 python -m venv venv
 source venv/bin/activate  # macOS/Linux
 # or you can create by conda if you like
+conda create --name VisualMem python==3.12
+conda activate VisualMem
 ```
 
 ### 3. Install Python Dependencies
