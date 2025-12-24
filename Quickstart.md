@@ -2,6 +2,15 @@
 
 This guide will walk you through the installation and setup of VisualMem.
 
+> [!TIP]
+> **Just want to record, not search?**
+> 
+> If you only want to keep a record of your computer usage (recording feature) for now and don't need to perform searches.
+> 
+> You can **disable** `ENABLE_RERANK` and **skip** `Step 2(Start VLM Service)` and directly launch VisualMem. 
+> 
+> The system will still automatically handle screenshots, OCR, and vector indexing for future usage.
+
 ## 📋 Prerequisites
 
 - **Python**: 3.12
@@ -17,7 +26,7 @@ This guide will walk you through the installation and setup of VisualMem.
 ### 1. Clone the Repository
 ```bash
 git clone https://github.com/DyingCoderLin/VisualMem.git
-cd VLM-research
+cd VisualMem
 ```
 
 ### 2. Create and Activate Virtual Environment
@@ -80,6 +89,18 @@ VLM_API_URI=http://<server-ip-address>:8081  # VLM service address
 VLM_API_MODEL=Qwen/Qwen3-VL-8B-Instruct  # Your VLM Model name
 VLM_API_KEY=None # Set your API key if using cloud services
 ```
+
+### 3. Configure Query Rewrite (Optional)
+
+VisualMem uses an LLM to rewrite and expand your queries to improve search accuracy. This feature is **enabled by default** (`ENABLE_LLM_REWRITE=true`).
+
+- **Any LLM Works**: Since this step only processes text, you can use **any** OpenAI-compatible LLM (e.g., GPT-4o-mini, Qwen-Plus, DeepSeek-V3). It does **not** require a multimodal model.
+- **Independent Configuration**: By default, it uses the same API as your VLM. To use a different (e.g., cheaper or faster) model, add these to your `.env`:
+  ```ini
+  QUERY_REWRITE_API_KEY=your_api_key
+  QUERY_REWRITE_BASE_URL=https://api.openai.com
+  QUERY_REWRITE_MODEL=gpt-4o-mini
+  ```
 
 ## 🚀 Step 3: Launch VisualMem
 
