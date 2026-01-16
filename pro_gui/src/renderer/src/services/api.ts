@@ -156,24 +156,10 @@ class ApiClient {
     })
   }
 
-  async startRecording(): Promise<{ status: string }> {
-    // 开始录制
-    return this.request<{ status: string }>('/api/recording/start', {
-      method: 'POST'
-    })
-  }
-
   async stopRecording(): Promise<{ status: string }> {
-    // 停止录制
+    // 仅通知后端刷新缓冲区
     return this.request<{ status: string }>('/api/recording/stop', {
       method: 'POST'
-    })
-  }
-
-  async getRecordingStatus(): Promise<{ is_recording: boolean }> {
-    // 获取录制状态
-    return this.request<{ is_recording: boolean }>('/api/recording/status', {
-      method: 'GET'
     })
   }
 

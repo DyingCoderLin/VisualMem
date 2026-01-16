@@ -23,6 +23,7 @@ class RecordingService {
   private options: Required<RecordingOptions>
   private isRecording: boolean = false
   private frameCounter: number = 0 // 计数器：0-10，每成功发送 10 帧后刷新数据
+  private statusListeners: ((status: boolean) => void)[] = []
 
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
@@ -41,14 +42,38 @@ class RecordingService {
     const savedState = sessionStorage.getItem('vlm_is_recording')
     if (savedState === 'true') {
       console.log('[RecordingService] Restoring recording state from sessionStorage after refresh')
-      // 延迟启动，确保环境已就绪
+      // 立即设置内部状态
+      this.isRecording = true
+      // 延迟启动录制循环，确保环境已就绪
       setTimeout(() => {
-        this.start().catch(err => console.error('Failed to auto-resume recording:', err))
+        if (this.isRecording) {
+          this.startLoop().catch(err => {
+            console.error('Failed to auto-resume recording loop:', err)
+            this.isRecording = false
+            this.notifyStatusListeners()
+          })
+        }
       }, 1000)
     }
 
     // 异步从后端获取配置（不阻塞初始化）
     this.loadConfigFromBackend()
+  }
+
+  /**
+   * 状态监听
+   */
+  subscribeStatus(listener: (status: boolean) => void): () => void {
+    this.statusListeners.push(listener)
+    // 立即通知当前状态
+    listener(this.isRecording)
+    return () => {
+      this.statusListeners = this.statusListeners.filter(l => l !== listener)
+    }
+  }
+
+  private notifyStatusListeners(): void {
+    this.statusListeners.forEach(listener => listener(this.isRecording))
   }
 
   /**
@@ -349,6 +374,15 @@ class RecordingService {
 
     this.isRecording = true
     sessionStorage.setItem('vlm_is_recording', 'true')
+    this.notifyStatusListeners()
+    
+    await this.startLoop()
+  }
+
+  /**
+   * 启动录制循环
+   */
+  private async startLoop(): Promise<void> {
     this.lastImageDataArray = []
     this.frameCounter = 0 // 重置计数器
 
@@ -469,6 +503,7 @@ class RecordingService {
     // 立即设置停止标志
     this.isRecording = false
     sessionStorage.removeItem('vlm_is_recording')
+    this.notifyStatusListeners()
     
     // 清除定时器
     if (this.intervalId !== null) {

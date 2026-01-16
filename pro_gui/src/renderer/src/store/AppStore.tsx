@@ -95,66 +95,54 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     setTimelineRefreshTrigger(prev => prev + 1)
   }, [])
 
+  // 监听录制服务的状态变化
+  useEffect(() => {
+    const unsubscribe = recordingService.subscribeStatus((status) => {
+      setIsRecording(status)
+      if (status) {
+        // 如果录制开启，确保日期范围包含今天
+        const now = new Date()
+        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+        setDateRange(prev => ({
+          ...prev,
+          latest_date: today
+        }))
+        refreshTimeline()
+      } else {
+        refreshDateRange()
+      }
+    })
+    return unsubscribe
+  }, [refreshDateRange, refreshTimeline])
+
   // 开始录制
   const startRecording = useCallback(async () => {
     try {
       await recordingService.start()
-      setIsRecording(true)
-      
-      // 更新日期范围：将 latest_date 设置为今天（如果录制开始）
-      const now = new Date()
-      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-      setDateRange(prev => ({
-        ...prev,
-        latest_date: today
-      }))
-      
-      // 刷新时间轴，让新录制的帧显示出来
-      refreshTimeline()
-      
-      console.log('Recording started')
+      // setIsRecording 将通过 subscribeStatus 自动更新
     } catch (error) {
       console.error('Failed to start recording:', error)
-      setIsRecording(false)
     }
-  }, [refreshTimeline])
+  }, [])
 
   // 停止录制
   const stopRecording = useCallback(async () => {
-    recordingService.stop()
-    setIsRecording(false)
-    console.log('Recording stopped')
-    
-    // 停止后刷新日期范围和时间轴
-    await refreshDateRange()
-    refreshTimeline()
-  }, [refreshDateRange, refreshTimeline])
+    try {
+      await recordingService.stop()
+      // setIsRecording 将通过 subscribeStatus 自动更新
+    } catch (error) {
+      console.error('Failed to stop recording:', error)
+    }
+  }, [])
 
   // 初始化：获取日期范围
   useEffect(() => {
     refreshDateRange()
     
-    // 检查录制状态：不仅检查本地 service，还要检查后端
-    const checkStatus = async () => {
-      const status = recordingService.getStatus()
-      setIsRecording(status)
-      
-      // 如果本地认为没在录制，但实际上后端可能还在接收数据（或者前端刚刷新）
-      // 我们需要确保 recordingService 的状态与 UI 同步
-      // 注意：由于录制是在前端 RecordingService 维护的定时器，
-      // 如果前端刷新导致 RecordingService 实例重建，我们需要恢复它的定时器
-      if (status && !isRecording) {
-        console.log('Restoring recording state after UI refresh')
-        setIsRecording(true)
-      }
-    }
-    
-    checkStatus()
-    
     // 每30秒刷新一次日期范围
     const interval = setInterval(refreshDateRange, 30000)
     return () => clearInterval(interval)
-  }, [refreshDateRange, isRecording])
+  }, [refreshDateRange])
 
   // 监听录制服务的新帧事件（如果 recordingService 支持）
   useEffect(() => {

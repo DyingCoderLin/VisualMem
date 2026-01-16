@@ -810,9 +810,30 @@ class VisualMemMainWindow(QMainWindow):
         self._init_ui()
         self._setup_shortcuts()
         self._load_initial_stats()
+        self._setup_recording_sync()
         
         # 居中显示
         self._center_on_screen()
+
+    def _setup_recording_sync(self):
+        """定时同步录制线程状态与按钮显示，避免休眠/唤醒后状态不同步。"""
+        self._recording_sync_timer = QTimer(self)
+        self._recording_sync_timer.setInterval(1000)
+        self._recording_sync_timer.timeout.connect(self._sync_recording_state)
+        self._recording_sync_timer.start()
+
+    def _sync_recording_state(self):
+        """确保 UI 状态与实际录制线程状态一致。"""
+        thread_running = self.record_thread is not None and self.record_thread.isRunning()
+        worker_running = bool(self.record_worker and self.record_worker.running)
+        actual_recording = thread_running and worker_running
+
+        if actual_recording and not self.is_recording:
+            self.is_recording = True
+            self.record_btn.set_recording(True)
+        elif not actual_recording and self.is_recording:
+            self.is_recording = False
+            self.record_btn.set_recording(False)
     
     def _init_ui(self):
         """初始化 UI"""

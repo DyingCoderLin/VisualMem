@@ -1123,12 +1123,12 @@ def get_frames_by_date_range(req: GetFramesByDateRangeRequest):
 @app.post("/api/recording/stop")
 def stop_recording_api():
     """
-    停止录制并触发缓冲区刷新
+    停止录制信号：仅用于触发后端批量写入缓冲区的强制刷新
     """
     if batch_write_buffer is not None:
-        logger.info("收到停止录制请求，触发缓冲区强制刷新...")
+        logger.info("收到前端录制停止信号，强制刷新缓冲区...")
         batch_write_buffer._flush_buffer()
-    return {"status": "success", "message": "Recording stopped and buffer flushed"}
+    return {"status": "success", "message": "Buffer flushed"}
 
 
 if __name__ == "__main__":
