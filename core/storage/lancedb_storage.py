@@ -66,23 +66,22 @@ class LanceDBStorage:
             logger.info(f"Loaded existing table: {self.table_name}")
             
             # 检查维度是否匹配
-            # 获取表的第一行或者 schema
             table_schema = self.table.schema
             vector_field = table_schema.field("vector")
             existing_dim = vector_field.type.list_size
             
             if existing_dim != self.embedding_dim:
                 logger.warning(f"维度不匹配: 数据库维度 {existing_dim} vs 当前维度 {self.embedding_dim}")
-                # 注意：由于我们要“建立一个新的”，而已经在 config.py 中处理了路径区分
-                # 这里如果仍然不匹配，说明 db_path 指向了错误的数据库
-                # 我们抛出异常提醒用户
                 raise ValueError(f"LanceDB table dimension mismatch: {existing_dim} != {self.embedding_dim}. Please check your config or use a different path.")
                 
         except Exception as e:
-            if isinstance(e, ValueError):
+            # 如果是维度不匹配的 ValueError，仍然抛出
+            if isinstance(e, ValueError) and "dimension mismatch" in str(e):
                 raise e
+            
+            # 其他情况（如表不存在）则设为 None，等待首次插入时创建
             self.table = None
-            logger.info(f"Frames table will be created on first insert")
+            logger.info(f"Frames table not found or empty, will be created on first insert")
         
         # 加载 OCR 文本向量表
         try:

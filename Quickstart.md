@@ -60,7 +60,7 @@ If you have enough VRAM (8GB+), you can enable a second-stage reranker for bette
 # Enable a second-stage reranking using a multimodal model
 ENABLE_RERANK=true
 # Model used for reranking (e.g. a smaller VLM)
-RERANK_MODEL=Qwen/Qwen3-VL-2B-Instruct
+RERANK_MODEL=Qwen/Qwen3-VL-Reranker-2B
 ```
 
 ## 🧠 Step 2: Start VLM Service

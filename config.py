@@ -110,7 +110,7 @@ class Config:
     RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "10"))
     
     # Reranker model configuration (local mode)
-    RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-2B-Instruct")
+    RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-2B")
     
     # ============================================
     # Image Compression Configuration
