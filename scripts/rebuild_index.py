@@ -19,7 +19,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import config
-from core.encoder.clip_encoder import CLIPEncoder
+from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from utils.logger import setup_logger
 
@@ -188,9 +188,9 @@ def rebuild_index(
     print(f"✓ 找到 {len(image_files)} 张图片")
     
     # 步骤3：初始化编码器和存储
-    print(f"\n[3/4] 初始化 CLIP 编码器: {model_name}")
+    print(f"\n[3/4] 初始化编码器: {model_name}")
     try:
-        encoder = CLIPEncoder(model_name=model_name)
+        encoder = create_encoder(model_name=model_name)
         print(f"✓ 编码器加载成功（embedding 维度: {encoder.embedding_dim}）")
     except Exception as e:
         print(f"❌ 编码器加载失败: {e}")
@@ -350,8 +350,8 @@ def main():
     parser.add_argument(
         '--model',
         type=str,
-        default=config.CLIP_MODEL,
-        help=f'CLIP 模型名称（默认: {config.CLIP_MODEL}）'
+        default=config.EMBEDDING_MODEL,
+        help=f'CLIP 模型名称（默认: {config.EMBEDDING_MODEL}）'
     )
     
     parser.add_argument(

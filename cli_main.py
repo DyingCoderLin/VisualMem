@@ -30,6 +30,8 @@ from core.retrieval.query_llm_utils import (
     filter_by_time,
 )
 from core.retrieval.reranker import Reranker
+from core.encoder.qwen_encoder import QwenEncoder
+from core.encoder.clip_encoder import CLIPEncoder
 from core.storage.sqlite_storage import SQLiteStorage
 
 logger = setup_logger("cli_main")
@@ -41,10 +43,10 @@ except Exception:  # pragma: no cover - only executed when dependency is missing
     psutil = None
 
 try:
-    from core.encoder.clip_encoder import CLIPEncoder
+    from core.encoder import create_encoder
     from core.storage.lancedb_storage import LanceDBStorage
 except Exception:
-    CLIPEncoder = None  # type: ignore
+    create_encoder = None  # type: ignore
     LanceDBStorage = None  # type: ignore
 
 try:
@@ -63,7 +65,7 @@ _record_thread: Optional[threading.Thread] = None
 _record_lock = threading.Lock()
 
 # Vector retrieval components (lazy initialization, reused)
-_vector_encoder: Optional[CLIPEncoder] = None
+_vector_encoder: Optional[QwenEncoder] = None
 _vector_storage: Optional[LanceDBStorage] = None
 _vector_initialized = False
 
@@ -160,22 +162,22 @@ def _ensure_vector_components():
     """Ensure vector retrieval components are initialized (lazy loading, initialize only once)"""
     global _vector_encoder, _vector_storage, _vector_initialized
     
-    if not CLIPEncoder or not LanceDBStorage:
+    if not create_encoder or not LanceDBStorage:
         print("Vector retrieval dependencies not installed, please ensure transformers/torch/lancedb are available.")
         sys.exit(1)
     
     if _vector_initialized:
         return
     
-    print("\n\n🔄 Loading CLIP model... (first load is slow)")
-    _vector_encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
-    print("📦 Initializing LanceDB storage...")
+    print(f"\n\n🔄 Loading encoder model {config.EMBEDDING_MODEL}... (first load is slow)")
+    _vector_encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
+    print(f"📦 Initializing LanceDB storage at {config.LANCEDB_PATH}...")
     _vector_storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=_vector_encoder.embedding_dim
     )
     _vector_initialized = True
-    print("✅ CLIP model loaded")
+    print(f"✅ Encoder model {config.EMBEDDING_MODEL} loaded")
 
 
 def _vector_rag(query: str, top_k: int = None):

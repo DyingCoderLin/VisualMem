@@ -27,14 +27,14 @@ logger = setup_logger("rebuild_db")
 TARGET_ALL = ["sqlite", "lancedb", "textdb"]
 
 
-def _confirm(paths: dict, tasks: List[str], clip_model: str, clear_existing: bool) -> bool:
+def _confirm(paths: dict, tasks: List[str], embedding_model: str, clear_existing: bool) -> bool:
     """简单确认提示"""
     print("\n⚠️  即将重建数据库")
     print(f"  • 图片目录: {paths['image']}")
     print(f"  • LanceDB(frames): {paths['lancedb']}")
     print(f"  • TextDB: {paths['textdb']}")
     print(f"  • OCR SQLite: {paths['sqlite']}")
-    print(f"  • CLIP 模型: {clip_model}")
+    print(f"  • CLIP 模型: {embedding_model}")
     print(f"  • 清空现有数据: {clear_existing}")
     print(f"  • 目标任务: {tasks}")
     ans = input("\n确认继续？[y/N]: ").strip().lower()
@@ -78,7 +78,7 @@ def rebuild_db(
     lancedb_path: Optional[str] = None,
     textdb_path: Optional[str] = None,
     sqlite_path: Optional[str] = None,
-    clip_model: Optional[str] = None,
+    embedding_model: Optional[str] = None,
     image_batch_size: int = 32,
     ocr_batch_size: int = 100,
     min_text_length: int = 10,
@@ -86,7 +86,7 @@ def rebuild_db(
     clear_existing: bool = True,
     cleanup_interval: int = 50,
 ):
-    clip_model = clip_model or config.CLIP_MODEL
+    embedding_model = embedding_model or config.EMBEDDING_MODEL
     resolved_image, resolved_lancedb, resolved_textdb, resolved_sqlite = resolve_paths(
         benchmark_name, image_dir, lancedb_path, textdb_path, sqlite_path
     )
@@ -112,7 +112,7 @@ def rebuild_db(
             "sqlite": resolved_sqlite,
         },
         tasks,
-        clip_model,
+        embedding_model,
         clear_existing,
     )
     if not proceed:
@@ -140,7 +140,7 @@ def rebuild_db(
         rebuild_lancedb_index(
             image_dir=str(resolved_image),
             db_path=str(resolved_lancedb),
-            model_name=clip_model,
+            model_name=embedding_model,
             clear_existing=clear_existing,
             batch_size=image_batch_size,
             cleanup_interval=cleanup_interval,
@@ -152,7 +152,7 @@ def rebuild_db(
             sqlite_db_path=str(resolved_sqlite),
             lance_db_path=str(resolved_textdb),
             batch_size=ocr_batch_size,
-            clip_model=clip_model,
+            embedding_model=embedding_model,
             clear_existing=clear_existing,
             confirm=False,
         )
@@ -178,7 +178,7 @@ def main():
         "--clip-model",
         type=str,
         default=None,
-        help=f"CLIP 模型名称（默认: {config.CLIP_MODEL}）",
+        help=f"CLIP 模型名称（默认: {config.EMBEDDING_MODEL}）",
     )
     parser.add_argument("--image-batch", type=int, default=32, help="图像 embedding 批次大小")
     parser.add_argument("--ocr-batch", type=int, default=100, help="OCR 文本 embedding 批次大小")
@@ -213,7 +213,7 @@ def main():
         lancedb_path=args.lancedb_path,
         textdb_path=args.textdb_path,
         sqlite_path=args.sqlite_path,
-        clip_model=args.clip_model,
+        embedding_model=args.embedding_model,
         image_batch_size=args.image_batch,
         ocr_batch_size=args.ocr_batch,
         min_text_length=args.min_text_length,

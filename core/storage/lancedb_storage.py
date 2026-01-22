@@ -64,7 +64,23 @@ class LanceDBStorage:
         try:
             self.table = self.db.open_table(self.table_name)
             logger.info(f"Loaded existing table: {self.table_name}")
-        except Exception:
+            
+            # 检查维度是否匹配
+            # 获取表的第一行或者 schema
+            table_schema = self.table.schema
+            vector_field = table_schema.field("vector")
+            existing_dim = vector_field.type.list_size
+            
+            if existing_dim != self.embedding_dim:
+                logger.warning(f"维度不匹配: 数据库维度 {existing_dim} vs 当前维度 {self.embedding_dim}")
+                # 注意：由于我们要“建立一个新的”，而已经在 config.py 中处理了路径区分
+                # 这里如果仍然不匹配，说明 db_path 指向了错误的数据库
+                # 我们抛出异常提醒用户
+                raise ValueError(f"LanceDB table dimension mismatch: {existing_dim} != {self.embedding_dim}. Please check your config or use a different path.")
+                
+        except Exception as e:
+            if isinstance(e, ValueError):
+                raise e
             self.table = None
             logger.info(f"Frames table will be created on first insert")
         

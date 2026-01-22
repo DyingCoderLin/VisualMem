@@ -41,12 +41,15 @@ class SmartQuerySelector:
         # 初始化 LanceDB（如果是 vector 模式）
         if self.storage_mode == "vector":
             try:
-                from core.encoder.clip_encoder import CLIPEncoder
+                from core.encoder import create_encoder
                 from core.storage.lancedb_storage import LanceDBStorage
                 from core.retrieval.image_retriever import ImageRetriever
                 
-                self.encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
-                self.lancedb_storage = LanceDBStorage(db_path=config.LANCEDB_PATH)
+                self.encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
+                self.lancedb_storage = LanceDBStorage(
+                    db_path=config.LANCEDB_PATH,
+                    embedding_dim=self.encoder.embedding_dim
+                )
                 self.retriever = ImageRetriever(self.encoder, self.lancedb_storage)
                 self.lancedb_available = True
                 logger.info("LanceDB retriever initialized")

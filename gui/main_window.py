@@ -1022,7 +1022,7 @@ class VisualMemMainWindow(QMainWindow):
                 from core.storage.lancedb_storage import LanceDBStorage
                 # 根据模型名称推断 embedding_dim，避免加载 CLIP 模型
                 # 如果表已存在，LanceDBStorage 会正常加载（维度参数主要用于创建新表）
-                model_name = config.CLIP_MODEL.lower()
+                model_name = config.EMBEDDING_MODEL.lower()
                 if "siglip-large" in model_name or "siglip-base-patch16-384" in model_name:
                     embedding_dim = 1024
                 elif "siglip-base" in model_name:

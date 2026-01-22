@@ -108,19 +108,19 @@ class RecordWorker(QObject):
             self.storage = SimpleStorage(storage_path=config.IMAGE_STORAGE_PATH)
             self.encoder = None
         else:
-            # Vector模式: 预加载CLIP模型
-            self.init_progress_signal.emit("正在加载CLIP模型... (首次加载较慢，请稍候)")
-            from core.encoder.clip_encoder import CLIPEncoder
+            # Vector模式: 加载编码器模型
+            self.init_progress_signal.emit(f"正在加载编码器模型 {config.EMBEDDING_MODEL}... (首次加载较慢，请稍候)")
+            from core.encoder import create_encoder
             from core.storage.lancedb_storage import LanceDBStorage
             
-            self.encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+            self.encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
             
             # 预热模型
-            self.init_progress_signal.emit("正在预热CLIP模型...")
+            self.init_progress_signal.emit("正在预热编码器模型...")
             dummy_image = PILImage.fromarray(np.zeros((224, 224, 3), dtype=np.uint8))
             _ = self.encoder.encode_image(dummy_image)
             
-            self.init_progress_signal.emit("正在初始化LanceDB存储...")
+            self.init_progress_signal.emit(f"正在初始化LanceDB存储 ({config.LANCEDB_PATH})...")
             self.storage = LanceDBStorage(
                 db_path=config.LANCEDB_PATH,
                 embedding_dim=self.encoder.embedding_dim

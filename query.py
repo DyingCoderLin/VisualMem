@@ -33,12 +33,12 @@ if config.STORAGE_MODE == "simple":
     
 elif config.STORAGE_MODE == "vector":
     try:
-        from core.encoder.clip_encoder import CLIPEncoder
+        from core.encoder import create_encoder
         from core.storage.lancedb_storage import LanceDBStorage
         
-        encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+        encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
         storage = LanceDBStorage(db_path=config.LANCEDB_PATH, embedding_dim=encoder.embedding_dim)
-        logger.info("Vector mode components loaded")
+        logger.info(f"Vector mode components loaded (Model: {config.EMBEDDING_MODEL})")
     except ImportError as e:
         logger.error(f"Vector mode requires: pip install transformers torch lancedb")
         sys.exit(1)

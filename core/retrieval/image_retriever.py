@@ -10,7 +10,7 @@ from datetime import datetime
 from PIL import Image
 from pathlib import Path
 
-from core.encoder.clip_encoder import CLIPEncoder
+from core.encoder import MultiModalEncoderInterface
 from core.storage.lancedb_storage import LanceDBStorage
 from core.retrieval.base_retriever import MultiModalRetrieverInterface
 from utils.logger import setup_logger
@@ -20,11 +20,11 @@ logger = setup_logger(__name__)
 
 class ImageRetriever(MultiModalRetrieverInterface):
     """
-    多模态图像检索器：基于 CLIP + LanceDB 的 dense 向量搜索
+    多模态图像检索器：基于 CLIP/Qwen + LanceDB 的 dense 向量搜索
     
     特点：
     - 只使用 dense 向量搜索（去掉 hybrid/sparse/BM25）
-    - 使用 CLIP 进行图像和文本编码（图文对齐）
+    - 使用 CLIP/Qwen 进行图像和文本编码（图文对齐）
     - 使用 LanceDB 作为向量数据库
     - 支持文本查询图像、图像查询图像
     """
@@ -35,7 +35,7 @@ class ImageRetriever(MultiModalRetrieverInterface):
     
     def __init__(
         self,
-        encoder: CLIPEncoder,
+        encoder: MultiModalEncoderInterface,
         storage: LanceDBStorage,
         db_path: Optional[str] = None,
         table_name: Optional[str] = None,
