@@ -1,0 +1,34 @@
+[package]
+name = "screencap_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform screen and window capture with Python bindings"
+license = "MIT"
+
+[lib]
+name = "screencap_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Cross-platform window capture
+xcap = "0.0.14"
+
+# Python bindings (use 0.20 for stable API)
+pyo3 = { version = "0.20", features = ["extension-module"] }
+
+# Image handling
+image = "0.25"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+
+# Lazy static for skip lists
+once_cell = "1.19"
+
+[profile.release]
+opt-level = 3
+lto = true
