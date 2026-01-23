@@ -10,4 +10,4 @@ logs/*.log
 .DS_Store
 **/.DS_Store
 *.json
-/screencap_rs/target/*
+screencap_rs/target/*
