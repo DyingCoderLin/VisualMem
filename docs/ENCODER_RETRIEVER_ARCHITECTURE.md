@@ -246,7 +246,7 @@ from core.retrieval import create_text_retriever
 from config import config
 
 # 初始化 - 使用 CLIP 编码器
-encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+encoder = CLIPEncoder(model_name=config.EMBEDDING_MODEL)
 retriever = create_text_retriever(encoder=encoder)
 
 # Dense 检索（语义）

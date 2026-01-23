@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 os.chdir(Path(__file__).parent.parent)
 
 from config import config
-from core.encoder.clip_encoder import CLIPEncoder
+from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.retrieval.image_retriever import ImageRetriever
 from utils.logger import setup_logger
@@ -35,8 +35,8 @@ def example_1_text_to_image():
     print("="*60)
     
     # 1. 初始化组件
-    logger.info("初始化 CLIP 编码器和 LanceDB...")
-    encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+    logger.info("初始化编码器和 LanceDB...")
+    encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
     storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=encoder.embedding_dim
@@ -77,7 +77,7 @@ def example_2_image_to_image():
     print("="*60)
     
     # 初始化
-    encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+    encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
     storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=encoder.embedding_dim
@@ -112,7 +112,7 @@ def example_3_stats():
     print("示例3：检索器统计信息")
     print("="*60)
     
-    encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+    encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
     storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=encoder.embedding_dim

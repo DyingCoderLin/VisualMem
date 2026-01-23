@@ -60,11 +60,20 @@ class Config:
     # ============================================
     ENABLE_CLIP_ENCODER = os.environ.get("ENABLE_CLIP_ENCODER", "false").lower() == "true"
     # For multimodal RAG, we need image-text alignment, so must use CLIP/ALIGN series embedding models
-    CLIP_MODEL = os.environ.get("CLIP_MODEL", "google/siglip-large-patch16-384")
-    LANCEDB_PATH = os.environ.get(
-        "LANCEDB_PATH",
-        os.path.join(STORAGE_ROOT, "visualmem_lancedb"),
-    )
+    # Default is now Qwen3-VL-Embedding-2B
+    EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
+    
+    # LanceDB Path selection based on model
+    def _compute_lancedb_path():
+        storage_root = os.environ.get("STORAGE_ROOT", "./visualmem_storage")
+        model = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
+        
+        if "qwen" in model.lower():
+            return os.path.join(storage_root, "visualmem_qwen_lancedb")
+        else:
+            return os.path.join(storage_root, "visualmem_clip_lancedb")
+
+    LANCEDB_PATH = os.environ.get("LANCEDB_PATH", _compute_lancedb_path())
 
     # ============================================
     # Query Enhancement
@@ -101,7 +110,7 @@ class Config:
     RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "10"))
     
     # Reranker model configuration (local mode)
-    RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-2B-Instruct")
+    RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-2B")
     
     # ============================================
     # Image Compression Configuration

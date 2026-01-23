@@ -19,7 +19,8 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import config
-from core.encoder.clip_encoder import CLIPEncoder
+from core.encoder import create_encoder
+from core.ocr import create_ocr_engine
 from core.storage.lancedb_storage import LanceDBStorage
 from utils.logger import setup_logger
 
@@ -153,6 +154,7 @@ def rebuild_index(
     clear_existing: bool = True,
     batch_size: int = 32,
     cleanup_interval: int = 50,  # 每插入多少个批次后清理一次旧版本
+    rebuild_with_ocr: bool = False,
 ):
     """
     重建索引
@@ -163,9 +165,15 @@ def rebuild_index(
         model_name: CLIP 模型名称
         clear_existing: 是否清空现有数据库
         batch_size: 批处理大小
+        cleanup_interval: 清理间隔
+        rebuild_with_ocr: 是否进行 OCR 识别
     """
     print("\n" + "="*60)
     print("重建 LanceDB 索引")
+    if rebuild_with_ocr:
+        print("模式: 图像 Embedding + OCR 识别")
+    else:
+        print("模式: 仅图像 Embedding")
     print("="*60)
     
     # 步骤1：清空数据库
@@ -188,9 +196,9 @@ def rebuild_index(
     print(f"✓ 找到 {len(image_files)} 张图片")
     
     # 步骤3：初始化编码器和存储
-    print(f"\n[3/4] 初始化 CLIP 编码器: {model_name}")
+    print(f"\n[3/4] 初始化编码器: {model_name}")
     try:
-        encoder = CLIPEncoder(model_name=model_name)
+        encoder = create_encoder(model_name=model_name)
         print(f"✓ 编码器加载成功（embedding 维度: {encoder.embedding_dim}）")
     except Exception as e:
         print(f"❌ 编码器加载失败: {e}")
@@ -208,8 +216,19 @@ def rebuild_index(
         return False
     
     # 步骤4：批量编码和存储（支持小 batch，定期清理旧版本）
-    print(f"\n[4/4] 编码并存储图片（批次大小: {batch_size}，定期清理旧版本）...")
+    ocr_mode_str = " + OCR" if rebuild_with_ocr else ""
+    print(f"\n[4/4] 编码并存储图片{ocr_mode_str}（批次大小: {batch_size}，定期清理旧版本）...")
     
+    # 初始化 OCR 引擎（如果需要）
+    ocr_engine = None
+    if rebuild_with_ocr:
+        try:
+            ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE)
+            print(f"✓ OCR 引擎初始化成功: {config.OCR_ENGINE_TYPE}")
+        except Exception as e:
+            print(f"❌ OCR 引擎初始化失败: {e}")
+            return False
+            
     image_dir_path = Path(image_dir)
     success_count = 0
     error_count = 0
@@ -230,13 +249,22 @@ def rebuild_index(
             # 编码图片
             embedding = encoder.encode_image(image)
             
+            # 执行 OCR（如果启用）
+            ocr_text = ""
+            if ocr_engine:
+                try:
+                    ocr_result = ocr_engine.recognize(image)
+                    ocr_text = ocr_result.text
+                except Exception as e:
+                    logger.warning(f"OCR 识别失败 {image_path}: {e}")
+            
             # 累积到批量数据中
             batch_frames.append({
                 "frame_id": frame_id,
                 "timestamp": timestamp,
                 "image": image,
                 "embedding": embedding,
-                "ocr_text": "",  # 如果需要 OCR，可以在这里添加
+                "ocr_text": ocr_text,
                 "metadata": metadata
             })
             
@@ -350,8 +378,8 @@ def main():
     parser.add_argument(
         '--model',
         type=str,
-        default=config.CLIP_MODEL,
-        help=f'CLIP 模型名称（默认: {config.CLIP_MODEL}）'
+        default=config.EMBEDDING_MODEL,
+        help=f'CLIP 模型名称（默认: {config.EMBEDDING_MODEL}）'
     )
     
     parser.add_argument(
@@ -374,6 +402,12 @@ def main():
         help='每插入多少个批次后清理一次旧版本（默认: 50，设置为0禁用自动清理）'
     )
     
+    parser.add_argument(
+        '--rebuild-with-ocr',
+        action='store_true',
+        help='在重建索引时同时进行 OCR 识别并存入数据库（默认: False）'
+    )
+    
     args = parser.parse_args()
     
     # 确认操作
@@ -381,6 +415,8 @@ def main():
         print("\n⚠️  警告：此操作将清空现有数据库！")
         print(f"图片目录: {args.image_dir}")
         print(f"数据库路径: {args.db_path}")
+        if args.rebuild_with_ocr:
+            print(f"OCR 模式: 已开启")
         response = input("\n确认继续？[y/N]: ")
         if response.lower() not in ['y', 'yes']:
             print("操作已取消")
@@ -394,6 +430,7 @@ def main():
         clear_existing=not args.no_clear,
         batch_size=args.batch_size,
         cleanup_interval=args.cleanup_interval,
+        rebuild_with_ocr=args.rebuild_with_ocr,
     )
     
     if success:
