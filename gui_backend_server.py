@@ -28,7 +28,7 @@ from pathlib import Path
 
 from config import config
 from utils.logger import setup_logger
-from core.encoder.clip_encoder import CLIPEncoder
+from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.storage.sqlite_storage import SQLiteStorage
 from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
@@ -111,7 +111,7 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
 
 # ============ 全局单例组件 ============
 
-encoder: Optional[CLIPEncoder] = None
+encoder = None
 vector_storage: Optional[LanceDBStorage] = None
 sqlite_storage: Optional[SQLiteStorage] = None
 reranker: Optional[Reranker] = None
@@ -222,9 +222,9 @@ def _init_components():
     global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine
 
     if encoder is None:
-        logger.info("Loading CLIP encoder for gui_backend_server...")
-        encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
-        logger.info("CLIP encoder loaded.")
+        logger.info(f"Loading encoder {config.EMBEDDING_MODEL} for gui_backend_server...")
+        encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
+        logger.info(f"Encoder {config.EMBEDDING_MODEL} loaded.")
 
     if vector_storage is None:
         logger.info("Initializing LanceDB storage for gui_backend_server...")
@@ -270,14 +270,14 @@ def _init_all_components():
 
     # 0. Pre-flight check: Ensure models are downloaded
     # This provides better UX by explicitly showing download progress
-    ensure_model_downloaded(config.CLIP_MODEL, "CLIP Encoder")
+    ensure_model_downloaded(config.EMBEDDING_MODEL, "CLIP Encoder")
     
     if config.ENABLE_RERANK:
         ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
     
-    # 1. Load CLIP encoder (embedding model)
-    logger.info("[1/7] Loading CLIP encoder...")
-    encoder = CLIPEncoder(model_name=config.CLIP_MODEL)
+    # 1. Load encoder (embedding model)
+    logger.info(f"[1/7] Loading encoder {config.EMBEDDING_MODEL}...")
+    encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
     
     # 2. Initialize LanceDB storage
     logger.info("[2/7] Initializing LanceDB storage...")

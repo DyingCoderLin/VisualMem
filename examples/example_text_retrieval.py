@@ -223,8 +223,8 @@ def main():
     
     # 1. 初始化编码器和检索器
     print("\n[1/3] 初始化 TextEncoder（基于 CLIP）...")
-    encoder = create_text_encoder(model_name=config.CLIP_MODEL)
-    print(f"  • 底层 CLIP 模型: {config.CLIP_MODEL}")
+    encoder = create_text_encoder(model_name=config.EMBEDDING_MODEL)
+    print(f"  • 底层 CLIP 模型: {config.EMBEDDING_MODEL}")
     print(f"  • Embedding 维度: {encoder.embedding_dim}")
     print(f"  • 设备: {encoder.device}")
     print(f"  • 说明: 与 CLIPEncoder 共享底层模型（控制变量）")

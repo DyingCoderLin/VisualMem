@@ -35,7 +35,7 @@ def rebuild_text_index(
     sqlite_db_path: str = None,
     lance_db_path: str = None,
     table_name: str = "ocr_texts",
-    clip_model: str = None,
+    embedding_model: str = None,
     batch_size: int = 32,
     clear_existing: bool = True,
     confirm: bool = True
@@ -49,7 +49,7 @@ def rebuild_text_index(
     
     sqlite_db_path = sqlite_db_path or config.OCR_DB_PATH
     lance_db_path = lance_db_path or config.TEXT_LANCEDB_PATH
-    clip_model = clip_model or config.CLIP_MODEL
+    embedding_model = embedding_model or config.EMBEDDING_MODEL
 
     sqlite_path = Path(sqlite_db_path)
     lance_path = Path(lance_db_path)
@@ -58,7 +58,7 @@ def rebuild_text_index(
     print(f"  • SQLite 数据库: {sqlite_path}")
     print(f"  • LanceDB 数据库: {lance_path}")
     print(f"  • 表名: {table_name}")
-    print(f"  • CLIP 模型: {clip_model}")
+    print(f"  • CLIP 模型: {embedding_model}")
     print(f"  • 批处理大小: {batch_size}")
     print(f"  • 清空现有数据: {clear_existing}")
     
@@ -129,10 +129,10 @@ def rebuild_text_index(
     
     # 3. 初始化 TextEncoder（基于 CLIP）
     print("\n[3/6] 初始化 TextEncoder（基于 CLIP）...")
-    encoder = create_text_encoder(model_name=clip_model)
+    encoder = create_text_encoder(model_name=embedding_model)
     embedding_dim = encoder.get_embedding_dim()
     print(f"✓ TextEncoder 已加载")
-    print(f"  • 底层模型: CLIP {clip_model}")
+    print(f"  • 底层模型: CLIP {embedding_model}")
     print(f"  • 维度: {embedding_dim}")
     print(f"  • 设备: {encoder.device}")
     print(f"  • 说明: 与 CLIPEncoder 共享底层CLIP 模型")
@@ -247,7 +247,7 @@ def main():
         "--clip-model",
         type=str,
         default=None,
-        help=f"CLIP 模型名称（默认: {config.CLIP_MODEL}）"
+        help=f"CLIP 模型名称（默认: {config.EMBEDDING_MODEL}）"
     )
     parser.add_argument(
         "--batch-size",
@@ -273,7 +273,7 @@ def main():
         sqlite_db_path=args.sqlite_db,
         lance_db_path=args.lance_db,
         table_name=args.table_name,
-        clip_model=args.clip_model,
+        embedding_model=args.embedding_model,
         batch_size=args.batch_size,
         clear_existing=args.clear_existing,
         confirm=not args.yes
