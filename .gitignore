@@ -9,3 +9,6 @@ logs/*.log
 .env
 .DS_Store
 **/.DS_Store
+/screencap_rs/target/*
+*.json
+*.mp4
