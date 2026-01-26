@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from utils.logger import setup_logger
+from utils.image_utils import resize_image_if_needed
 from config import config
 
 logger = setup_logger(__name__)
@@ -84,6 +85,9 @@ class SimpleStorage:
             # 确保图片是RGB模式（JPEG不支持透明通道）
             if image.mode in ('RGBA', 'LA', 'P'):
                 image = image.convert('RGB')
+            
+            # 在保存前按需压缩图片（高清 OCR 和 Embedding 已经在此之前完成）
+            image = resize_image_if_needed(image)
             
             # 保存图片为JPEG格式，质量80%
             image_filename = f"{frame_id}.jpg"

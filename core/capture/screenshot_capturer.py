@@ -44,7 +44,7 @@ class ScreenshotCapturer(AbstractCapturer):
     
     def capture(self) -> Optional[ScreenFrame]:
         """
-        捕获当前屏幕的截图并压缩
+        捕获当前屏幕的截图（保持原始高清分辨率）
         """
         try:
             # 捕获整个屏幕
@@ -56,8 +56,9 @@ class ScreenshotCapturer(AbstractCapturer):
                 screenshot = screenshot.convert('RGB')
                 logger.debug(f"Converted image to RGB mode for JPEG compatibility")
             
-            # 压缩图片
-            screenshot = self._resize_image(screenshot)
+            # 不再在这里压缩图片，改为在存储阶段压缩，
+            # 这样 OCR 和 Embedding 可以使用高清图片
+            # screenshot = self._resize_image(screenshot)
             
             # 创建 ScreenFrame 对象
             frame = ScreenFrame(
@@ -66,10 +67,7 @@ class ScreenshotCapturer(AbstractCapturer):
                 ocr_text=None  # OCR 文本将在预处理阶段填充
             )
             
-            if original_size != screenshot.size:
-                logger.debug(f"Captured and resized: {original_size} -> {screenshot.size}")
-            else:
-                logger.debug(f"Captured screenshot: {screenshot.size}")
+            logger.debug(f"Captured screenshot: {screenshot.size}")
             
             return frame
             

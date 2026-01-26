@@ -13,13 +13,18 @@ def calculate_normalized_rms_diff(img1: Image.Image, img2: Image.Image) -> float
     """
     计算两张 PIL 图像的归一化均方根(RMS)差异。
     返回一个 0.0 (相同) 到 1.0 (完全不同) 之间的浮点数。
+    为了性能，会在内部将图像缩小到 256x256 进行比较。
     """
-    # 确保图像模式和大小相同
-    if img1.size != img2.size or img1.mode != img2.mode:
-        img2 = img2.resize(img1.size).convert(img1.mode)
+    # 为了提高计算速度，将图像缩小到一个固定大小进行比较
+    # 这对于检测大范围变化已经足够
+    compare_size = (256, 256)
+    
+    # 缩小图像并转为灰度图（加速计算）
+    img1_small = img1.resize(compare_size).convert("L")
+    img2_small = img2.resize(compare_size).convert("L")
         
     # 1. 计算差异图像
-    diff_img = ImageChops.difference(img1, img2)
+    diff_img = ImageChops.difference(img1_small, img2_small)
     
     # 2. 转换为 numpy 数组
     diff_array = np.array(diff_img)

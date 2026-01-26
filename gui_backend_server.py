@@ -28,6 +28,7 @@ from pathlib import Path
 
 from config import config
 from utils.logger import setup_logger
+from utils.image_utils import resize_image_if_needed
 from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.storage.sqlite_storage import SQLiteStorage
@@ -541,15 +542,18 @@ def store_frame(req: StoreFrameRequest):
             image_path = (date_path / image_filename).resolve()
             counter += 1
     
-    image.save(str(image_path), format="JPEG", quality=config.IMAGE_QUALITY)
+    # 在保存前按需压缩图片（高清 OCR 和 Embedding 已经在此之前完成）
+    # 注意：此时 image 还是高清的，用于下面的 embedding 和 ocr
+    image_to_save = resize_image_if_needed(image)
+    image_to_save.save(str(image_path), format="JPEG", quality=config.IMAGE_QUALITY)
 
     # 使用基于时间戳生成的 frame_id，而不是前端传来的旧格式
     frame_id = base_frame_id
 
-    # Compute image embedding（但不立即写入，等待批量写入）
+    # Compute image embedding（使用原始高清图片以获得更好结果）
     embedding = encoder.encode_image(image)
 
-    # OCR (if enabled)
+    # OCR (if enabled)（使用原始高清图片以获得更好结果）
     ocr_text = ""
     ocr_json = ""
     ocr_engine_name = "pending"
