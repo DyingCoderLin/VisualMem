@@ -267,7 +267,7 @@ def migrate_frame_ids(db_path: str, dry_run: bool = False, frame_id_only: bool =
         
         # 提交更改
         conn.commit()
-        logger.info("✓ 数据库迁移完成")
+        logger.info("数据库迁移完成")
         
         # 3. 重命名文件（仅在非 frame_id_only 模式下）
         if not frame_id_only:
@@ -347,7 +347,7 @@ def main():
     
     # 确认
     if not args.dry_run:
-        print("\n⚠️  警告：这是一个破坏性操作！")
+        print("\n警告：这是一个破坏性操作！")
         print("   建议先备份数据库：")
         print(f"   cp {db_path} {db_path}.backup")
         response = input("\n确认要继续吗？(yes/no): ").strip().lower()
@@ -374,4 +374,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

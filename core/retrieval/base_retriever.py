@@ -59,12 +59,12 @@ class BaseRetriever(ABC):
         self._rerankers = {}
         
         logger.info(f"{self.__class__.__name__} 初始化")
-        logger.info(f"  • 数据库路径: {self.db_path}")
-        logger.info(f"  • 表名: {self.table_name}")
+        logger.info(f"  - 数据库路径: {self.db_path}")
+        logger.info(f"  - 表名: {self.table_name}")
         if encoder:
-            logger.info(f"  • Encoder: {encoder.__class__.__name__}")
+            logger.info(f"  - Encoder: {encoder.__class__.__name__}")
         else:
-            logger.info(f"  • Encoder: None (仅支持 Sparse/FTS 搜索)")
+            logger.info(f"  - Encoder: None (仅支持 Sparse/FTS 搜索)")
     
     @abstractmethod
     def _connect_db(self):
@@ -298,4 +298,3 @@ class MultiModalRetrieverInterface(BaseRetriever):
         """通过图像路径检索"""
         image = Image.open(image_path)
         return self.retrieve_by_image(image, top_k, **kwargs)
-

@@ -72,7 +72,7 @@ class RecordWorker(QObject):
             self._init_ocr()
             
             self.initialized = True
-            self.init_progress_signal.emit("✅ 所有组件初始化完成!")
+            self.init_progress_signal.emit("所有组件初始化完成!")
             self.ready_signal.emit()
             
             logger.info(f"RecordWorker 初始化完成 (模式: {self.storage_mode})")
@@ -345,7 +345,7 @@ class RecordWorker(QObject):
                         self._enqueue_ocr_task(frame_id, frame.timestamp, frame.image, image_path)
                 
                 frame_count += 1
-                logger.info(f"✓ 帧已存储 (总计: {frame_count})")
+                logger.info(f"帧已存储 (总计: {frame_count})")
                 
                 # 获取统计信息（本地模式使用 storage.get_stats，远程模式使用 API）
                 if self.gui_mode == "remote":
@@ -453,5 +453,3 @@ class RecordWorker(QObject):
             self.ocr_thread.join(timeout=5.0)
         
         self.status_signal.emit("录制已停止")
-
-

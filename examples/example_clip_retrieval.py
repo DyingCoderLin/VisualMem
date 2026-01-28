@@ -122,14 +122,14 @@ def example_3_stats():
     stats = retriever.get_stats()
     
     print(f"\n检索器配置：")
-    print(f"  • 类型: {stats['retriever_type']}")
-    print(f"  • 编码器: {stats['encoder_model']}")
-    print(f"  • Embedding 维度: {stats['embedding_dim']}")
-    print(f"  • 支持文本查询: {stats['supports_text_query']}")
-    print(f"  • 支持图像查询: {stats['supports_image_query']}")
-    print(f"  • 默认 top_k: {stats['top_k']}")
+    print(f"  - 类型: {stats['retriever_type']}")
+    print(f"  - 编码器: {stats['encoder_model']}")
+    print(f"  - Embedding 维度: {stats['embedding_dim']}")
+    print(f"  - 支持文本查询: {stats['supports_text_query']}")
+    print(f"  - 支持图像查询: {stats['supports_image_query']}")
+    print(f"  - 默认 top_k: {stats['top_k']}")
     print(f"\n数据库统计：")
-    print(f"  • 总帧数: {stats['storage_stats']['total_frames']}")
+    print(f"  - 总帧数: {stats['storage_stats']['total_frames']}")
 
 
 def main():
@@ -138,10 +138,10 @@ def main():
     print("CLIP 多模态检索系统 - 使用示例")
     print("="*60)
     print("\n特性：")
-    print("  ✓ Dense 向量搜索（去掉 hybrid/sparse）")
-    print("  ✓ 文本查询图像（CLIP 文本编码器）")
-    print("  ✓ 图像查询图像（CLIP 图像编码器）")
-    print("  ✓ 图文对齐的共享空间（512维）")
+    print("  - Dense 向量搜索（去掉 hybrid/sparse）")
+    print("  - 文本查询图像（CLIP 文本编码器）")
+    print("  - 图像查询图像（CLIP 图像编码器）")
+    print("  - 图文对齐的共享空间（512维）")
     
     try:
         # 运行示例
@@ -151,7 +151,7 @@ def main():
         
     except Exception as e:
         logger.error(f"示例运行失败: {e}", exc_info=True)
-        print(f"\n❌ 错误: {e}")
+        print(f"\n错误: {e}")
         print("\n请确保：")
         print("1. 已经运行 main.py 捕获了一些截图")
         print("2. 已经切换到 vector 模式（STORAGE_MODE=vector）")
@@ -160,4 +160,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

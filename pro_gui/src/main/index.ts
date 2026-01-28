@@ -174,13 +174,13 @@ async function waitForBackend(maxRetries: number = 60, interval: number = 1000):
   while (retries < maxRetries || isDownloading) {
     const isReady = await checkBackendHealth()
     if (isReady) {
-      console.log('✅ Backend is ready!')
+      console.log('Backend is ready!')
       return true
     }
     
     if (isDownloading) {
       if (retries % 30 === 0) {
-        // console.log('⏳ Waiting for model to download (this may take a while)...')
+        // console.log('Waiting for model to download (this may take a while)...')
       }
       // In downloading mode, we don't increment the normal retry counter
     } else {
@@ -189,14 +189,14 @@ async function waitForBackend(maxRetries: number = 60, interval: number = 1000):
     
     // Check if process is still alive
     if (pythonProcess && pythonProcess.exitCode !== null) {
-      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}`)
+      console.error(`Backend process exited with code ${pythonProcess.exitCode}`)
       return false
     }
     
     await new Promise(resolve => setTimeout(resolve, interval))
   }
   
-  console.error('❌ Backend failed to start within timeout')
+  console.error('Backend failed to start within timeout')
   return false
 }
 
@@ -251,16 +251,16 @@ function startPythonBackend(): Promise<void> {
           if (str.includes('Starting download')) {
             if (!isDownloading) {
               isDownloading = true
-              console.log('⏳ Detected model download or heavy loading, waiting for it to complete...')
+              console.log('Detected model download or heavy loading, waiting for it to complete...')
             }
           }
 
           if (str.includes('download complete!')) {
-            console.log('✅ A model download has finished!')
+            console.log('A model download has finished!')
           }
 
           if (str.includes('[1/7] Loading CLIP encoder...')) {
-            console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
+            console.log('All pre-flight downloads finished. Backend is now loading models into memory...')
             isDownloading = false
             
           }
@@ -282,16 +282,16 @@ function startPythonBackend(): Promise<void> {
           if (str.includes('Starting download')) {
             if (!isDownloading) {
               isDownloading = true
-              console.log('⏳ Detected model download or heavy loading, waiting for it to complete...')
+              console.log('Detected model download or heavy loading, waiting for it to complete...')
             }
           }
 
           if (str.includes('download complete!')) {
-            console.log('✅ A model download has finished!')
+            console.log('A model download has finished!')
           }
 
           if (str.includes('[1/7] Loading CLIP encoder...')) {
-            console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
+            console.log('All pre-flight downloads finished. Backend is now loading models into memory...')
             isDownloading = false
             isStartingUp = false // 停止输出到终端，后续日志只进入文件
           }
@@ -383,4 +383,3 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   stopPythonBackend()
 })
-

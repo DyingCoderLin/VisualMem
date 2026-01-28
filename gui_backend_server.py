@@ -160,9 +160,9 @@ class BatchWriteBuffer:
             if vector_storage is not None:
                 success = vector_storage.store_frames_batch(frames_to_write)
                 if success:
-                    logger.info(f"✓ 成功批量写入 {len(frames_to_write)} 帧")
+                    logger.info(f"成功批量写入 {len(frames_to_write)} 帧")
                 else:
-                    logger.error(f"✗ 批量写入失败")
+                    logger.error("批量写入失败")
             
             # 批量写入到 SQLite（逐条写入，因为 SQLite 的批量写入接口可能不同）
             if sqlite_storage is not None:
@@ -326,7 +326,7 @@ def _init_all_components():
                 delete_unverified=True
             )
             if stats:
-                logger.info(f"✓ 优化完成（cleanup_older_than=0.1小时）")
+                logger.info("优化完成（cleanup_older_than=0.1小时）")
         else:
             logger.info("LanceDB 表不存在，跳过优化")
     except Exception as e:
@@ -1140,5 +1140,3 @@ if __name__ == "__main__":
         port=8080,
         reload=False,
     )
-
-

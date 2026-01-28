@@ -55,33 +55,33 @@ def rebuild_text_index(
     lance_path = Path(lance_db_path)
     
     print("\n配置:")
-    print(f"  • SQLite 数据库: {sqlite_path}")
-    print(f"  • LanceDB 数据库: {lance_path}")
-    print(f"  • 表名: {table_name}")
-    print(f"  • CLIP 模型: {embedding_model}")
-    print(f"  • 批处理大小: {batch_size}")
-    print(f"  • 清空现有数据: {clear_existing}")
+    print(f"  - SQLite 数据库: {sqlite_path}")
+    print(f"  - LanceDB 数据库: {lance_path}")
+    print(f"  - 表名: {table_name}")
+    print(f"  - CLIP 模型: {embedding_model}")
+    print(f"  - 批处理大小: {batch_size}")
+    print(f"  - 清空现有数据: {clear_existing}")
     
     # 1. 检查 SQLite 数据库
     print("\n[1/6] 检查 SQLite OCR 数据库...")
     if not sqlite_path.exists():
         logger.error(f"SQLite 数据库不存在: {sqlite_path}")
-        print(f"\n❌ 错误: SQLite 数据库 {sqlite_path} 不存在")
+        print(f"\n错误: SQLite 数据库 {sqlite_path} 不存在")
         print("\n请先运行以下命令之一:")
-        print("  • python main.py  (开启 OCR 捕捉)")
-        print("  • python scripts/rebuild_sqlite.py  (重建 SQLite 数据库)")
+        print("  - python main.py  (开启 OCR 捕捉)")
+        print("  - python scripts/rebuild_sqlite.py  (重建 SQLite 数据库)")
         return
     
     sqlite_storage = SQLiteStorage(db_path=str(sqlite_path))
     stats = sqlite_storage.get_stats()
     
-    print(f"✓ SQLite 数据库已连接")
-    print(f"  • 总帧数: {stats['total_frames']}")
-    print(f"  • OCR 结果数: {stats['total_ocr_results']}")
+    print(f"SQLite 数据库已连接")
+    print(f"  - 总帧数: {stats['total_frames']}")
+    print(f"  - OCR 结果数: {stats['total_ocr_results']}")
     
     if stats['total_frames'] == 0:
         logger.warning("SQLite 数据库为空")
-        print("\n⚠️ SQLite 数据库为空，无法构建索引")
+        print("\nSQLite 数据库为空，无法构建索引")
         return
     
     # 2. 读取所有 OCR 文本
@@ -121,21 +121,21 @@ def rebuild_text_index(
     
     conn.close()
     
-    print(f"✓ 读取了 {len(all_data)} 条 OCR 文本记录")
+    print(f"读取了 {len(all_data)} 条 OCR 文本记录")
     
     if len(all_data) == 0:
-        print("\n⚠️ 没有有效的 OCR 文本，无法构建索引")
+        print("\n没有有效的 OCR 文本，无法构建索引")
         return
     
     # 3. 初始化 TextEncoder（基于 CLIP）
     print("\n[3/6] 初始化 TextEncoder（基于 CLIP）...")
     encoder = create_text_encoder(model_name=embedding_model)
     embedding_dim = encoder.get_embedding_dim()
-    print(f"✓ TextEncoder 已加载")
-    print(f"  • 底层模型: CLIP {embedding_model}")
-    print(f"  • 维度: {embedding_dim}")
-    print(f"  • 设备: {encoder.device}")
-    print(f"  • 说明: 与 CLIPEncoder 共享底层CLIP 模型")
+    print(f"TextEncoder 已加载")
+    print(f"  - 底层模型: CLIP {embedding_model}")
+    print(f"  - 维度: {embedding_dim}")
+    print(f"  - 设备: {encoder.device}")
+    print(f"  - 说明: 与 CLIPEncoder 共享底层CLIP 模型")
     
     # 4. 生成 Embeddings（使用 CLIP 文本编码）
     print("\n[4/6] 生成文本 embeddings（使用 CLIP）...")
@@ -150,7 +150,7 @@ def rebuild_text_index(
         batch_embeddings = encoder.encode_text_batch(batch_texts)
         all_embeddings.extend(batch_embeddings)
     
-    print(f"✓ 生成了 {len(all_embeddings)} 个 CLIP 文本 embeddings")
+    print(f"生成了 {len(all_embeddings)} 个 CLIP 文本 embeddings")
     
     # 5. 准备 LanceDB 数据
     print("\n[5/6] 准备 LanceDB 数据...")
@@ -185,17 +185,17 @@ def rebuild_text_index(
             mode="overwrite" if clear_existing else "create"
         )
         
-        print(f"✓ 表 '{table_name}' 创建成功")
-        print(f"  • 总行数: {table.count_rows()}")
+        print(f"表 '{table_name}' 创建成功")
+        print(f"  - 总行数: {table.count_rows()}")
         
         # 创建 FTS 索引（用于 Sparse 和 Hybrid 检索）
         print("\n创建 FTS 全文索引...")
         table.create_fts_index("text", replace=True)
-        print("✓ FTS 索引创建成功")
+        print("FTS 索引创建成功")
         
     except Exception as e:
         logger.error(f"创建表失败: {e}")
-        print(f"\n❌ 错误: {e}")
+        print(f"\n错误: {e}")
         return
     
     # 统计信息
@@ -204,16 +204,16 @@ def rebuild_text_index(
     print("="*70)
     
     print("\n数据库信息:")
-    print(f"  • LanceDB 路径: {lance_path}")
-    print(f"  • 表名: {table_name}")
-    print(f"  • 总记录数: {len(all_data)}")
-    print(f"  • Embedding 维度: {embedding_dim}")
-    print(f"  • FTS 索引: ✅ 已创建")
+    print(f"  - LanceDB 路径: {lance_path}")
+    print(f"  - 表名: {table_name}")
+    print(f"  - 总记录数: {len(all_data)}")
+    print(f"  - Embedding 维度: {embedding_dim}")
+    print(f"  - FTS 索引: 已创建")
     
     print("\n支持的检索方式:")
-    print("  ✅ Dense Search:  纯语义搜索（基于 embedding 相似度）")
-    print("  ✅ Sparse Search: FTS 关键词搜索（BM25）")
-    print("  ✅ Hybrid Search: 混合搜索（Dense + Sparse + Reranker）")
+    print("  - Dense Search:  纯语义搜索（基于 embedding 相似度）")
+    print("  - Sparse Search: FTS 关键词搜索（BM25）")
+    print("  - Hybrid Search: 混合搜索（Dense + Sparse + Reranker）")
     
     print("\n" + "="*70)
     print("可以使用以下方式查询:")
@@ -282,4 +282,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
