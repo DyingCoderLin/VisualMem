@@ -1272,12 +1272,12 @@ class VisualMemMainWindow(QMainWindow):
         end_time = self.time_input.get_end_datetime()
         
         if ocr_mode:
-            self._show_result_panel("📝 OCR Text Searching...")
+            self._show_result_panel("OCR Text Searching...")
             self._start_query_thread(
                 lambda worker: worker.query_ocr_rag(query_text, start_time, end_time)
             )
         else:
-            self._show_result_panel("🔍 Searching...")
+            self._show_result_panel("Searching...")
             self._start_query_thread(
                 lambda worker: worker.query_rag_with_time(query_text, start_time, end_time)
             )
@@ -1292,7 +1292,7 @@ class VisualMemMainWindow(QMainWindow):
                 self._show_error("开始时间必须早于结束时间")
                 return
             
-            self._show_result_panel("📅 Summarizing...")
+            self._show_result_panel("Summarizing...")
             self._start_query_thread(lambda worker: worker.query_time_summary(start_time, end_time))
         
         except Exception as e:
@@ -1301,10 +1301,10 @@ class VisualMemMainWindow(QMainWindow):
     def _do_realtime_query(self, question: str, ocr_mode: bool = False):
         """执行实时问答"""
         if ocr_mode:
-            self._show_result_panel("📝 OCR Text Query...")
+            self._show_result_panel("OCR Text Query...")
             self._start_query_thread(lambda worker: worker.query_realtime_ocr(question))
         else:
-            self._show_result_panel("❓ Analyzing...")
+            self._show_result_panel("Analyzing...")
             self._start_query_thread(lambda worker: worker.query_realtime(question))
     
     def _start_query_thread(self, query_func):
@@ -1332,7 +1332,7 @@ class VisualMemMainWindow(QMainWindow):
     
     def _show_query_error(self, error: str):
         """显示查询错误"""
-        self.result_panel.set_result("❌ Error", error)
+        self.result_panel.set_result("Error", error)
     
     def _show_error(self, error: str):
         """显示错误"""

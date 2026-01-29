@@ -372,15 +372,15 @@ if __name__ == "__main__":
     
     # 2. 检查表是否存在
     if retriever.table is None:
-        print("\n⚠️ 表不存在，请先运行数据准备脚本")
+        print("\n警告: 表不存在，请先运行数据准备脚本")
     else:
-        print("\n✅ 表已连接")
+        print("\n表已连接")
         
         # 3. 测试统计信息
         stats = retriever.get_stats()
         print(f"\n数据库统计:")
         for k, v in stats.items():
-            print(f"  • {k}: {v}")
+            print(f"  - {k}: {v}")
         
         # 4. 测试检索（如果有数据）
         if stats.get("total_rows", 0) > 0:
@@ -407,4 +407,3 @@ if __name__ == "__main__":
                 print(f"{i}. {r.get('text', 'N/A')[:50]}")
     
     print("\n" + "="*60)
-

@@ -105,7 +105,7 @@ def cleanup_table_versions(
         db = lancedb.connect(db_path)
         
         if table_name not in db.table_names():
-            print(f"⚠️  表 '{table_name}' 不存在，跳过")
+            print(f"表 '{table_name}' 不存在，跳过")
             return None
         
         table = db.open_table(table_name)
@@ -120,16 +120,16 @@ def cleanup_table_versions(
             print(f"最新版本: {versions_before[-1]}")
         
         if dry_run:
-            print(f"\n🔍 预览模式：将会清理 {older_than_hours} 小时前的版本")
+            print(f"\n预览模式：将会清理 {older_than_hours} 小时前的版本")
             print(f"   delete_unverified: {delete_unverified}")
             return None
         
         # 执行优化（清理旧版本 + 压缩文件）
         cleanup_time = timedelta(hours=older_than_hours)
         if do_compact:
-            print(f"\n🧹 开始优化（清理 {older_than_hours} 小时前的版本 + 压缩文件）...")
+            print(f"\n开始优化（清理 {older_than_hours} 小时前的版本 + 压缩文件）...")
         else:
-            print(f"\n🧹 开始清理 {older_than_hours} 小时前的版本...")
+            print(f"\n开始清理 {older_than_hours} 小时前的版本...")
         
         try:
             # 使用 optimize 方法（替代 cleanup_old_versions + compact_files）
@@ -140,14 +140,14 @@ def cleanup_table_versions(
             )
         except Exception as e:
             logger.error(f"优化失败: {e}")
-            print(f"❌ 优化失败: {e}")
+            print(f"优化失败: {e}")
             return None
         
         # 获取清理后的版本信息
         versions_after = table.list_versions()
         version_count_after = len(versions_after)
         
-        print(f"✓ 优化完成")
+        print(f"优化完成")
         print(f"清理后版本数量: {version_count_after}")
         print(f"删除版本数: {version_count_before - version_count_after}")
         
@@ -163,7 +163,7 @@ def cleanup_table_versions(
         
     except Exception as e:
         logger.error(f"清理表 {table_name} 失败: {e}")
-        print(f"❌ 清理失败: {e}")
+        print(f"清理失败: {e}")
         return None
 
 
@@ -204,7 +204,7 @@ def cleanup_lancedb_versions(
     # 检查数据库路径
     db_dir = Path(db_path)
     if not db_dir.exists():
-        print(f"\n❌ 错误: 数据库路径不存在: {db_path}")
+        print(f"\n错误: 数据库路径不存在: {db_path}")
         return
     
     # 获取清理前的数据库大小
@@ -334,4 +334,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -30,21 +30,21 @@ def ensure_model_downloaded(model_id: str, model_name_label: str = "Model"):
     Check if model exists, if not, print a clear message and download it.
     """
     if is_model_cached(model_id):
-        logger.info(f"✓ {model_name_label} ({model_id}) is already cached.")
+        logger.info(f"{model_name_label} ({model_id}) is already cached.")
         return
 
     # Use print instead of logger to ensure it's captured by Electron's stdout/stderr
     # and stands out in the terminal
     print(f"\n{'='*60}")
-    print(f"🚀 {model_name_label} NOT FOUND: {model_id}")
-    print(f"📥 Starting download... This may take several minutes depending on your internet speed.")
+    print(f"{model_name_label} NOT FOUND: {model_id}")
+    print("Starting download... This may take several minutes depending on your internet speed.")
     print(f"{'='*60}\n", flush=True)
     
     try:
         from huggingface_hub import snapshot_download
         # This will show progress bars to stdout/stderr
         snapshot_download(repo_id=model_id)
-        print(f"\n✅ {model_name_label} download complete!\n", flush=True)
+        print(f"\n{model_name_label} download complete!\n", flush=True)
     except Exception as e:
-        print(f"\n❌ Failed to download {model_id}: {e}\n", flush=True)
+        print(f"\nFailed to download {model_id}: {e}\n", flush=True)
         # We don't raise here, let the actual model loading fail later with its own error

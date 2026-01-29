@@ -142,7 +142,7 @@ def clear_database(db_path: str):
         try:
             # 删除数据库文件
             db_file.unlink()
-            logger.info(f"✓ Deleted existing database: {db_path}")
+            logger.info(f"Deleted existing database: {db_path}")
         except Exception as e:
             logger.error(f"Failed to delete database: {e}")
             raise
@@ -221,27 +221,27 @@ def rebuild_sqlite(
     db_path = db_path or config.OCR_DB_PATH
     
     print(f"\n配置:")
-    print(f"  • 图片目录: {image_dir}")
-    print(f"  • 数据库路径: {db_path}")
-    print(f"  • OCR 引擎: {ocr_engine_type}")
+    print(f"  - 图片目录: {image_dir}")
+    print(f"  - 数据库路径: {db_path}")
+    print(f"  - OCR 引擎: {ocr_engine_type}")
     
     # 2. 扫描图片
     print(f"\n[1/4] 扫描图片...")
     image_paths = scan_images(image_dir)
     
     if len(image_paths) == 0:
-        print(f"\n❌ 未找到图片，退出")
+        print(f"\n未找到图片，退出")
         return
     
-    print(f"✓ 找到 {len(image_paths)} 张图片")
+    print(f"找到 {len(image_paths)} 张图片")
     
     # 3. 清空数据库
     print(f"\n[2/4] 清空现有数据库...")
     try:
         clear_database(db_path)
-        print(f"✓ 数据库已清空")
+        print(f"数据库已清空")
     except Exception as e:
-        print(f"❌ 清空数据库失败: {e}")
+        print(f"清空数据库失败: {e}")
         return
     
     # 4. 初始化 OCR 引擎和存储
@@ -249,9 +249,9 @@ def rebuild_sqlite(
     try:
         ocr_engine = create_ocr_engine(ocr_engine_type, lang="chi_sim+eng")
         sqlite_storage = SQLiteStorage(db_path=db_path)
-        print(f"✓ OCR 引擎和存储已初始化")
+        print(f"OCR 引擎和存储已初始化")
     except Exception as e:
-        print(f"❌ 初始化失败: {e}")
+        print(f"初始化失败: {e}")
         print(f"\n请确保已安装 pytesseract:")
         print(f"  macOS:   brew install tesseract tesseract-lang")
         print(f"  Ubuntu:  sudo apt install tesseract-ocr tesseract-ocr-chi-sim")
@@ -280,10 +280,10 @@ def rebuild_sqlite(
         
         if success:
             success_count += 1
-            print(f"  ✓ 成功")
+            print(f"  成功")
         else:
             error_count += 1
-            print(f"  ✗ 失败: {error_msg}")
+            print(f"  失败: {error_msg}")
         
         # 每 10 张显示进度
         if i % 10 == 0:
@@ -301,19 +301,19 @@ def rebuild_sqlite(
     print("="*60)
     
     print(f"\n统计:")
-    print(f"  • 总图片数: {len(image_paths)}")
-    print(f"  • 成功: {success_count}")
-    print(f"  • 失败: {error_count}")
-    print(f"  • 总耗时: {elapsed:.1f}s")
-    print(f"  • 平均速度: {elapsed/len(image_paths):.2f}s/张")
+    print(f"  - 总图片数: {len(image_paths)}")
+    print(f"  - 成功: {success_count}")
+    print(f"  - 失败: {error_count}")
+    print(f"  - 总耗时: {elapsed:.1f}s")
+    print(f"  - 平均速度: {elapsed/len(image_paths):.2f}s/张")
     
     # 7. 显示数据库统计
     stats = sqlite_storage.get_stats()
     print(f"\n数据库状态:")
-    print(f"  • 总帧数: {stats['total_frames']}")
-    print(f"  • OCR 结果数: {stats['total_ocr_results']}")
-    print(f"  • 总文本长度: {stats['total_text_length']} 字符")
-    print(f"  • 数据库路径: {stats['db_path']}")
+    print(f"  - 总帧数: {stats['total_frames']}")
+    print(f"  - OCR 结果数: {stats['total_ocr_results']}")
+    print(f"  - 总文本长度: {stats['total_text_length']} 字符")
+    print(f"  - 数据库路径: {stats['db_path']}")
     
     print("\n" + "="*60)
     print("可以使用以下方式查询:")
@@ -377,7 +377,7 @@ def main():
     
     # 确认提示
     if not args.yes:
-        print("\n⚠️  警告：此操作将删除现有的 SQLite 数据库！")
+        print("\n警告：此操作将删除现有的 SQLite 数据库！")
         print(f"数据库路径: {args.db_path or config.OCR_DB_PATH}")
         response = input("\n是否继续？(yes/no): ")
         if response.lower() not in ['yes', 'y']:
@@ -391,15 +391,14 @@ def main():
             ocr_engine_type=args.ocr_engine
         )
     except KeyboardInterrupt:
-        print("\n\n⚠️  用户中断，退出")
+        print("\n\n用户中断，退出")
         sys.exit(1)
     except Exception as e:
         logger.error(f"重建失败: {e}", exc_info=True)
-        print(f"\n❌ 错误: {e}")
+        print(f"\n错误: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-
 

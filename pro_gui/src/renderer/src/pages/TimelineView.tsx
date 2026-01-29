@@ -487,7 +487,7 @@ const TimelineView: React.FC = () => {
     
     // 如果距离已加载内容末尾很近（小于阈值），触发加载
     if (distanceToLoadedEnd < threshold) {
-      // console.log(`[TimelineView] ✅ Triggering load more for ${date}, distanceToLoadedEnd: ${distanceToLoadedEnd.toFixed(0)}px < threshold: ${threshold.toFixed(0)}px`)
+      // console.log(`[TimelineView] Triggering load more for ${date}, distanceToLoadedEnd: ${distanceToLoadedEnd.toFixed(0)}px < threshold: ${threshold.toFixed(0)}px`)
       if (loadMoreFramesForDateRef.current) {
         loadMoreFramesForDateRef.current(date).catch(err => {
           console.error(`Failed to load more frames for ${date}:`, err)
@@ -674,7 +674,7 @@ const TimelineView: React.FC = () => {
       
       scrollContainer.addEventListener('scroll', handler, { passive: true })
       scrollHandlers.set(group.date, handler)
-      // console.log(`[TimelineView] ✅ Bound scroll handler for ${group.date} (loaded: ${group.loadedCount}/${group.totalCount})`)
+      // console.log(`[TimelineView] Bound scroll handler for ${group.date} (loaded: ${group.loadedCount}/${group.totalCount})`)
       
       // 初始检查：如果已经滚动到已加载内容末尾附近，立即触发加载
       const { scrollLeft, clientWidth } = scrollContainer

@@ -26,8 +26,8 @@ def example_vlm_api():
     
     # 1. 显示配置
     print("VLM 配置:")
-    print(f"  • API 地址: {config.VLM_API_URI}")
-    print(f"  • 模型: {config.VLM_API_MODEL}")
+    print(f"  - API 地址: {config.VLM_API_URI}")
+    print(f"  - 模型: {config.VLM_API_MODEL}")
     print()
     
     # 2. 创建示例图片
@@ -47,8 +47,8 @@ def example_vlm_api():
     image.save(buffered, format="PNG")
     img_bytes = buffered.getvalue()
     img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-    print(f"  ✓ 图片大小: {len(img_bytes)} bytes")
-    print(f"  ✓ Base64长度: {len(img_base64)} chars")
+    print(f"  - 图片大小: {len(img_bytes)} bytes")
+    print(f"  - Base64长度: {len(img_base64)} chars")
     print()
     
     # 3. 构造请求
@@ -65,9 +65,9 @@ def example_vlm_api():
         "text": "请描述这张图片的内容"
     }
     
-    print(f"  • 请求方法: POST")
-    print(f"  • API 地址: {config.VLM_API_URI}")
-    print(f"  • 查询内容: 请描述这张图片的内容")
+    print(f"  - 请求方法: POST")
+    print(f"  - API 地址: {config.VLM_API_URI}")
+    print(f"  - 查询内容: 请描述这张图片的内容")
     
     # 4. 发送请求
     print("\n[3/4] 发送请求到 VLM...")
@@ -80,10 +80,10 @@ def example_vlm_api():
             verify=False  # 跳过SSL验证（如果是自签名证书）
         )
         
-        print(f"  • HTTP 状态码: {response.status_code}")
+        print(f"  - HTTP 状态码: {response.status_code}")
         
         if response.status_code == 200:
-            print("  ✓ 请求成功！")
+            print("  - 请求成功！")
             
             # 5. 解析响应
             print("\n[4/4] VLM 响应:")
@@ -110,18 +110,18 @@ def example_vlm_api():
             
             print("-" * 60)
             print("\n" + "="*60)
-            print("✅ VLM API 连接成功！")
+            print("VLM API 连接成功！")
             print("="*60)
             print("\n接下来可以：")
             print("  1. python main.py   # 开始捕捉屏幕截图")
             print("  2. python query.py  # 查询和理解截图内容")
             
         else:
-            print(f"\n❌ 请求失败（状态码: {response.status_code}）")
+            print(f"\n请求失败（状态码: {response.status_code}）")
             print(f"响应内容: {response.text[:200]}")
             
     except requests.exceptions.ConnectionError as e:
-        print(f"\n❌ 连接失败")
+        print(f"\n连接失败")
         print(f"\n请检查:")
         print(f"  1. VLM 服务是否运行在: {config.VLM_API_URI}")
         print(f"  2. 网络连接是否正常")
@@ -129,7 +129,7 @@ def example_vlm_api():
         print(f"\n详细错误: {e}")
         
     except Exception as e:
-        print(f"\n❌ 发生错误: {e}")
+        print(f"\n发生错误: {e}")
         import traceback
         traceback.print_exc()
 
@@ -149,8 +149,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\n用户中断")
     except Exception as e:
-        print(f"\n❌ 示例运行失败: {e}")
+        print(f"\n示例运行失败: {e}")
 
 if __name__ == "__main__":
     main()
-

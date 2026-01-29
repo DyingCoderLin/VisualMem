@@ -86,11 +86,11 @@ class TextEncoder(TextEncoderInterface):
             else:
                 self.embedding_dim = self.model.config.projection_dim
             
-            logger.info(f"✅ TextEncoder 加载成功")
-            logger.info(f"  • 模型: {model_name}")
-            logger.info(f"  • 设备: {device}")
-            logger.info(f"  • 向量维度: {self.embedding_dim}")
-            logger.info(f"  • 底层: CLIP 文本塔（与 CLIPEncoder 共享模型）")
+            logger.info(f"TextEncoder 加载成功")
+            logger.info(f"  - 模型: {model_name}")
+            logger.info(f"  - 设备: {device}")
+            logger.info(f"  - 向量维度: {self.embedding_dim}")
+            logger.info(f"  - 底层: CLIP 文本塔（与 CLIPEncoder 共享模型）")
             
         except Exception as e:
             logger.error(f"加载 TextEncoder 失败: {e}")
@@ -258,5 +258,5 @@ if __name__ == "__main__":
     print(f"  文本0 vs 文本2: {sim_02:.4f}")
     
     print("\n" + "="*60)
-    print("✅ TextEncoder 使用 CLIP 模型，与 CLIPEncoder 共享底层")
+    print("TextEncoder 使用 CLIP 模型，与 CLIPEncoder 共享底层")
     print("="*60)

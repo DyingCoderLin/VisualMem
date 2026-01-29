@@ -155,7 +155,7 @@ async function waitForBackend(maxRetries = 60, interval = 1e3) {
   while (retries < maxRetries || isDownloading) {
     const isReady = await checkBackendHealth();
     if (isReady) {
-      console.log("✅ Backend is ready!");
+      console.log("Backend is ready!");
       return true;
     }
     if (isDownloading) ;
@@ -163,12 +163,12 @@ async function waitForBackend(maxRetries = 60, interval = 1e3) {
       retries++;
     }
     if (pythonProcess && pythonProcess.exitCode !== null) {
-      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}`);
+      console.error(`Backend process exited with code ${pythonProcess.exitCode}`);
       return false;
     }
     await new Promise((resolve2) => setTimeout(resolve2, interval));
   }
-  console.error("❌ Backend failed to start within timeout");
+  console.error("Backend failed to start within timeout");
   return false;
 }
 function startPythonBackend() {
@@ -202,14 +202,14 @@ function startPythonBackend() {
           if (str.includes("Starting download")) {
             if (!isDownloading) {
               isDownloading = true;
-              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
+              console.log("Detected model download or heavy loading, waiting for it to complete...");
             }
           }
           if (str.includes("download complete!")) {
-            console.log("✅ A model download has finished!");
+            console.log("A model download has finished!");
           }
           if (str.includes("[1/7] Loading CLIP encoder...")) {
-            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
+            console.log("All pre-flight downloads finished. Backend is now loading models into memory...");
             isDownloading = false;
           }
           if (str.includes("All backend components initialized successfully!")) {
@@ -227,14 +227,14 @@ function startPythonBackend() {
           if (str.includes("Starting download")) {
             if (!isDownloading) {
               isDownloading = true;
-              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
+              console.log("Detected model download or heavy loading, waiting for it to complete...");
             }
           }
           if (str.includes("download complete!")) {
-            console.log("✅ A model download has finished!");
+            console.log("A model download has finished!");
           }
           if (str.includes("[1/7] Loading CLIP encoder...")) {
-            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
+            console.log("All pre-flight downloads finished. Backend is now loading models into memory...");
             isDownloading = false;
             isStartingUp = false;
           }

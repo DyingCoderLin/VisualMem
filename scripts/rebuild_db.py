@@ -29,14 +29,14 @@ TARGET_ALL = ["sqlite", "lancedb", "textdb"]
 
 def _confirm(paths: dict, tasks: List[str], embedding_model: str, clear_existing: bool) -> bool:
     """简单确认提示"""
-    print("\n⚠️  即将重建数据库")
-    print(f"  • 图片目录: {paths['image']}")
-    print(f"  • LanceDB(frames): {paths['lancedb']}")
-    print(f"  • TextDB: {paths['textdb']}")
-    print(f"  • OCR SQLite: {paths['sqlite']}")
-    print(f"  • CLIP 模型: {embedding_model}")
-    print(f"  • 清空现有数据: {clear_existing}")
-    print(f"  • 目标任务: {tasks}")
+    print("\n即将重建数据库")
+    print(f"  - 图片目录: {paths['image']}")
+    print(f"  - LanceDB(frames): {paths['lancedb']}")
+    print(f"  - TextDB: {paths['textdb']}")
+    print(f"  - OCR SQLite: {paths['sqlite']}")
+    print(f"  - CLIP 模型: {embedding_model}")
+    print(f"  - 清空现有数据: {clear_existing}")
+    print(f"  - 目标任务: {tasks}")
     ans = input("\n确认继续？[y/N]: ").strip().lower()
     return ans in ("y", "yes")
 
@@ -96,12 +96,12 @@ def rebuild_db(
         tasks = TARGET_ALL.copy()
 
     logger.info("开始重建数据库")
-    logger.info(f"  • Benchmark: {benchmark_name or '默认'}")
-    logger.info(f"  • 图片目录: {resolved_image}")
-    logger.info(f"  • LanceDB(frames): {resolved_lancedb}")
-    logger.info(f"  • TextDB: {resolved_textdb}")
-    logger.info(f"  • OCR SQLite: {resolved_sqlite}")
-    logger.info(f"  • 目标任务: {tasks}")
+    logger.info(f"  - Benchmark: {benchmark_name or '默认'}")
+    logger.info(f"  - 图片目录: {resolved_image}")
+    logger.info(f"  - LanceDB(frames): {resolved_lancedb}")
+    logger.info(f"  - TextDB: {resolved_textdb}")
+    logger.info(f"  - OCR SQLite: {resolved_sqlite}")
+    logger.info(f"  - 目标任务: {tasks}")
 
     # 确认提示
     proceed = _confirm(
@@ -225,4 +225,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
