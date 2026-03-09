@@ -22,6 +22,35 @@ def get_rerank_model():
         )
     return _model_instance
 
+def clear_rerank_model():
+    """释放重排模型占用的内存"""
+    global _model_instance
+    if _model_instance is not None:
+        logger.info("Releasing rerank model instance...")
+        # 显式删除模型和处理器
+        if hasattr(_model_instance, 'model'):
+            _model_instance.model = None
+        if hasattr(_model_instance, 'processor'):
+            _model_instance.processor = None
+        if hasattr(_model_instance, 'score_linear'):
+            _model_instance.score_linear = None
+        _model_instance = None
+        
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+        
+        # 清理 GPU/MPS 缓存
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+        except Exception:
+            pass
+        logger.info("Rerank model instance released.")
+
 class LocalReranker:
     def __init__(self):
         self.model = get_rerank_model()

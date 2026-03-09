@@ -123,26 +123,40 @@ class LanceDBStorage:
         image: Image.Image,
         embedding: List[float],
         ocr_text: str = "",
-        metadata: dict = None
+        metadata: dict = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
         存储一帧：图片 + embedding + 元数据
         
         注意：如果 frame_id 已存在，会先删除旧记录再插入新记录（避免重复）
         注意：建议使用 store_frames_batch 进行批量插入以提高性能并减少版本数量
+        
+        Args:
+            frame_id: 帧ID
+            timestamp: 时间戳
+            image: 图片
+            embedding: 向量
+            ocr_text: OCR文本
+            metadata: 元数据
+            app_name: 应用名称（frame 为 None，sub_frame 填写）
+            window_name: 窗口名称（frame 为 None，sub_frame 填写）
         """
         try:
             # 保存图片
             image_path = self._save_image(image, frame_id)
             
-            # 准备数据
+            # 准备数据（包含 app_name 和 window_name）
             data = [{
                 "frame_id": frame_id,
                 "timestamp": timestamp.isoformat(),
                 "image_path": image_path,
                 "vector": embedding,  # LanceDB的embedding列
                 "ocr_text": ocr_text or "",
-                "metadata": str(metadata or {})
+                "metadata": str(metadata or {}),
+                "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
             }]
             
             # 插入到LanceDB
@@ -187,6 +201,8 @@ class LanceDBStorage:
                 - embedding: List[float]
                 - ocr_text: str (可选)
                 - metadata: dict (可选)
+                - app_name: str (可选，frame 为 None，sub_frame 填写)
+                - window_name: str (可选，frame 为 None，sub_frame 填写)
         
         Returns:
             bool: 是否成功
@@ -214,14 +230,19 @@ class LanceDBStorage:
                 else:
                     image_path = self._save_image(image, frame_id)
                 
-                # 准备数据
+                # 准备数据（包含 app_name 和 window_name 用于筛选）
+                app_name = frame.get("app_name")  # frame 为 None，sub_frame 填写
+                window_name = frame.get("window_name")  # frame 为 None，sub_frame 填写
+                
                 data_list.append({
                     "frame_id": frame_id,
                     "timestamp": timestamp.isoformat(),
                     "image_path": image_path,
                     "vector": embedding,
                     "ocr_text": ocr_text or "",
-                    "metadata": str(metadata or {})
+                    "metadata": str(metadata or {}),
+                    "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                    "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
                 })
                 frame_ids_to_check.append(frame_id)
             
@@ -272,22 +293,26 @@ class LanceDBStorage:
         query_embedding: List[float], 
         top_k: int = 5,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> List[Dict]:
         """
-        向量搜索：根据query embedding找到最相关的图片（支持时间范围过滤）
+        向量搜索：根据query embedding找到最相关的图片（支持时间范围和应用/窗口过滤）
         
         Args:
             query_embedding: 查询向量
             top_k: 返回数量
             start_time: 开始时间（可选，用于 Pre-filtering）
             end_time: 结束时间（可选，用于 Pre-filtering）
+            app_name: 应用名称过滤（可选，精确匹配）
+            window_name: 窗口名称过滤（可选，精确匹配）
         
         Returns:
-            List of dicts containing: frame_id, timestamp, image_path, similarity, ocr_text
+            List of dicts containing: frame_id, timestamp, image_path, similarity, ocr_text, app_name, window_name
         
         Note:
-            使用 LanceDB 的 Pre-filtering 功能，在向量搜索时直接过滤时间范围，
+            使用 LanceDB 的 Pre-filtering 功能，在向量搜索时直接过滤条件，
             比先搜索再过滤或先过滤再搜索更高效。
         """
         try:
@@ -298,21 +323,34 @@ class LanceDBStorage:
             # 构建搜索查询
             search_query = self.table.search(query_embedding)
             
-            # 如果有时间范围，使用 Pre-filtering（LanceDB 原生支持）
-            if start_time is not None or end_time is not None:
-                # 构建 where 条件（timestamp 存储为 ISO 格式字符串）
-                conditions = []
-                if start_time is not None:
-                    start_iso = start_time.isoformat()
-                    conditions.append(f"timestamp >= '{start_iso}'")
-                if end_time is not None:
-                    end_iso = end_time.isoformat()
-                    conditions.append(f"timestamp <= '{end_iso}'")
-                
-                if conditions:
-                    where_clause = " AND ".join(conditions)
-                    search_query = search_query.where(where_clause)
-                    logger.debug(f"Applying time filter: {where_clause}")
+            # 构建 where 条件（支持时间、app_name、window_name 过滤）
+            conditions = []
+            
+            # 时间范围过滤
+            if start_time is not None:
+                start_iso = start_time.isoformat()
+                conditions.append(f"timestamp >= '{start_iso}'")
+            if end_time is not None:
+                end_iso = end_time.isoformat()
+                conditions.append(f"timestamp <= '{end_iso}'")
+            
+            # 应用名称过滤
+            if app_name is not None and app_name != "":
+                # 转义单引号，防止 SQL 注入
+                app_name_escaped = app_name.replace("'", "''")
+                conditions.append(f"app_name = '{app_name_escaped}'")
+            
+            # 窗口名称过滤
+            if window_name is not None and window_name != "":
+                # 转义单引号，防止 SQL 注入
+                window_name_escaped = window_name.replace("'", "''")
+                conditions.append(f"window_name = '{window_name_escaped}'")
+            
+            # 应用 Pre-filtering
+            if conditions:
+                where_clause = " AND ".join(conditions)
+                search_query = search_query.where(where_clause)
+                logger.debug(f"Applying filters: {where_clause}")
             
             # 执行搜索
             results = search_query.limit(top_k).to_list()
@@ -325,9 +363,11 @@ class LanceDBStorage:
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
                     "image_path": result["image_path"],
                     "distance": result.get("_distance", 0),  # LanceDB的距离（越小越相似）
-                    "ocr_text": result["ocr_text"],
+                    "ocr_text": result.get("ocr_text", ""),
                     "image": self._load_image(result["image_path"]),
-                    "metadata": result.get("metadata", {})
+                    "metadata": result.get("metadata", {}),
+                    "app_name": result.get("app_name", ""),  # 应用名称
+                    "window_name": result.get("window_name", ""),  # 窗口名称
                 }
                 found_frames.append(frame_data)
             
@@ -344,7 +384,9 @@ class LanceDBStorage:
         timestamp: datetime,
         image_path: str,
         ocr_text: str,
-        text_embedding: List[float]
+        text_embedding: List[float],
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
         存储 OCR 文本的 embedding
@@ -355,6 +397,8 @@ class LanceDBStorage:
             image_path: 图片路径
             ocr_text: OCR 文本内容
             text_embedding: OCR 文本的 CLIP embedding
+            app_name: 应用名称（可选，用于筛选）
+            window_name: 窗口名称（可选，用于筛选）
         """
         try:
             if not ocr_text or not ocr_text.strip():
@@ -366,7 +410,9 @@ class LanceDBStorage:
                 "timestamp": timestamp.isoformat(),
                 "image_path": image_path,
                 "ocr_text": ocr_text,
-                "vector": text_embedding
+                "vector": text_embedding,
+                "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
             }]
             
             if self.ocr_table is None:
@@ -387,19 +433,23 @@ class LanceDBStorage:
         query_embedding: List[float], 
         top_k: int = 10,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> List[Dict]:
         """
-        搜索 OCR 文本 embedding（支持时间范围过滤）
+        搜索 OCR 文本 embedding（支持时间范围和应用/窗口过滤）
         
         Args:
             query_embedding: 查询文本的 CLIP embedding
             top_k: 返回数量
             start_time: 开始时间（可选，用于 Pre-filtering）
             end_time: 结束时间（可选，用于 Pre-filtering）
+            app_name: 应用名称过滤（可选，精确匹配）
+            window_name: 窗口名称过滤（可选，精确匹配）
             
         Returns:
-            相关帧列表，包含 frame_id, timestamp, image_path, ocr_text, distance
+            相关帧列表，包含 frame_id, timestamp, image_path, ocr_text, distance, app_name, window_name
         """
         try:
             if self.ocr_table is None:
@@ -409,20 +459,31 @@ class LanceDBStorage:
             # 构建搜索查询
             search_query = self.ocr_table.search(query_embedding)
             
-            # 如果有时间范围，使用 Pre-filtering
-            if start_time is not None or end_time is not None:
-                conditions = []
-                if start_time is not None:
-                    start_iso = start_time.isoformat()
-                    conditions.append(f"timestamp >= '{start_iso}'")
-                if end_time is not None:
-                    end_iso = end_time.isoformat()
-                    conditions.append(f"timestamp <= '{end_iso}'")
-                
-                if conditions:
-                    where_clause = " AND ".join(conditions)
-                    search_query = search_query.where(where_clause)
-                    logger.debug(f"Applying time filter to OCR search: {where_clause}")
+            # 构建 where 条件（支持时间、app_name、window_name 过滤）
+            conditions = []
+            
+            # 时间范围过滤
+            if start_time is not None:
+                start_iso = start_time.isoformat()
+                conditions.append(f"timestamp >= '{start_iso}'")
+            if end_time is not None:
+                end_iso = end_time.isoformat()
+                conditions.append(f"timestamp <= '{end_iso}'")
+            
+            # 应用名称过滤（如果 OCR 表有该字段）
+            if app_name is not None and app_name != "":
+                app_name_escaped = app_name.replace("'", "''")
+                conditions.append(f"app_name = '{app_name_escaped}'")
+            
+            # 窗口名称过滤（如果 OCR 表有该字段）
+            if window_name is not None and window_name != "":
+                window_name_escaped = window_name.replace("'", "''")
+                conditions.append(f"window_name = '{window_name_escaped}'")
+            
+            if conditions:
+                where_clause = " AND ".join(conditions)
+                search_query = search_query.where(where_clause)
+                logger.debug(f"Applying filters to OCR search: {where_clause}")
             
             results = search_query.limit(top_k).to_list()
             
@@ -432,9 +493,11 @@ class LanceDBStorage:
                     "frame_id": result["frame_id"],
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
                     "image_path": result["image_path"],
-                    "ocr_text": result["ocr_text"],
+                    "ocr_text": result.get("ocr_text", ""),
                     "distance": result.get("_distance", 0),
-                    "image": self._load_image(result["image_path"])
+                    "image": self._load_image(result["image_path"]),
+                    "app_name": result.get("app_name", ""),  # 应用名称
+                    "window_name": result.get("window_name", ""),  # 窗口名称
                 }
                 found_frames.append(frame_data)
             

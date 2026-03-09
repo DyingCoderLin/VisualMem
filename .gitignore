@@ -12,3 +12,11 @@ logs/*.log
 *.json
 screencap_rs/target/
 *.mp4
+.codex/*
+benchmark_output/*
+.env-test
+AGENTS.md
+findings.md
+task_plan.md
+progress.md
+agent-sync.md

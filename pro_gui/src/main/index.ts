@@ -13,8 +13,24 @@ const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 let mainWindow: BrowserWindow | null = null
 let pythonProcess: ChildProcess | null = null
 let isDownloading = false
+let isLoadingModel = false  // 模型正在加载到内存
 let isStartingUp = true
 const BACKEND_PORT = 8080
+
+// 禁用 Chromium 会发起外部 HTTPS 的内置功能，避免在控制台打印 SSL handshake failed / net_error -101
+app.commandLine.appendSwitch('disable-features', [
+  'SafeBrowsing',
+  'Translate',
+  'TranslateUI',
+  'OptimizationHints',
+  'OptimizationHintsFetching',
+  'BackupSignedInSyncTransport',
+  'SyncService'
+].join(','))
+app.commandLine.appendSwitch('disable-background-networking')
+app.commandLine.appendSwitch('disable-component-update')
+app.commandLine.appendSwitch('no-first-run')
+app.commandLine.appendSwitch('no-default-browser-check')
 
 // 设置 IPC 处理器
 function setupIPC(): void {
@@ -152,9 +168,9 @@ function checkBackendHealth(): Promise<boolean> {
     
     req.on('error', (err) => {
       const errCode = (err as NodeJS.ErrnoException).code
-      // 连接错误（ECONNREFUSED）是正常的，表示后端还没启动
-      // 只在非连接错误时打印日志
-      if (errCode !== 'ECONNREFUSED') {
+      // ECONNREFUSED = 后端尚未监听；ECONNRESET = 连接被对端关闭（后端未就绪或已退出）
+      // 这两种在等待启动阶段都属正常，不每次打日志，避免刷屏
+      if (errCode !== 'ECONNREFUSED' && errCode !== 'ECONNRESET') {
         console.error('Health check request error:', errCode, err)
       }
       resolve(false)
@@ -167,29 +183,35 @@ function checkBackendHealth(): Promise<boolean> {
   })
 }
 
-async function waitForBackend(maxRetries: number = 60, interval: number = 1000): Promise<boolean> {
+async function waitForBackend(maxRetries: number = 180, interval: number = 1000): Promise<boolean> {
   console.log('\nWaiting for backend to be ready...')
   
   let retries = 0
-  while (retries < maxRetries || isDownloading) {
+  // 在下载或加载模型时不计入超时
+  while (retries < maxRetries || isDownloading || isLoadingModel) {
     const isReady = await checkBackendHealth()
     if (isReady) {
       console.log('✅ Backend is ready!')
       return true
     }
     
-    if (isDownloading) {
-      if (retries % 30 === 0) {
-        // console.log('⏳ Waiting for model to download (this may take a while)...')
+    if (isDownloading || isLoadingModel) {
+      // 在下载或加载模型时，不增加重试计数器
+      // 每30秒打印一次状态
+      if (retries % 30 === 0 && retries > 0) {
+        if (isDownloading) {
+          console.log('⏳ Still downloading model...')
+        } else if (isLoadingModel) {
+          console.log('⏳ Still loading model into memory (this may take 1-2 minutes on first run)...')
+        }
       }
-      // In downloading mode, we don't increment the normal retry counter
     } else {
       retries++
     }
     
     // Check if process is still alive
     if (pythonProcess && pythonProcess.exitCode !== null) {
-      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}`)
+      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}. Check logs/backend_server.log for details.`)
       return false
     }
     
@@ -239,63 +261,52 @@ function startPythonBackend(): Promise<void> {
         shell: process.platform === 'win32'
       })
 
-      // 将 stdout 和 stderr 重定向到日志文件，并检测是否在下载模型
-      if (pythonProcess.stdout) {
-        pythonProcess.stdout.on('data', (data) => {
-          const str = data.toString()
-          // 只在启动阶段（下载模型时）输出到终端
-          if (isStartingUp) {
+      // 将 stdout 和 stderr 重定向到日志文件，并检测是否在下载/加载模型
+      const handleOutput = (data: Buffer, isStderr: boolean) => {
+        const str = data.toString()
+        // 只在启动阶段输出到终端
+        if (isStartingUp) {
+          if (isStderr) {
+            process.stderr.write(data)
+          } else {
             process.stdout.write(data)
           }
-          
-          if (str.includes('Starting download')) {
-            if (!isDownloading) {
-              isDownloading = true
-              console.log('⏳ Detected model download or heavy loading, waiting for it to complete...')
-            }
+        }
+        
+        // 检测模型下载
+        if (str.includes('Starting download')) {
+          if (!isDownloading) {
+            isDownloading = true
+            console.log('⏳ Detected model download, waiting for it to complete...')
           }
+        }
 
-          if (str.includes('download complete!')) {
-            console.log('✅ A model download has finished!')
-          }
+        if (str.includes('download complete!')) {
+          console.log('✅ A model download has finished!')
+        }
 
-          if (str.includes('[1/7] Loading CLIP encoder...')) {
-            console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
-            isDownloading = false
-            
-          }
+        // 检测模型加载开始（[1/7] Loading encoder 或 [1/10] Loading encoder）
+        if (str.includes('Loading encoder') && str.includes('[1/')) {
+          console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
+          console.log('⏳ This may take 1-2 minutes on first run (loading 2B+ parameter model)...')
+          isDownloading = false
+          isLoadingModel = true
+        }
 
-          if (str.includes('All backend components initialized successfully!')) {
-            isStartingUp = false // 停止输出到终端，后续日志只进入文件
-          }
-        })
+        // 检测初始化完成
+        if (str.includes('All backend components initialized successfully!')) {
+          console.log('✅ All models loaded successfully!')
+          isLoadingModel = false
+          isStartingUp = false // 停止输出到终端，后续日志只进入文件
+        }
+      }
+
+      if (pythonProcess.stdout) {
+        pythonProcess.stdout.on('data', (data) => handleOutput(data, false))
         pythonProcess.stdout.pipe(logStream)
       }
       if (pythonProcess.stderr) {
-        pythonProcess.stderr.on('data', (data) => {
-          const str = data.toString()
-          // 只在启动阶段（下载模型时）输出到终端
-          if (isStartingUp) {
-            process.stderr.write(data)
-          }
-          
-          if (str.includes('Starting download')) {
-            if (!isDownloading) {
-              isDownloading = true
-              console.log('⏳ Detected model download or heavy loading, waiting for it to complete...')
-            }
-          }
-
-          if (str.includes('download complete!')) {
-            console.log('✅ A model download has finished!')
-          }
-
-          if (str.includes('[1/7] Loading CLIP encoder...')) {
-            console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
-            isDownloading = false
-            isStartingUp = false // 停止输出到终端，后续日志只进入文件
-          }
-        })
+        pythonProcess.stderr.on('data', (data) => handleOutput(data, true))
         pythonProcess.stderr.pipe(logStream)
       }
 
@@ -357,7 +368,7 @@ app.whenReady().then(async () => {
       // 后端就绪后再创建窗口
       createWindow()
     } else {
-      console.error('Failed to start backend, exiting...')
+      console.error('Failed to start backend (timeout or backend exited). Check logs/backend_server.log, then try: python gui_backend_server.py')
       app.quit()
     }
   } catch (error) {

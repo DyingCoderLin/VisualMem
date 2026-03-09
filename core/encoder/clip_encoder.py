@@ -8,7 +8,7 @@ logger = setup_logger(__name__)
 
 class CLIPEncoder(MultiModalEncoderInterface):
     """
-    CLIP Encoder: 用于生成图像和文本的embedding
+    Image Encoder: 用于生成图像和文本的embedding
     模型轻量级（~600MB），可以在本地快速运行
     """
     
@@ -191,4 +191,24 @@ class CLIPEncoder(MultiModalEncoderInterface):
         similarity = (similarity + 1) / 2
         
         return similarity
+
+    def clear(self):
+        """释放模型占用的内存"""
+        logger.info(f"Releasing CLIP model: {self.model_name}")
+        self.model = None
+        self.processor = None
+        
+        import gc
+        gc.collect()
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+        except Exception:
+            pass
+        logger.info("CLIP model released.")
 

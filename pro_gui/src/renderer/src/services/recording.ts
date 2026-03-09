@@ -24,6 +24,7 @@ class RecordingService {
   private isRecording: boolean = false
   private frameCounter: number = 0 // 计数器：0-10，每成功发送 10 帧后刷新数据
   private statusListeners: ((status: boolean) => void)[] = []
+  private pendingRequests: Set<AbortController> = new Set() // 跟踪正在进行的请求
 
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
@@ -448,7 +449,8 @@ class RecordingService {
         const frameId = `${frameIdPrefix}${microSeconds}`
 
         // 发送到后端（异步，不阻塞）
-        this.sendFrameToBackendDirectly(base64Data, frameId, timestamp, width, height).catch(err => {
+        // index 作为 monitor_id 发送
+        this.sendFrameToBackendDirectly(base64Data, frameId, timestamp, width, height, index).catch(err => {
           console.error(`Error sending frame for screen ${index}:`, err)
         })
       }
@@ -464,21 +466,22 @@ class RecordingService {
   /**
    * 直接发送 Base64 帧到后端
    */
-  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number): Promise<void> {
-    // 发送到后端
+  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number = 0): Promise<void> {
+    // 再次检查录制状态
+    if (!this.isRecording) {
+      return
+    }
+    
     try {
-      // 再次检查录制状态
-      if (!this.isRecording) {
-        return
-      }
-      
       await apiClient.storeFrame({
         frame_id: frameId,
         timestamp: timestamp,
         image_base64: base64Data,
+        monitor_id: monitorId,
         metadata: {
           width: width,
-          height: height
+          height: height,
+          monitor_id: monitorId
         }
       })
       
@@ -492,7 +495,15 @@ class RecordingService {
         })
       }
     } catch (error) {
-      console.error('Failed to send frame to backend:', error)
+      // 忽略因停止录制导致的请求取消错误
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // 请求被取消，这是正常的（停止录制时）
+        return
+      }
+      // 只在录制状态下打印错误
+      if (this.isRecording) {
+        console.error('Failed to send frame to backend:', error)
+      }
     }
   }
 

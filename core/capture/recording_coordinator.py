@@ -129,6 +129,12 @@ class RecordingCoordinator:
         self.stats = RecordingStats()
         self._is_running = False
         self._current_frame_id: Optional[str] = None
+        self._last_stored_frame_id: Optional[str] = None
+        
+        # chunk_id cache: populated by _on_chunk_created callback so we avoid
+        # the race where we query the DB before the INSERT is committed.
+        self._latest_video_chunk_ids: Dict[int, int] = {}       # monitor_id -> chunk_id
+        self._latest_window_chunk_ids: Dict[str, int] = {}      # "app::window" -> chunk_id
         
         # Track active windows for cleanup
         self._active_window_keys: set = set()
@@ -136,31 +142,38 @@ class RecordingCoordinator:
         logger.info(f"RecordingCoordinator initialized: monitor={config.monitor_id}")
     
     def _on_chunk_created(self, chunk_path: str, chunk_type: str, identifier: str):
-        """Callback when a new video chunk is created"""
+        """Callback when a new video chunk is created.
+        
+        Inserts the chunk record into the database and caches the returned
+        chunk_id so that subsequent write_frame calls can reference it
+        without a racy SELECT query.
+        """
         logger.info(f"New {chunk_type} chunk created: {chunk_path}")
         
-        # Insert chunk record to database
         if chunk_type == "screen":
-            # Extract monitor_id from identifier (e.g., "monitor_0")
             monitor_id = int(identifier.split("_")[1]) if "_" in identifier else 0
-            self.db.insert_video_chunk(
+            chunk_id = self.db.insert_video_chunk(
                 file_path=chunk_path,
                 monitor_id=monitor_id,
                 device_name=identifier,
                 fps=self.config.fps
             )
+            if chunk_id > 0:
+                self._latest_video_chunk_ids[monitor_id] = chunk_id
         else:  # window
-            # Parse window key (e.g., "app::window::pid")
             parts = identifier.split("::")
             app_name = parts[0] if len(parts) > 0 else "unknown"
             window_name = parts[1] if len(parts) > 1 else "unknown"
-            self.db.insert_window_chunk(
+            chunk_id = self.db.insert_window_chunk(
                 file_path=chunk_path,
                 app_name=app_name,
                 window_name=window_name,
                 monitor_id=self.config.monitor_id,
                 fps=self.config.fps
             )
+            if chunk_id > 0:
+                key = f"{app_name}::{window_name}"
+                self._latest_window_chunk_ids[key] = chunk_id
     
     def _generate_frame_id(self) -> str:
         """Generate a unique frame ID"""
@@ -261,7 +274,7 @@ class RecordingCoordinator:
         # 2. Track active windows
         current_window_keys = set()
         for window in screen_obj.windows:
-            key = f"{window.app_name}::{window.window_name}::{window.process_id}"
+            key = f"{window.app_name}::{window.window_name}"
             current_window_keys.add(key)
         
         # Cleanup stale window writers
@@ -282,8 +295,11 @@ class RecordingCoordinator:
             if chunk_result:
                 chunk_path, offset_index = chunk_result
                 
-                # Get chunk_id from database
-                video_chunk_id = self._get_latest_video_chunk_id()
+                # Use cached chunk_id (populated by _on_chunk_created callback)
+                video_chunk_id = self._latest_video_chunk_ids.get(
+                    screen_obj.monitor_id,
+                    self._get_latest_video_chunk_id()
+                )
                 
                 # Store frame metadata
                 self.db.store_frame_with_video_ref(
@@ -292,7 +308,6 @@ class RecordingCoordinator:
                     video_chunk_id=video_chunk_id,
                     offset_index=offset_index,
                     monitor_id=screen_obj.monitor_id,
-                    image_hash=screen_obj.full_screen_hash,
                     device_name=screen_obj.device_name
                 )
                 
@@ -315,6 +330,7 @@ class RecordingCoordinator:
                 
                 result["frame_id"] = frame_id
                 result["frame_stored"] = True
+                self._last_stored_frame_id = frame_id
                 self.stats.frames_stored += 1
                 
                 # Callback
@@ -341,17 +357,17 @@ class RecordingCoordinator:
                 chunk_result = self.video_manager.write_window_frame(
                     window.app_name,
                     window.window_name,
-                    window.process_id,
                     window.image
                 )
                 
                 if chunk_result:
                     chunk_path, offset_index = chunk_result
                     
-                    # Get chunk_id from database
-                    window_chunk_id = self._get_latest_window_chunk_id(
-                        window.app_name,
-                        window.window_name
+                    # Use cached chunk_id (populated by _on_chunk_created callback)
+                    win_key = f"{window.app_name}::{window.window_name}"
+                    window_chunk_id = self._latest_window_chunk_ids.get(
+                        win_key,
+                        self._get_latest_window_chunk_id(window.app_name, window.window_name)
                     )
                     
                     # Store sub-frame metadata
@@ -361,10 +377,7 @@ class RecordingCoordinator:
                         window_chunk_id=window_chunk_id,
                         offset_index=offset_index,
                         app_name=window.app_name,
-                        window_name=window.window_name,
-                        process_id=window.process_id,
-                        is_focused=window.is_focused,
-                        image_hash=window.image_hash
+                        window_name=window.window_name
                     )
                     
                     # OCR (optional)
@@ -397,8 +410,12 @@ class RecordingCoordinator:
                     )
         
         # 5. Create frame-subframe mappings
-        if result["frame_id"] and sub_frame_ids:
-            self.db.add_frame_subframe_mappings_batch(result["frame_id"], sub_frame_ids)
+        # Use the current frame_id, or fall back to the most recently stored
+        # frame_id so that sub_frames captured when the screen is unchanged
+        # still get linked to a parent frame.
+        mapping_frame_id = result["frame_id"] or self._last_stored_frame_id
+        if mapping_frame_id and sub_frame_ids:
+            self.db.add_frame_subframe_mappings_batch(mapping_frame_id, sub_frame_ids)
         
         result["sub_frame_ids"] = sub_frame_ids
         result["sub_frames_stored"] = len(sub_frame_ids)

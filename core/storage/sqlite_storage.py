@@ -57,7 +57,7 @@ class SQLiteStorage:
     5. sub_frames: 窗口子帧
        - sub_frame_id (primary key)
        - window_chunk_id, offset_index, timestamp
-       - app_name, window_name, process_id, is_focused, image_hash
+       - app_name, window_name
     
     6. frame_subframe_mapping: 帧与子帧映射
        - frame_id -> sub_frame_id (多对多)
@@ -86,14 +86,70 @@ class SQLiteStorage:
         conn.row_factory = sqlite3.Row  # 使用 Row 工厂，方便字典访问
         return conn
     
+    def _migrate_tables(self, cursor: sqlite3.Cursor):
+        """
+        数据库迁移：为现有表添加缺失的列
+        这确保了旧数据库与新schema的兼容性
+        """
+        # 定义frames表需要的新列及其默认值
+        frames_new_columns = [
+            ("video_chunk_id", "INTEGER", None),
+            ("offset_index", "INTEGER", None),
+            ("monitor_id", "INTEGER", "0"),
+            ("created_at", "TEXT", "CURRENT_TIMESTAMP"),
+            ("app_name", "TEXT", None),  # 应用名称（frame为空，sub_frame填写）
+            ("window_name", "TEXT", None),  # 窗口名称（frame为空，sub_frame填写）
+        ]
+        
+        # 定义ocr_text表需要的新列
+        ocr_text_new_columns = [
+            ("sub_frame_id", "TEXT", None),
+        ]
+        
+        # 检查并添加frames表的列
+        try:
+            cursor.execute("PRAGMA table_info(frames)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            
+            for col_name, col_type, default_val in frames_new_columns:
+                if col_name not in existing_columns:
+                    if default_val:
+                        cursor.execute(f"ALTER TABLE frames ADD COLUMN {col_name} {col_type} DEFAULT {default_val}")
+                    else:
+                        cursor.execute(f"ALTER TABLE frames ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Migrated frames table: added column {col_name}")
+        except sqlite3.OperationalError as e:
+            # 表不存在时忽略，会在后面创建
+            if "no such table" not in str(e).lower():
+                logger.warning(f"Migration warning for frames table: {e}")
+        
+        # 检查并添加ocr_text表的列
+        try:
+            cursor.execute("PRAGMA table_info(ocr_text)")
+            existing_columns = {row[1] for row in cursor.fetchall()}
+            
+            for col_name, col_type, default_val in ocr_text_new_columns:
+                if col_name not in existing_columns:
+                    if default_val:
+                        cursor.execute(f"ALTER TABLE ocr_text ADD COLUMN {col_name} {col_type} DEFAULT {default_val}")
+                    else:
+                        cursor.execute(f"ALTER TABLE ocr_text ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Migrated ocr_text table: added column {col_name}")
+        except sqlite3.OperationalError as e:
+            if "no such table" not in str(e).lower():
+                logger.warning(f"Migration warning for ocr_text table: {e}")
+    
     def _create_tables(self):
         """创建数据库表"""
         conn = self._get_connection()
         cursor = conn.cursor()
         
+        # ========== 数据库迁移：检查并添加缺失的列 ==========
+        self._migrate_tables(cursor)
+        
         # ========== 旧表（保持兼容，扩展字段） ==========
         
-        # 创建 frames 表（扩展支持video_chunk引用）
+        # 创建 frames 表（扩展支持video_chunk引用和app/window信息）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS frames (
                 frame_id TEXT PRIMARY KEY,
@@ -104,8 +160,9 @@ class SQLiteStorage:
                 video_chunk_id INTEGER,
                 offset_index INTEGER,
                 monitor_id INTEGER DEFAULT 0,
-                image_hash INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                app_name TEXT,
+                window_name TEXT,
                 FOREIGN KEY (video_chunk_id) REFERENCES video_chunks(id)
             )
         """)
@@ -165,9 +222,6 @@ class SQLiteStorage:
                 timestamp TEXT NOT NULL,
                 app_name TEXT NOT NULL,
                 window_name TEXT NOT NULL,
-                process_id INTEGER,
-                is_focused INTEGER DEFAULT 0,
-                image_hash INTEGER,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (window_chunk_id) REFERENCES window_chunks(id)
             )
@@ -284,7 +338,9 @@ class SQLiteStorage:
         ocr_engine: str = "pytesseract",
         ocr_confidence: float = 0.0,
         device_name: str = "default",
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
         存储帧和 OCR 结果
@@ -299,23 +355,60 @@ class SQLiteStorage:
             ocr_confidence: OCR 置信度
             device_name: 设备名称
             metadata: 其他元数据
+            app_name: 应用名称（frame为空，sub_frame填写）
+            window_name: 窗口名称（frame为空，sub_frame填写）
         """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             
-            # 1. 插入 frame
-            cursor.execute("""
-                INSERT OR REPLACE INTO frames 
-                (frame_id, timestamp, image_path, device_name, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                frame_id,
-                timestamp.isoformat(),
-                str(image_path),
-                device_name,
-                json.dumps(metadata) if metadata else "{}"
-            ))
+            # 先检查是否已经有记录（比如已经被视频压缩进程更新过）
+            cursor.execute("SELECT image_path, video_chunk_id, offset_index FROM frames WHERE frame_id = ?", (frame_id,))
+            existing_row = cursor.fetchone()
+
+            if existing_row:
+                # 记录已存在，仅更新不覆盖 video_chunk 相关的 image_path
+                existing_image_path = existing_row["image_path"]
+                final_image_path = str(image_path)
+                
+                # 如果原路径已经是 video_chunk/window_chunk，并且新路径不是，则保留原路径
+                # 但是如果新路径是 video_chunk/window_chunk (这通常不会发生在这个函数，但为了安全)，则允许覆盖
+                if existing_image_path and ("video_chunk:" in existing_image_path or "window_chunk:" in existing_image_path) and not ("video_chunk:" in final_image_path or "window_chunk:" in final_image_path):
+                    final_image_path = existing_image_path
+
+                cursor.execute("""
+                    UPDATE frames 
+                    SET timestamp = ?, 
+                        image_path = ?, 
+                        device_name = ?, 
+                        metadata = ?, 
+                        app_name = ?, 
+                        window_name = ?
+                    WHERE frame_id = ?
+                """, (
+                    timestamp.isoformat(),
+                    str(final_image_path),
+                    device_name,
+                    json.dumps(metadata) if metadata else "{}",
+                    app_name,
+                    window_name,
+                    frame_id
+                ))
+            else:
+                # 1. 插入 frame
+                cursor.execute("""
+                    INSERT INTO frames 
+                    (frame_id, timestamp, image_path, device_name, metadata, app_name, window_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    frame_id,
+                    timestamp.isoformat(),
+                    str(image_path),
+                    device_name,
+                    json.dumps(metadata) if metadata else "{}",
+                    app_name,
+                    window_name
+                ))
             
             # 2. 插入 OCR 结果（如果有文本）
             if ocr_text:
@@ -547,7 +640,8 @@ class SQLiteStorage:
         self,
         start_time: Union[datetime, str],
         end_time: Union[datetime, str],
-        limit: int = 10000
+        limit: int = 10000,
+        only_full_screen: bool = False
     ) -> List[Dict]:
         """
         获取时间范围内的帧（直接在 SQL 中按时间范围查询，更高效）
@@ -556,6 +650,7 @@ class SQLiteStorage:
             start_time: 开始时间 (datetime 或 ISO 字符串)
             end_time: 结束时间 (datetime 或 ISO 字符串)
             limit: 最大返回数量（防止内存溢出）
+            only_full_screen: 是否只返回全屏帧（排除子帧）
             
         Returns:
             帧列表
@@ -568,7 +663,7 @@ class SQLiteStorage:
             start_str = start_time.isoformat() if isinstance(start_time, datetime) else start_time
             end_str = end_time.isoformat() if isinstance(end_time, datetime) else end_time
             
-            cursor.execute("""
+            sql = """
                 SELECT 
                     f.frame_id,
                     f.timestamp,
@@ -580,9 +675,17 @@ class SQLiteStorage:
                 FROM frames f
                 LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
                 WHERE f.timestamp >= ? AND f.timestamp < ?
-                ORDER BY f.timestamp ASC
-                LIMIT ?
-            """, (start_str, end_str, limit))
+            """
+            
+            params = [start_str, end_str]
+            
+            if only_full_screen:
+                sql += " AND (f.app_name IS NULL OR f.app_name = '')"
+                
+            sql += " ORDER BY f.timestamp ASC LIMIT ?"
+            params.append(limit)
+            
+            cursor.execute(sql, tuple(params))
             
             rows = cursor.fetchall()
             conn.close()
@@ -834,12 +937,15 @@ class SQLiteStorage:
         video_chunk_id: int,
         offset_index: int,
         monitor_id: int = 0,
-        image_hash: int = 0,
         device_name: str = "default",
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
-        存储帧（使用video_chunk引用而非image_path）
+        更新帧的 video_chunk 引用（如果帧已存在则更新，否则插入）
+        
+        注意：这个方法会保留现有的 OCR 数据，只更新 video 相关字段
         
         Args:
             frame_id: 帧ID
@@ -847,38 +953,62 @@ class SQLiteStorage:
             video_chunk_id: 关联的视频chunk ID
             offset_index: 在视频中的帧索引
             monitor_id: 显示器ID
-            image_hash: 图像哈希值
             device_name: 设备名称
             metadata: 其他元数据
+            app_name: 应用名称（frame为空，sub_frame填写）
+            window_name: 窗口名称（frame为空，sub_frame填写）
         """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
-            # image_path 设为空字符串或video chunk引用
+
+            # image_path 设为 video chunk 引用
             image_path = f"video_chunk:{video_chunk_id}:{offset_index}"
             
+            # 先尝试更新现有记录
             cursor.execute("""
-                INSERT OR REPLACE INTO frames 
-                (frame_id, timestamp, image_path, device_name, metadata, 
-                 video_chunk_id, offset_index, monitor_id, image_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE frames 
+                SET image_path = ?,
+                    video_chunk_id = ?,
+                    offset_index = ?,
+                    monitor_id = ?,
+                    app_name = ?,
+                    window_name = ?
+                WHERE frame_id = ?
             """, (
-                frame_id,
-                timestamp.isoformat(),
                 image_path,
-                device_name,
-                json.dumps(metadata) if metadata else "{}",
                 video_chunk_id,
                 offset_index,
                 monitor_id,
-                image_hash
+                app_name,
+                window_name,
+                frame_id
             ))
+            
+            # 如果没有更新到任何记录，则插入新记录
+            if cursor.rowcount == 0:
+                cursor.execute("""
+                    INSERT INTO frames 
+                    (frame_id, timestamp, image_path, device_name, metadata, 
+                     video_chunk_id, offset_index, monitor_id, app_name, window_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    frame_id,
+                    timestamp.isoformat(),
+                    image_path,
+                    device_name,
+                    json.dumps(metadata) if metadata else "{}",
+                    video_chunk_id,
+                    offset_index,
+                    monitor_id,
+                    app_name,
+                    window_name
+                ))
             
             conn.commit()
             conn.close()
             
-            logger.debug(f"Stored frame {frame_id} with video ref")
+            logger.debug(f"Updated frame {frame_id} with video ref (chunk={video_chunk_id}, offset={offset_index})")
             return True
             
         except Exception as e:
@@ -892,10 +1022,7 @@ class SQLiteStorage:
         window_chunk_id: int,
         offset_index: int,
         app_name: str,
-        window_name: str,
-        process_id: int = 0,
-        is_focused: bool = False,
-        image_hash: int = 0
+        window_name: str
     ) -> bool:
         """
         存储窗口子帧
@@ -907,29 +1034,23 @@ class SQLiteStorage:
             offset_index: 在视频中的帧索引
             app_name: 应用名称
             window_name: 窗口名称
-            process_id: 进程ID
-            is_focused: 是否聚焦
-            image_hash: 图像哈希值
         """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
+
             cursor.execute("""
                 INSERT OR REPLACE INTO sub_frames 
                 (sub_frame_id, window_chunk_id, offset_index, timestamp,
-                 app_name, window_name, process_id, is_focused, image_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 app_name, window_name)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 sub_frame_id,
                 window_chunk_id,
                 offset_index,
                 timestamp.isoformat(),
                 app_name,
-                window_name,
-                process_id,
-                1 if is_focused else 0,
-                image_hash
+                window_name
             ))
             
             conn.commit()
@@ -1062,10 +1183,7 @@ class SQLiteStorage:
                     "offset_index": row["offset_index"],
                     "timestamp": datetime.fromisoformat(row["timestamp"]),
                     "app_name": row["app_name"],
-                    "window_name": row["window_name"],
-                    "process_id": row["process_id"],
-                    "is_focused": bool(row["is_focused"]),
-                    "image_hash": row["image_hash"]
+                    "window_name": row["window_name"]
                 })
             
             return results
@@ -1142,6 +1260,141 @@ class SQLiteStorage:
             logger.error(f"Failed to get sub_frame video info: {e}")
             return None
     
+    def extract_frame_image(self, frame_id: str) -> Optional[Image.Image]:
+        """
+        从 MP4 视频中提取指定帧的图像。
+
+        先查询帧的 video_chunk 信息，然后调用 FFmpeg 提取。
+        如果帧的 image_path 是普通文件路径则直接加载。
+        """
+        try:
+            info = self.get_frame_video_info(frame_id)
+            if info and info.get("file_path") and info.get("offset_index") is not None:
+                from .ffmpeg_utils import FFmpegFrameExtractor
+                extractor = FFmpegFrameExtractor()
+                return extractor.extract_frame_by_index(
+                    info["file_path"],
+                    info["offset_index"],
+                    info.get("fps", 1.0),
+                )
+
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if row and row["image_path"]:
+                path = row["image_path"]
+                if path.startswith("video_chunk:") or path.startswith("window_chunk:"):
+                    parts = path.split(":")
+                    if len(parts) == 3:
+                        chunk_id, offset = int(parts[1]), int(parts[2])
+                        table = "video_chunks" if path.startswith("video_chunk:") else "window_chunks"
+                        conn = self._get_connection()
+                        cursor = conn.cursor()
+                        cursor.execute(f"SELECT file_path, fps FROM {table} WHERE id = ?", (chunk_id,))
+                        r = cursor.fetchone()
+                        conn.close()
+                        if r:
+                            from .ffmpeg_utils import FFmpegFrameExtractor
+                            return FFmpegFrameExtractor().extract_frame_by_index(
+                                r["file_path"], offset, r["fps"]
+                            )
+                else:
+                    import os
+                    if os.path.exists(path):
+                        return Image.open(path).convert("RGB")
+            return None
+        except Exception as e:
+            logger.error(f"Failed to extract frame image for {frame_id}: {e}")
+            return None
+
+    def extract_sub_frame_image(self, sub_frame_id: str) -> Optional[Image.Image]:
+        """
+        从 MP4 视频中提取指定子帧的图像。
+
+        先查询子帧的 window_chunk 信息，然后调用 FFmpeg 提取。
+        """
+        try:
+            info = self.get_sub_frame_video_info(sub_frame_id)
+            if info and info.get("file_path") and info.get("offset_index") is not None:
+                from .ffmpeg_utils import FFmpegFrameExtractor
+                extractor = FFmpegFrameExtractor()
+                return extractor.extract_frame_by_index(
+                    info["file_path"],
+                    info["offset_index"],
+                    info.get("fps", 1.0),
+                )
+            return None
+        except Exception as e:
+            logger.error(f"Failed to extract sub_frame image for {sub_frame_id}: {e}")
+            return None
+
+    def get_frame_with_sub_frames(self, frame_id: str) -> Optional[Dict]:
+        """
+        获取帧及其所有关联子帧的完整信息（含视频chunk路径）。
+        
+        Returns:
+            包含 frame 信息和 sub_frames 列表的字典
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                SELECT f.*, vc.file_path as chunk_file_path, vc.fps as chunk_fps
+                FROM frames f
+                LEFT JOIN video_chunks vc ON f.video_chunk_id = vc.id
+                WHERE f.frame_id = ?
+            """, (frame_id,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return None
+            
+            frame_info = {
+                "frame_id": row["frame_id"],
+                "timestamp": datetime.fromisoformat(row["timestamp"]),
+                "image_path": row["image_path"],
+                "video_chunk_id": row["video_chunk_id"],
+                "offset_index": row["offset_index"],
+                "chunk_file_path": row["chunk_file_path"],
+                "chunk_fps": row["chunk_fps"],
+                "monitor_id": row["monitor_id"],
+            }
+            
+            cursor.execute("""
+                SELECT sf.*, wc.file_path as chunk_file_path, wc.fps as chunk_fps
+                FROM sub_frames sf
+                JOIN frame_subframe_mapping fsm ON sf.sub_frame_id = fsm.sub_frame_id
+                LEFT JOIN window_chunks wc ON sf.window_chunk_id = wc.id
+                WHERE fsm.frame_id = ?
+                ORDER BY sf.app_name, sf.window_name
+            """, (frame_id,))
+            sub_rows = cursor.fetchall()
+            conn.close()
+            
+            sub_frames = []
+            for sr in sub_rows:
+                sub_frames.append({
+                    "sub_frame_id": sr["sub_frame_id"],
+                    "timestamp": datetime.fromisoformat(sr["timestamp"]),
+                    "app_name": sr["app_name"],
+                    "window_name": sr["window_name"],
+                    "window_chunk_id": sr["window_chunk_id"],
+                    "offset_index": sr["offset_index"],
+                    "chunk_file_path": sr["chunk_file_path"],
+                    "chunk_fps": sr["chunk_fps"],
+                })
+            
+            frame_info["sub_frames"] = sub_frames
+            return frame_info
+            
+        except Exception as e:
+            logger.error(f"Failed to get frame with sub_frames: {e}")
+            return None
+
     def search_sub_frames_by_app(
         self,
         app_name: str,
@@ -1173,7 +1426,6 @@ class SQLiteStorage:
                     "timestamp": datetime.fromisoformat(row["timestamp"]),
                     "app_name": row["app_name"],
                     "window_name": row["window_name"],
-                    "is_focused": bool(row["is_focused"]),
                     "ocr_text": row["ocr_text"] or "",
                     "ocr_confidence": row["ocr_confidence"] or 0.0
                 })

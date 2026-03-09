@@ -15,3 +15,9 @@ class Reranker:
         对搜索结果进行重排
         """
         return self.instance.rerank(query, frames, top_k)
+    
+    def clear(self):
+        """释放模型资源"""
+        from .local_reranker import clear_rerank_model
+        clear_rerank_model()
+        self.instance = None

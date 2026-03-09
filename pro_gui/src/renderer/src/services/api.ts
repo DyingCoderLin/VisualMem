@@ -8,6 +8,14 @@ interface QueryRagRequest {
   ocr_mode?: boolean
 }
 
+export interface SubFrameResult {
+  sub_frame_id: string
+  timestamp: string
+  app_name: string
+  window_name: string
+  image_path: string | null
+}
+
 export interface FrameResult {
   frame_id: string
   timestamp: string
@@ -15,6 +23,7 @@ export interface FrameResult {
   image_path?: string
   ocr_text?: string
   relevance?: number
+  sub_frames?: SubFrameResult[]
 }
 
 interface QueryRagResponse {
@@ -42,13 +51,14 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    timeoutMs: number = 30000  // 默认 30 秒超时
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`
     
-    // 为所有请求设置默认超时（例如 30 秒），防止请求无限挂起
+    // 为所有请求设置超时，防止请求无限挂起
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 30000)
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
       const response = await fetch(url, {
@@ -167,13 +177,39 @@ class ApiClient {
     frame_id: string
     timestamp: string
     image_base64: string
+    monitor_id?: number
     metadata?: Record<string, any>
-  }): Promise<{ status: string }> {
-    // 存储帧到后端
-    return this.request<{ status: string }>('/api/store_frame', {
-      method: 'POST',
-      body: JSON.stringify(req)
-    })
+    windows?: Array<{
+      app_name: string
+      window_name: string
+      image_base64: string
+    }>
+  }): Promise<{ status: string; frame_id?: string; sub_frame_count?: number }> {
+    // 存储帧到后端（支持窗口信息）
+    // 使用更长的超时（120秒），因为后端需要做 embedding + OCR
+    return this.request<{ status: string; frame_id?: string; sub_frame_count?: number }>(
+      '/api/store_frame',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...req,
+          monitor_id: req.monitor_id ?? 0
+        })
+      },
+      120000  // 120 秒超时
+    )
+  }
+
+  async extractVideoFrame(videoPath: string, frameIndex: number = 0, fps: number = 1.0): Promise<{ image_base64: string; width: number; height: number }> {
+    // 从视频中提取单帧
+    return this.request<{ image_base64: string; width: number; height: number }>(
+      `/api/video/extract_frame?video_path=${encodeURIComponent(videoPath)}&frame_index=${frameIndex}&fps=${fps}`
+    )
+  }
+
+  getVideoFrameImageUrl(videoPath: string, frameIndex: number = 0, fps: number = 1.0): string {
+    // 获取视频帧图片URL（用于img标签）
+    return `${this.baseUrl}/api/video/frame_image?video_path=${encodeURIComponent(videoPath)}&frame_index=${frameIndex}&fps=${fps}`
   }
 }
 

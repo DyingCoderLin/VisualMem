@@ -18,7 +18,7 @@ import time as time_module
 from collections import deque
 import json
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,6 +31,12 @@ from utils.logger import setup_logger
 from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.storage.sqlite_storage import SQLiteStorage
+from core.storage.temp_frame_buffer import TempFrameBuffer, FrameInfo
+from core.storage.ffmpeg_utils import (
+    FFmpegFrameCompressor,
+    FFmpegFrameExtractor,
+    get_video_frame_as_base64,
+)
 from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
 from core.retrieval.reranker import Reranker
 from core.understand.api_vlm import ApiVLM
@@ -109,6 +115,35 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _parent_watchdog():
+    """
+    监控父进程是否还在运行。如果父进程退出，则自动退出。
+    这防止了 Electron 前端关闭后 Python 后端依然运行的问题。
+    """
+    import os
+    import sys
+    import time as time_module
+    
+    # 记录启动时的父进程 ID
+    initial_ppid = os.getppid()
+    if initial_ppid <= 1:
+        # 如果父进程已经是 1 (init/launchd)，说明可能是独立启动的，不开启监控
+        logger.info("Backend started without parent process or as orphan, skipping watchdog.")
+        return
+
+    logger.info(f"Parent process watchdog started (monitoring PPID: {initial_ppid})")
+    
+    while True:
+        time_module.sleep(5)  # 每 5 秒检查一次
+        current_ppid = os.getppid()
+        
+        # 如果父进程 ID 变为 1，或者与初始 ID 不同，说明原来的父进程已经退出
+        if current_ppid != initial_ppid:
+            logger.info(f"Parent process (PPID {initial_ppid}) has exited. Backend shutting down...")
+            # 发送退出信号
+            os._exit(0)  # 使用 os._exit(0) 强制退出，避免被 uvicorn 捕获
+
+
 # ============ 全局单例组件 ============
 
 encoder = None
@@ -117,6 +152,33 @@ sqlite_storage: Optional[SQLiteStorage] = None
 reranker: Optional[Reranker] = None
 vlm: Optional[ApiVLM] = None
 ocr_engine = None
+
+# ============ 视频存储相关组件 ============
+temp_frame_buffer: Optional[TempFrameBuffer] = None
+ffmpeg_compressor: Optional[FFmpegFrameCompressor] = None
+ffmpeg_extractor: Optional[FFmpegFrameExtractor] = None
+
+# 帧差检测（窗口级别去重）
+from core.preprocess.frame_diff import FrameDiffDetector
+window_diff_detector: Optional[FrameDiffDetector] = None
+
+# 视频压缩配置
+VIDEO_BATCH_SIZE = 60  # 每60帧压缩一次
+VIDEO_FPS = 1.0  # 1帧/秒
+
+# ============ 窗口捕获组件 ============
+# 尝试导入 screencap_rs 用于窗口捕获
+USE_SCREENCAP_RS = False
+screencap_rs_module = None
+try:
+    import screencap_rs as screencap_rs_module
+    USE_SCREENCAP_RS = True
+    logger.info(f"screencap_rs available (platform: {screencap_rs_module.get_platform()})")
+except ImportError:
+    logger.warning("screencap_rs not available, window capture will be disabled")
+
+# 是否在后端捕获窗口（如果前端没有提供窗口信息）
+ENABLE_BACKEND_WINDOW_CAPTURE = True
 
 # ============ 批量写入缓冲区 ============
 
@@ -178,6 +240,8 @@ class BatchWriteBuffer:
                             ocr_confidence=frame_data.get("ocr_confidence", 0.0),
                             device_name=frame_data.get("device_name", "remote-gui"),
                             metadata=frame_data.get("metadata", {}),
+                            app_name=frame_data.get("app_name"),  # frame 为空，sub_frame 填写
+                            window_name=frame_data.get("window_name"),  # frame 为空，sub_frame 填写
                         )
                     except Exception as e:
                         logger.error(f"写入 SQLite 失败 (frame_id={frame_data.get('frame_id')}): {e}")
@@ -215,6 +279,289 @@ class BatchWriteBuffer:
 
 # 全局批量写入缓冲区
 batch_write_buffer: Optional[BatchWriteBuffer] = None
+
+
+def _on_video_batch_ready(batch_type: str, identifier: str, frames: List[FrameInfo]):
+    """
+    当视频批次准备好压缩时的回调函数
+    
+    Args:
+        batch_type: "full_screen" 或 "window"
+        identifier: "monitor_{id}" 或 "{app_name}_{window_name}"
+        frames: 帧信息列表
+    """
+    logger.info(f"Video batch ready: {batch_type}/{identifier}, {len(frames)} frames")
+    # 实际压缩在 _compress_video_batch 中异步执行
+
+
+def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameInfo]):
+    """
+    压缩视频批次
+    
+    Args:
+        batch_type: "full_screen" 或 "window"
+        identifier: "monitor_{id}" 或 "{app_name}_{window_name}"
+        frames: 帧信息列表
+    """
+    global temp_frame_buffer, ffmpeg_compressor, sqlite_storage
+    
+    if not frames or ffmpeg_compressor is None:
+        return
+    
+    try:
+        # 获取输出路径
+        first_frame = frames[0]
+        output_path = temp_frame_buffer._get_video_output_path(
+            batch_type, identifier, first_frame.timestamp
+        )
+        
+        # 收集输入文件路径
+        input_files = [f.image_path for f in frames]
+        
+        # 压缩视频
+        success = ffmpeg_compressor.compress_from_files(input_files, str(output_path))
+        
+        if success:
+            logger.info(f"Video compression successful: {output_path}")
+            
+            # 插入视频chunk记录到数据库
+            if sqlite_storage is not None:
+                if batch_type == "full_screen":
+                    monitor_id = int(identifier.split("_")[1]) if "_" in identifier else 0
+                    chunk_id = sqlite_storage.insert_video_chunk(
+                        file_path=str(output_path),
+                        monitor_id=monitor_id,
+                        device_name=identifier,
+                        fps=VIDEO_FPS
+                    )
+                    
+                    # 更新所有帧的video_chunk_id
+                    if chunk_id > 0:
+                        sqlite_storage.update_chunk_frame_count(chunk_id, len(frames), "video")
+                        for i, frame in enumerate(frames):
+                            sqlite_storage.store_frame_with_video_ref(
+                                frame_id=frame.frame_id,
+                                timestamp=frame.timestamp,
+                                video_chunk_id=chunk_id,
+                                offset_index=i,
+                                monitor_id=frame.monitor_id,
+                                device_name=identifier,
+                                metadata=frame.metadata,
+                                app_name=None,  # frame 类型，app_name 为空
+                                window_name=None  # frame 类型，window_name 为空
+                            )
+                else:
+                    # 窗口视频
+                    app_name = frames[0].app_name or "unknown"
+                    window_name = frames[0].window_name or "unknown"
+                    chunk_id = sqlite_storage.insert_window_chunk(
+                        file_path=str(output_path),
+                        app_name=app_name,
+                        window_name=window_name,
+                        monitor_id=0,
+                        fps=VIDEO_FPS
+                    )
+                    
+                    if chunk_id > 0:
+                        sqlite_storage.update_chunk_frame_count(chunk_id, len(frames), "window")
+                        for i, frame in enumerate(frames):
+                            # 存储到 sub_frames 表（用于关联 window_chunk）
+                            sqlite_storage.store_sub_frame(
+                                sub_frame_id=frame.frame_id,
+                                timestamp=frame.timestamp,
+                                window_chunk_id=chunk_id,
+                                offset_index=i,
+                                app_name=frame.app_name or "",
+                                window_name=frame.window_name or ""
+                            )
+                            
+                            # 同时更新 frames 表中的记录（sub_frame 也存储在 frames 表中，用于统一查询）
+                            # 使用 window_chunk 格式：window_chunk:{chunk_id}:{offset_index}
+                            image_path = f"window_chunk:{chunk_id}:{i}"
+                            # 对于 sub_frame，video_chunk_id 设为 NULL（因为它是 window_chunk）
+                            # 我们需要直接更新 frames 表
+                            try:
+                                conn = sqlite_storage._get_connection()
+                                cursor = conn.cursor()
+                                
+                                # First check if frame exists
+                                cursor.execute("SELECT 1 FROM frames WHERE frame_id = ?", (frame.frame_id,))
+                                if cursor.fetchone():
+                                    cursor.execute("""
+                                        UPDATE frames 
+                                        SET image_path = ?,
+                                            offset_index = ?,
+                                            app_name = ?,
+                                            window_name = ?
+                                        WHERE frame_id = ?
+                                    """, (
+                                        image_path,
+                                        i,
+                                        frame.app_name or "",
+                                        frame.window_name or "",
+                                        frame.frame_id
+                                    ))
+                                else:
+                                    # Insert if it doesn't exist
+                                    cursor.execute("""
+                                        INSERT INTO frames 
+                                        (frame_id, timestamp, image_path, device_name, metadata, app_name, window_name, offset_index)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        frame.frame_id,
+                                        frame.timestamp.isoformat(),
+                                        image_path,
+                                        f"{frame.app_name}/{frame.window_name}",
+                                        "{}",
+                                        frame.app_name or "",
+                                        frame.window_name or "",
+                                        i
+                                    ))
+                                conn.commit()
+                                conn.close()
+                                logger.debug(f"Updated sub_frame {frame.frame_id} in frames table")
+                            except Exception as e:
+                                logger.error(f"Failed to update sub_frame {frame.frame_id} in frames table: {e}")
+                            
+                            # 创建帧与子帧的映射关系
+                            if frame.parent_frame_id:
+                                sqlite_storage.add_frame_subframe_mapping(
+                                    frame_id=frame.parent_frame_id,
+                                    sub_frame_id=frame.frame_id
+                                )
+            
+            # 清理临时文件
+            temp_frame_buffer.cleanup_batch_files(frames)
+            
+        else:
+            logger.error(f"Video compression failed for {batch_type}/{identifier}")
+            
+    except Exception as e:
+        logger.error(f"Error compressing video batch: {e}")
+
+
+def _check_and_compress_batches():
+    """
+    检查并压缩所有就绪的批次
+    """
+    global temp_frame_buffer
+    
+    if temp_frame_buffer is None:
+        return
+    
+    ready_batches = temp_frame_buffer.get_ready_batches()
+    for batch_type, identifier, _ in ready_batches:
+        frames = temp_frame_buffer.flush_batch(batch_type, identifier)
+        if frames:
+            _compress_video_batch(batch_type, identifier, frames)
+
+
+def _flush_all_video_buffers():
+    """
+    刷新所有视频缓冲区（用于停止录制时）
+    """
+    global temp_frame_buffer
+    
+    if temp_frame_buffer is None:
+        return
+    
+    all_batches = temp_frame_buffer.flush_all()
+    for batch_type, identifier, frames in all_batches:
+        if frames:
+            _compress_video_batch(batch_type, identifier, frames)
+    
+    # 清理空目录
+    temp_frame_buffer.cleanup_empty_dirs()
+
+
+def _recover_temp_frames():
+    """
+    发现异常退出遗留的 temp_frames，将其压缩成 MP4 并更新 SQLite，然后删除临时文件。
+    """
+    global temp_frame_buffer, ffmpeg_compressor, sqlite_storage
+    if not sqlite_storage or not ffmpeg_compressor or not temp_frame_buffer:
+        return
+        
+    try:
+        conn = sqlite_storage._get_connection()
+        cursor = conn.cursor()
+        
+        # 1. 恢复全屏截图
+        cursor.execute("SELECT frame_id, timestamp, image_path, device_name, metadata FROM frames WHERE image_path LIKE '%temp_frames%' AND frame_id LIKE 'frame_%' ORDER BY timestamp ASC")
+        fs_records = cursor.fetchall()
+        
+        from collections import defaultdict
+        from core.storage.temp_frame_buffer import FrameInfo
+        import json
+        
+        fs_groups = defaultdict(list)
+        for row in fs_records:
+            path = Path(row["image_path"])
+            if path.exists():
+                monitor_id = 0
+                if row["device_name"] and row["device_name"].startswith("monitor_"):
+                    try:
+                        monitor_id = int(row["device_name"].split("_")[1])
+                    except ValueError:
+                        pass
+                
+                ts_str = row["timestamp"]
+                ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
+                
+                fs_groups[monitor_id].append(FrameInfo(
+                    frame_id=row["frame_id"],
+                    timestamp=ts,
+                    image_path=str(path),
+                    monitor_id=monitor_id,
+                    metadata=json.loads(row["metadata"]) if row["metadata"] else {}
+                ))
+            else:
+                # 文件丢失，清理僵尸路径
+                cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["frame_id"],))
+        
+        for monitor_id, frames in fs_groups.items():
+            logger.info(f"Recovering {len(frames)} leftover full_screen temp_frames for monitor_{monitor_id}...")
+            _compress_video_batch("full_screen", f"monitor_{monitor_id}", frames)
+            
+        # 2. 恢复窗口截图
+        cursor.execute("""
+            SELECT s.sub_frame_id, s.timestamp, f.image_path, s.app_name, s.window_name
+            FROM sub_frames s
+            JOIN frames f ON s.sub_frame_id = f.frame_id
+            WHERE f.image_path LIKE '%temp_frames%'
+            ORDER BY s.timestamp ASC
+        """)
+        win_records = cursor.fetchall()
+        
+        win_groups = defaultdict(list)
+        for row in win_records:
+            path = Path(row["image_path"])
+            if path.exists():
+                app_name = row["app_name"] or "unknown"
+                window_name = row["window_name"] or "unknown"
+                key = f"{app_name}_{window_name}"
+                
+                ts_str = row["timestamp"]
+                ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
+                
+                win_groups[key].append(FrameInfo(
+                    frame_id=row["sub_frame_id"],
+                    timestamp=ts,
+                    image_path=str(path),
+                    app_name=app_name,
+                    window_name=window_name
+                ))
+            else:
+                cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["sub_frame_id"],))
+                
+        for key, frames in win_groups.items():
+            logger.info(f"Recovering {len(frames)} leftover window temp_frames for {key}...")
+            _compress_video_batch("window", key, frames)
+            
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error recovering temp frames: {e}")
 
 
 def _init_components():
@@ -263,6 +610,7 @@ def _init_all_components():
     与 _init_components() 不同，这个函数会强制加载，不检查是否已加载。
     """
     global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine, batch_write_buffer
+    global temp_frame_buffer, ffmpeg_compressor, ffmpeg_extractor, window_diff_detector
     
     logger.info("=" * 60)
     logger.info("Initializing all backend components (startup preload)...")
@@ -270,7 +618,7 @@ def _init_all_components():
 
     # 0. Pre-flight check: Ensure models are downloaded
     # This provides better UX by explicitly showing download progress
-    ensure_model_downloaded(config.EMBEDDING_MODEL, "CLIP Encoder")
+    ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
     
     if config.ENABLE_RERANK:
         ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
@@ -333,9 +681,34 @@ def _init_all_components():
         logger.warning(f"优化 LanceDB 失败: {e}")
     
     # 8. Initialize batch write buffer
-    logger.info("[8/8] Initializing batch write buffer...")
+    logger.info("[8/10] Initializing batch write buffer...")
     batch_write_buffer = BatchWriteBuffer(batch_size=10, flush_interval_seconds=60.0)
     batch_write_buffer.start()
+    
+    # 9. Initialize temp frame buffer for video compression
+    logger.info("[9/10] Initializing temp frame buffer for video compression...")
+    temp_frame_buffer = TempFrameBuffer(
+        storage_root=config.STORAGE_ROOT,
+        batch_size=VIDEO_BATCH_SIZE,
+        fps=VIDEO_FPS,
+        on_batch_ready=_on_video_batch_ready
+    )
+    
+    # 10. Initialize FFmpeg utilities
+    logger.info("[10/11] Initializing FFmpeg utilities...")
+    ffmpeg_compressor = FFmpegFrameCompressor(fps=VIDEO_FPS)
+    ffmpeg_extractor = FFmpegFrameExtractor()
+    
+    # 11. Initialize window-level frame diff detector for dedup
+    logger.info("[11/11] Initializing window frame diff detector...")
+    window_diff_detector = FrameDiffDetector(
+        screen_threshold=config.SIMPLE_FILTER_DIFF_THRESHOLD,
+        window_threshold=config.SIMPLE_FILTER_DIFF_THRESHOLD,
+    )
+    
+    # 12. Recover leftover temp frames from previous abnormal exit
+    logger.info("[12/12] Recovering leftover temp frames...")
+    _recover_temp_frames()
     
     logger.info("=" * 60)
     logger.info("All backend components initialized successfully!")
@@ -345,11 +718,20 @@ def _init_all_components():
 # ============ Pydantic models ============
 
 
+class WindowInfo(BaseModel):
+    """窗口信息（来自screencap_rs）"""
+    app_name: str
+    window_name: str
+    image_base64: str  # 窗口截图的base64
+
+
 class StoreFrameRequest(BaseModel):
     frame_id: str
     timestamp: str  # ISO string
-    image_base64: str
+    image_base64: str  # 全屏截图的base64
+    monitor_id: int = 0  # 显示器ID
     metadata: Optional[Dict] = None
+    windows: Optional[List[WindowInfo]] = None  # 窗口截图列表（可选）
 
 
 class FrameResult(BaseModel):
@@ -407,6 +789,11 @@ async def startup_event():
     服务器启动时预加载所有重型组件（embedding model, reranker, etc.）
     这样可以避免第一次请求时的延迟。
     """
+    # 启动父进程监控线程
+    import threading
+    watchdog_thread = threading.Thread(target=_parent_watchdog, daemon=True)
+    watchdog_thread.start()
+    
     _init_all_components()
 
 
@@ -417,9 +804,59 @@ async def shutdown_event():
     """
     logger.info("=" * 60)
     logger.info("Shutting down backend server...")
-    if batch_write_buffer is not None:
-        logger.info("Flushing batch write buffer...")
-        batch_write_buffer.stop()
+    
+    global encoder, reranker, vlm, ocr_engine, vector_storage, sqlite_storage
+    
+    # 1. 先刷新视频缓冲区
+    try:
+        if temp_frame_buffer is not None:
+            logger.info("Flushing video frame buffers...")
+            _flush_all_video_buffers()
+    except Exception as e:
+        logger.error(f"Error flushing video buffers: {e}")
+    
+    # 2. 再刷新批量写入缓冲区
+    try:
+        if batch_write_buffer is not None:
+            logger.info("Flushing batch write buffer...")
+            batch_write_buffer.stop()
+    except Exception as e:
+        logger.error(f"Error stopping batch write buffer: {e}")
+    
+    # 3. 显式释放大模型内存
+    logger.info("Releasing models and clearing memory...")
+    try:
+        if encoder is not None:
+            if hasattr(encoder, 'clear'):
+                encoder.clear()
+            encoder = None
+        
+        if reranker is not None:
+            if hasattr(reranker, 'clear'):
+                reranker.clear()
+            reranker = None
+            
+        vlm = None
+        ocr_engine = None
+        
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+        
+        # 清理 PyTorch 缓存 (CUDA/MPS)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+        except Exception:
+            pass
+            
+    except Exception as e:
+        logger.error(f"Error during model release: {e}")
+    
     logger.info("Backend server shutdown complete.")
     logger.info("=" * 60)
 
@@ -495,13 +932,17 @@ def get_stats():
 @app.post("/api/store_frame")
 def store_frame(req: StoreFrameRequest):
     """
-    Store a frame sent from remote GUI.
-    - Decode base64 image
-    - Save to IMAGE_STORAGE_PATH
-    - Add to batch write buffer (批量写入，减少版本数量)
-    - 当缓冲区达到10张图片或1分钟时，批量写入到 LanceDB 和 SQLite
+    Store a frame sent from remote GUI (支持新的视频存储模式).
+    
+    新逻辑:
+    1. 全屏截图 -> 临时PNG文件 -> 每60帧压缩成MP4
+    2. 窗口截图 -> 临时PNG文件 -> 每60帧压缩成MP4
+    3. 同时进行embedding和OCR处理
     """
-    # 组件已在启动时预加载，直接使用
+    global encoder, vector_storage, sqlite_storage, batch_write_buffer
+    global temp_frame_buffer
+    
+    # 组件检查
     assert encoder is not None
     assert vector_storage is not None
     assert sqlite_storage is not None
@@ -511,42 +952,43 @@ def store_frame(req: StoreFrameRequest):
         ts = datetime.fromisoformat(req.timestamp)
     except Exception as e:
         logger.error(f"Invalid timestamp '{req.timestamp}': {e}")
-        raise
+        raise HTTPException(status_code=400, detail=f"Invalid timestamp: {e}")
 
-    # Decode image
+    # Decode full screen image
     img_bytes = base64.b64decode(req.image_base64)
     image = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
 
-    # Build image path on server
-    # 参考 gui_main.py 的逻辑，使用时间戳直接命名：YYYYMMDD_HHMMSS_ffffff.jpg
-    date_dir = config.IMAGE_STORAGE_PATH
-    date_path = Path(date_dir) / ts.strftime("%Y%m%d")
-    date_path.mkdir(parents=True, exist_ok=True)
-    
-    # 生成基于时间戳的文件名和 frame_id：YYYYMMDD_HHMMSS_ffffff
-    # frame_id 与文件名保持一致（不含 .jpg 扩展名）
+    # 生成 frame_id
     base_frame_id = ts.strftime("%Y%m%d_%H%M%S_") + f"{ts.microsecond:06d}"
-    image_filename = f"{base_frame_id}.jpg"
-    image_path = (date_path / image_filename).resolve()
-    
-    # 如果文件已存在（相同微秒时间戳），在微秒后追加序号
-    if image_path.exists():
-        counter = 1
-        while image_path.exists():
-            # 调整微秒，确保唯一性
-            adjusted_microsecond = min(ts.microsecond + counter, 999999)
-            adjusted_ts = ts.replace(microsecond=adjusted_microsecond)
-            base_frame_id = adjusted_ts.strftime("%Y%m%d_%H%M%S_") + f"{adjusted_microsecond:06d}"
-            image_filename = f"{base_frame_id}.jpg"
-            image_path = (date_path / image_filename).resolve()
-            counter += 1
-    
-    image.save(str(image_path), format="JPEG", quality=config.IMAGE_QUALITY)
+    frame_id = f"frame_{base_frame_id}_{req.monitor_id}"
 
-    # 使用基于时间戳生成的 frame_id，而不是前端传来的旧格式
-    frame_id = base_frame_id
+    # ========== 1. 处理全屏截图 ==========
+    
+    # 保存到临时文件用于视频压缩
+    if temp_frame_buffer is not None:
+        temp_image_path, batch_ready = temp_frame_buffer.add_full_screen_frame(
+            frame_id=frame_id,
+            image=image,
+            timestamp=ts,
+            monitor_id=req.monitor_id,
+            metadata=req.metadata
+        )
+        
+        # 如果批次就绪，触发压缩
+        if batch_ready:
+            _check_and_compress_batches()
+    else:
+        # 回退到原有的JPEG存储方式
+        date_dir = config.IMAGE_STORAGE_PATH
+        date_path = Path(date_dir) / ts.strftime("%Y%m%d")
+        date_path.mkdir(parents=True, exist_ok=True)
+        image_filename = f"{base_frame_id}.jpg"
+        temp_image_path = str((date_path / image_filename).resolve())
+        image.save(temp_image_path, format="JPEG", quality=config.IMAGE_QUALITY)
 
-    # Compute image embedding（但不立即写入，等待批量写入）
+    # ========== 2. Embedding 和 OCR 处理 ==========
+    
+    # Compute image embedding
     embedding = encoder.encode_image(image)
 
     # OCR (if enabled)
@@ -564,25 +1006,164 @@ def store_frame(req: StoreFrameRequest):
         except Exception as e:
             logger.warning(f"OCR failed for frame {frame_id}: {e}")
 
-    # 添加到批量写入缓冲区（批量写入，不立即写入）
+    # 添加到批量写入缓冲区（用于LanceDB和SQLite的OCR数据）
     frame_data = {
-        "frame_id": frame_id,  # 使用新生成的 frame_id
+        "frame_id": frame_id,
         "timestamp": ts,
-        "image": image,  # 保存 PIL Image 对象，批量写入时会保存
+        "image": image,
         "embedding": embedding,
         "ocr_text": ocr_text,
-        "image_path": str(image_path),
+        "image_path": temp_image_path,  # 临时路径，后续会更新为video_chunk引用
         "ocr_text_json": ocr_json,
         "ocr_engine": ocr_engine_name,
         "ocr_confidence": ocr_conf,
-        "device_name": "remote-gui",
-        "metadata": req.metadata or {"size": image.size},
+        "device_name": f"monitor_{req.monitor_id}",
+        "metadata": req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
+        "app_name": None,  # frame 类型，app_name 为空
+        "window_name": None,  # frame 类型，window_name 为空
     }
     
     batch_write_buffer.add_frame(frame_data)
+
+    # ========== 3. 处理窗口截图 ==========
     
-    logger.debug(f"Added frame to batch buffer: {frame_id} at {image_path}")
-    return {"status": "ok"}
+    sub_frame_ids = []
+    windows_to_process = []
+    
+    # 如果前端提供了窗口信息，使用前端数据
+    if req.windows:
+        for win in req.windows:
+            try:
+                win_bytes = base64.b64decode(win.image_base64)
+                win_image = PILImage.open(io.BytesIO(win_bytes)).convert("RGB")
+                windows_to_process.append({
+                    "app_name": win.app_name,
+                    "window_name": win.window_name,
+                    "image": win_image
+                })
+            except Exception as e:
+                logger.warning(f"Failed to decode window image for {win.app_name}: {e}")
+    
+    # 如果前端没有提供窗口信息，且启用了后端窗口捕获，使用screencap_rs
+    elif ENABLE_BACKEND_WINDOW_CAPTURE and USE_SCREENCAP_RS and screencap_rs_module is not None:
+        try:
+            captured_windows = screencap_rs_module.capture_all_windows(
+                include_minimized=False,
+                filter_system=True
+            )
+            for cw in captured_windows:
+                try:
+                    # 将PNG bytes转换为PIL Image
+                    png_bytes = cw.get_image_bytes()
+                    win_image = PILImage.open(io.BytesIO(png_bytes)).convert("RGB")
+                    windows_to_process.append({
+                        "app_name": cw.info.app_name,
+                        "window_name": cw.info.title,
+                        "image": win_image
+                    })
+                except Exception as e:
+                    logger.debug(f"Failed to process captured window {cw.info.app_name}: {e}")
+            logger.debug(f"Backend captured {len(windows_to_process)} windows")
+        except Exception as e:
+            logger.warning(f"Backend window capture failed: {e}")
+    
+    # 处理窗口（帧差去重 + embedding）
+    if windows_to_process and temp_frame_buffer is not None:
+        from utils.data_models import WindowFrame as WF
+        from core.capture.window_capturer import calculate_image_hash
+        
+        for i, win_data in enumerate(windows_to_process):
+            try:
+                win_image = win_data["image"]
+                app_name = win_data["app_name"]
+                window_name = win_data["window_name"]
+                
+                # Window-level frame diff dedup
+                if window_diff_detector is not None:
+                    win_hash = calculate_image_hash(win_image)
+                    wf = WF(
+                        app_name=app_name,
+                        window_name=window_name,
+                        image=win_image,
+                        image_hash=win_hash,
+                        timestamp=ts,
+                    )
+                    diff_result = window_diff_detector.check_window_diff(wf)
+                    if not diff_result.should_store:
+                        logger.debug(
+                            f"Skipping duplicate window {app_name}/{window_name} "
+                            f"(diff={diff_result.diff_score:.4f})"
+                        )
+                        continue
+                
+                # 生成 sub_frame_id
+                safe_app = app_name.replace(" ", "_").replace("/", "_")[:20]
+                sub_frame_id = f"subframe_{safe_app}_{base_frame_id}_{i}"
+                
+                # 对窗口帧做 embedding
+                win_embedding = encoder.encode_image(win_image)
+                
+                # 保存到临时文件
+                win_temp_path, win_batch_ready = temp_frame_buffer.add_window_frame(
+                    sub_frame_id=sub_frame_id,
+                    image=win_image,
+                    timestamp=ts,
+                    app_name=app_name,
+                    window_name=window_name,
+                    parent_frame_id=frame_id  # 关联全屏帧ID
+                )
+                
+                # Immediately create sub_frame record and mapping in SQLite
+                # (the video_chunk reference will be back-filled on compression)
+                if sqlite_storage is not None:
+                    sqlite_storage.store_sub_frame(
+                        sub_frame_id=sub_frame_id,
+                        timestamp=ts,
+                        window_chunk_id=0,
+                        offset_index=0,
+                        app_name=app_name,
+                        window_name=window_name,
+                    )
+                    sqlite_storage.add_frame_subframe_mapping(
+                        frame_id=frame_id,
+                        sub_frame_id=sub_frame_id,
+                    )
+                
+                # 将窗口帧的 embedding 也存储到 LanceDB（通过 batch_write_buffer）
+                sub_frame_data = {
+                    "frame_id": sub_frame_id,  # 使用 sub_frame_id 作为 frame_id
+                    "timestamp": ts,
+                    "image": win_image,
+                    "embedding": win_embedding,
+                    "ocr_text": "",  # 窗口帧通常不做 OCR
+                    "image_path": win_temp_path,
+                    "ocr_text_json": "",
+                    "ocr_engine": "none",
+                    "ocr_confidence": 0.0,
+                    "device_name": f"{app_name}/{window_name}",
+                    "metadata": {
+                        "app_name": app_name,
+                        "window_name": window_name,
+                        "parent_frame_id": frame_id,
+                        "is_sub_frame": True
+                    },
+                    "app_name": app_name,  # sub_frame 类型，填写 app_name
+                    "window_name": window_name,  # sub_frame 类型，填写 window_name
+                }
+                batch_write_buffer.add_frame(sub_frame_data)
+                
+                sub_frame_ids.append(sub_frame_id)
+                
+                # 如果窗口批次就绪，触发压缩
+                if win_batch_ready:
+                    _check_and_compress_batches()
+                    
+            except Exception as e:
+                logger.warning(f"Failed to process window {win_data.get('app_name', 'unknown')}: {e}")
+                continue
+    
+    logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows")
+    return {"status": "ok", "frame_id": frame_id, "sub_frame_count": len(sub_frame_ids)}
 
 
 @app.post("/api/query_rag_with_time", response_model=QueryRagWithTimeResponse)
@@ -746,18 +1327,44 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
     if not frames:
         return QueryRagWithTimeResponse(answer="在指定时间范围内未找到相关的屏幕记录。", frames=[])
 
-    # Load images for rerank + VLM
+    # Load images for rerank + VLM (path 可能是文件路径或 video_chunk:id:offset / window_chunk:id:offset)
     loaded_frames: List[Dict] = []
     for f in frames:
         path = f.get("image_path")
         if not path:
             continue
-        try:
-            img = PILImage.open(path)
+        img = _load_image_from_path(path)
+        resolved_path = path
+        if img is None and sqlite_storage is not None:
+            # 可能是已压缩的帧：LanceDB 里仍是临时路径，用 frame_id 从 SQLite 取最新 image_path 再试
+            fid = f.get("frame_id")
+            if fid:
+                try:
+                    conn = sqlite_storage._get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (fid,))
+                    row = cursor.fetchone()
+                    conn.close()
+                    if row and row["image_path"] and row["image_path"] != path:
+                        resolved_path = row["image_path"]
+                        img = _load_image_from_path(resolved_path)
+                    if img is None:
+                        # 子帧可能在 sub_frames 表，用 get_sub_frame_video_info 得到 file_path + offset
+                        info = sqlite_storage.get_sub_frame_video_info(fid)
+                        if info and info.get("file_path") and info.get("offset_index") is not None and ffmpeg_extractor:
+                            img = ffmpeg_extractor.extract_frame_by_index(
+                                info["file_path"], info["offset_index"], info.get("fps", VIDEO_FPS)
+                            )
+                            if img is not None:
+                                resolved_path = f"window_chunk:{info['window_chunk_id']}:{info['offset_index']}"
+                except Exception as e:
+                    logger.debug(f"Resolve image_path for {fid}: {e}")
+        if img is not None:
             f["image"] = img
+            f["image_path"] = resolved_path
             loaded_frames.append(f)
-        except Exception as e:
-            logger.warning(f"Failed to load image for frame {f.get('frame_id')}: {e}")
+        else:
+            logger.debug(f"Skip frame (image not loadable): {f.get('frame_id')} path={path[:80]}")
 
     if not loaded_frames:
         return QueryRagWithTimeResponse(answer="检索到的图片无法加载。", frames=[])
@@ -818,15 +1425,152 @@ Focus on what the user was doing and how the visual content relates to their que
     return QueryRagWithTimeResponse(answer=answer, frames=resp_frames)
 
 
+def _load_image_from_path(path_str: str):
+    """
+    从 path 加载 PIL Image。path 可以是：
+    - video_chunk:{chunk_id}:{offset_index}
+    - window_chunk:{chunk_id}:{offset_index}
+    - 绝对或相对文件路径
+    返回 PIL.Image 或 None（加载失败或 chunk 尚未就绪）。
+    """
+    if not path_str or not path_str.strip():
+        return None
+    path_str = str(path_str).strip()
+    # video_chunk / window_chunk：从数据库取文件路径再用 FFmpeg 抽帧
+    if path_str.startswith("video_chunk:") or path_str.startswith("window_chunk:"):
+        parts = path_str.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            chunk_id = int(parts[1])
+            offset_index = int(parts[2])
+        except ValueError:
+            return None
+        if chunk_id <= 0:
+            return None
+        if sqlite_storage is None or ffmpeg_extractor is None:
+            return None
+        try:
+            conn = sqlite_storage._get_connection()
+            cursor = conn.cursor()
+            if path_str.startswith("video_chunk:"):
+                cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
+            else:
+                cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if not row or not row["file_path"]:
+                return None
+            video_path = row["file_path"]
+            fps = row["fps"] or VIDEO_FPS
+            if not Path(video_path).exists():
+                return None
+            return ffmpeg_extractor.extract_frame_by_index(video_path, offset_index, fps)
+        except Exception as e:
+            logger.debug(f"_load_image_from_path chunk {path_str}: {e}")
+            return None
+    # 文件路径
+    if Path(path_str).is_absolute():
+        final_path = Path(path_str)
+    else:
+        script_dir = Path(__file__).parent.absolute()
+        project_root = script_dir
+        cwd = Path.cwd().absolute()
+        if "visualmem_storage" in path_str:
+            final_path = project_root / path_str
+            if not final_path.exists():
+                final_path = cwd / path_str
+        else:
+            base_path = Path(config.IMAGE_STORAGE_PATH)
+            if base_path.is_absolute():
+                final_path = base_path / path_str
+            else:
+                final_path = project_root / base_path / path_str
+                if not final_path.exists():
+                    final_path = cwd / base_path / path_str
+    if not final_path.exists() or not final_path.is_file():
+        return None
+    try:
+        return PILImage.open(str(final_path)).convert("RGB")
+    except Exception as e:
+        logger.debug(f"_load_image_from_path file {path_str}: {e}")
+        return None
+
+
 @app.get("/api/image")
 def get_image(path: str = Query(..., description="Image file path")):
     """
     获取图片文件（用于前端显示）
-    支持绝对路径或相对路径（相对于项目根目录）
+    支持：
+    1. 绝对路径
+    2. 相对路径（相对于项目根目录）
+    3. video_chunk:{chunk_id}:{offset_index} 格式（从视频中提取帧）
     """
     try:
         path_str = str(path)
         
+        # 处理 video_chunk 或 window_chunk 引用格式
+        if path_str.startswith("video_chunk:") or path_str.startswith("window_chunk:"):
+            # 格式: video_chunk:{chunk_id}:{offset_index} 或 window_chunk:{chunk_id}:{offset_index}
+            parts = path_str.split(":")
+            if len(parts) != 3:
+                raise HTTPException(status_code=400, detail=f"Invalid chunk format: {path}")
+            
+            try:
+                chunk_id = int(parts[1])
+                offset_index = int(parts[2])
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid chunk format: {path}")
+            
+            # 从数据库获取视频文件路径
+            if sqlite_storage is None:
+                raise HTTPException(status_code=500, detail="Storage not initialized")
+            
+            conn = sqlite_storage._get_connection()
+            cursor = conn.cursor()
+            
+            # 根据 chunk 类型查询不同的表
+            if path_str.startswith("video_chunk:"):
+                cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
+            else:  # window_chunk
+                cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row:
+                chunk_type = "video" if path_str.startswith("video_chunk:") else "window"
+                raise HTTPException(status_code=404, detail=f"{chunk_type} chunk {chunk_id} not found")
+            
+            video_path = row["file_path"]
+            fps = row["fps"] or VIDEO_FPS
+            
+            # 从视频中提取帧
+            if ffmpeg_extractor is None:
+                raise HTTPException(status_code=500, detail="FFmpeg extractor not initialized")
+            
+            image = ffmpeg_extractor.extract_frame_by_index(video_path, offset_index, fps)
+            if image is None:
+                raise HTTPException(status_code=404, detail=f"Failed to extract frame {offset_index} from video")
+            
+            # 返回图片
+            import io
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85)
+            buffer.seek(0)
+            
+            return Response(
+                content=buffer.getvalue(),
+                media_type="image/jpeg",
+                headers={
+                    "Cache-Control": "public, max-age=3600",  # 缓存1小时
+                }
+            )
+        
+        script_dir = Path(__file__).parent.absolute()
+        project_root = script_dir  # gui_backend_server.py 在项目根目录
+        cwd = Path.cwd().absolute()
+
         # 如果是绝对路径，直接使用
         if Path(path_str).is_absolute():
             final_path = Path(path_str)
@@ -834,9 +1578,6 @@ def get_image(path: str = Query(..., description="Image file path")):
             # 相对路径处理
             # 获取项目根目录（脚本所在目录的父目录，或当前工作目录）
             # 尝试多种方式找到项目根目录
-            script_dir = Path(__file__).parent.absolute()
-            project_root = script_dir  # gui_backend_server.py 在项目根目录
-            cwd = Path.cwd().absolute()
             
             # 如果路径包含 visualmem_storage，尝试相对于项目根目录
             if 'visualmem_storage' in path_str:
@@ -860,6 +1601,59 @@ def get_image(path: str = Query(..., description="Image file path")):
         
         # 确保路径存在且是文件
         if not final_path.exists() or not final_path.is_file():
+            # 特殊处理：如果路径包含 temp_frames 且不存在，说明可能刚刚被压缩成视频了
+            if 'temp_frames' in path_str:
+                logger.info(f"Temp image not found, trying to find updated path in DB: {path_str}")
+                try:
+                    # 从路径中尝试提取时间戳和 monitor_id
+                    # 路径格式: .../temp_frames/full_screen/monitor_0/20260126_103850_579000.png
+                    # 或者是: .../temp_frames/windows/AppName_WindowName/20260126_103850_579000.png
+                    parts = Path(path_str).parts
+                    filename = parts[-1]  # 20260126_103850_579000.png
+                    
+                    if filename.endswith('.png'):
+                        ts_str = filename[:-4]  # 20260126_103850_579000
+                        
+                        if 'full_screen' in path_str:
+                            # 全屏帧: frame_{ts_str}_{monitor_id}
+                            monitor_part = parts[-2] if len(parts) >= 2 else "monitor_0"
+                            monitor_id = monitor_part.split('_')[1] if '_' in monitor_part else "0"
+                            frame_id = f"frame_{ts_str}_{monitor_id}"
+                            
+                            # 查询数据库获取最新路径
+                            if sqlite_storage:
+                                conn = sqlite_storage._get_connection()
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+                                row = cursor.fetchone()
+                                conn.close()
+                                
+                                if row and row['image_path'] and row['image_path'] != path_str:
+                                    logger.info(f"Found updated path for {frame_id}: {row['image_path']}")
+                                    # 递归调用 get_image 处理新路径（可能是 video_chunk）
+                                    return get_image(row['image_path'])
+                        
+                        elif 'windows' in path_str:
+                            # 窗口子帧: subframe_{safe_app}_{ts_str}_{index}
+                            # 注意：由于 safe_app 和 index 难以从路径反推，我们尝试模糊匹配 timestamp
+                            if sqlite_storage:
+                                conn = sqlite_storage._get_connection()
+                                cursor = conn.cursor()
+                                # 转换 ts_str (20260126_103850_579000) 到 ISO 格式的一部分进行匹配
+                                # 或者直接匹配 sub_frame_id 包含 ts_str 的记录
+                                cursor.execute("SELECT window_chunk_id, offset_index FROM sub_frames WHERE sub_frame_id LIKE ?", (f"%{ts_str}%",))
+                                row = cursor.fetchone()
+                                conn.close()
+                                
+                                if row and row["window_chunk_id"]:
+                                    new_path = f"window_chunk:{row['window_chunk_id']}:{row['offset_index']}"
+                                    logger.info(f"Found updated window_chunk path for temp window frame: {new_path}")
+                                    return get_image(new_path)
+                except Exception as e:
+                    logger.warning(f"Failed to redirect stale temp path: {e}")
+
+            logger.warning(f"=== [Frontend Image Load Failed] ===")
+            logger.warning(f"Frontend requested image path: '{path}'")
             logger.warning(f"Image not found: {path}")
             logger.warning(f"  Resolved path: {final_path} (exists: {final_path.exists()})")
             logger.warning(f"  Project root (script dir): {project_root}")
@@ -878,6 +1672,8 @@ def get_image(path: str = Query(..., description="Image file path")):
     except HTTPException:
         raise
     except Exception as e:
+        logger.error(f"=== [Frontend Image Load Failed] ===")
+        logger.error(f"Frontend requested image path: '{path}'")
         logger.error(f"Failed to serve image {path}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to serve image: {str(e)}")
 
@@ -894,16 +1690,33 @@ def get_recent_frames(minutes: int = 5):
         # 获取最近的 X 分钟内的帧
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(minutes=minutes)
-        frames = sqlite_storage.get_frames_in_timerange(start_time=start_time, end_time=end_time)
+        frames = sqlite_storage.get_frames_in_timerange(
+            start_time=start_time, 
+            end_time=end_time,
+            only_full_screen=True  # 仅获取全屏帧
+        )
         
         recent_frames = []
         for f in frames:
-            # 转换为前端需要的格式
+            sub_frames = sqlite_storage.get_sub_frames_for_frame(f["frame_id"])
+            sub_list = []
+            for sf in sub_frames:
+                wc_id = sf.get("window_chunk_id") or 0
+                off = sf.get("offset_index")
+                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
+                sub_list.append({
+                    "sub_frame_id": sf["sub_frame_id"],
+                    "timestamp": sf["timestamp"].isoformat(),
+                    "app_name": sf.get("app_name", ""),
+                    "window_name": sf.get("window_name", ""),
+                    "image_path": image_path,
+                })
             recent_frames.append({
                 "frame_id": f["frame_id"],
                 "timestamp": f["timestamp"].isoformat(),
                 "image_path": f["image_path"],
-                "ocr_text": f["ocr_text"]
+                "ocr_text": f["ocr_text"],
+                "sub_frames": sub_list,
             })
         # print(f"Found {len(recent_frames)} frames in the last {minutes} minutes.")
         
@@ -978,6 +1791,7 @@ def get_frames_count_by_date(req: GetFramesByDateRequest):
             FROM frames f
             WHERE f.timestamp >= ? AND f.timestamp < ?
             AND f.image_path IS NOT NULL AND f.image_path != ''
+            AND (f.app_name IS NULL OR f.app_name = '')
         """, (start_time_str, end_time_str))
         
         row = cursor.fetchone()
@@ -1035,6 +1849,7 @@ def get_frames_by_date(req: GetFramesByDateRequest):
             FROM frames f
             LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
             WHERE f.timestamp >= ? AND f.timestamp < ?
+            AND (f.app_name IS NULL OR f.app_name = '')
             ORDER BY f.timestamp ASC
             LIMIT ? OFFSET ?
         """, (start_time_str, end_time_str, limit, offset))
@@ -1042,20 +1857,34 @@ def get_frames_by_date(req: GetFramesByDateRequest):
         rows = cursor.fetchall()
         conn.close()
         
-        # 转换为 API 响应格式（只返回路径，不返回 base64）
+        # 转换为 API 响应格式（只返回路径，不返回 base64），并附带子帧（含可用的 image_path）
         result = []
         for row in rows:
             # 只返回有 image_path 的帧
             if not row["image_path"]:
                 continue
-                
+            fid = row["frame_id"]
+            sub_frames = sqlite_storage.get_sub_frames_for_frame(fid)
+            sub_list = []
+            for sf in sub_frames:
+                wc_id = sf.get("window_chunk_id") or 0
+                off = sf.get("offset_index")
+                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
+                sub_list.append({
+                    "sub_frame_id": sf["sub_frame_id"],
+                    "timestamp": sf["timestamp"].isoformat(),
+                    "app_name": sf.get("app_name", ""),
+                    "window_name": sf.get("window_name", ""),
+                    "image_path": image_path,
+                })
             ts = datetime.fromisoformat(row["timestamp"])
             ts_str = ts.isoformat()
             result.append({
-                "frame_id": row["frame_id"],
+                "frame_id": fid,
                 "timestamp": ts_str,
                 "image_path": row["image_path"],
                 "ocr_text": row["ocr_text"] or "",
+                "sub_frames": sub_list,
             })
         
         # logger.info(f"Returned {len(result)} frames for date {req.date} (offset={offset}, limit={limit})")
@@ -1092,19 +1921,35 @@ def get_frames_by_date_range(req: GetFramesByDateRangeRequest):
         all_frames = sqlite_storage.get_frames_in_timerange(
             start_time=start_time_str, # 传递字符串，sqlite_storage 会处理
             end_time=end_time_str,
-            limit=100000  # 设置一个较大的 limit，确保获取所有数据
+            limit=100000,  # 设置一个较大的 limit，确保获取所有数据
+            only_full_screen=True  # 仅获取全屏帧用于时间轴
         )
         
-        # 转换为 API 响应格式（只返回路径，不返回 base64）
+        # 转换为 API 响应格式（只返回路径，不返回 base64），并附带子帧（含可用的 image_path）
         result = []
         for frame in all_frames:
+            fid = frame.get("frame_id", "")
+            sub_frames = sqlite_storage.get_sub_frames_for_frame(fid) if fid else []
+            sub_list = []
+            for sf in sub_frames:
+                wc_id = sf.get("window_chunk_id") or 0
+                off = sf.get("offset_index")
+                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
+                sub_list.append({
+                    "sub_frame_id": sf["sub_frame_id"],
+                    "timestamp": sf["timestamp"].isoformat(),
+                    "app_name": sf.get("app_name", ""),
+                    "window_name": sf.get("window_name", ""),
+                    "image_path": image_path,
+                })
             ts = frame.get("timestamp")
             ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
             result.append({
-                "frame_id": frame.get("frame_id", ""),
+                "frame_id": fid,
                 "timestamp": ts_str,
-                "image_path": frame.get("image_path", ""),  # 只返回路径
+                "image_path": frame.get("image_path", ""),
                 "ocr_text": frame.get("ocr_text", ""),
+                "sub_frames": sub_list,
             })
         
         # logger.info(f"Returned {len(result)} frames for date range {req.start_date} to {req.end_date}")
@@ -1123,12 +1968,113 @@ def get_frames_by_date_range(req: GetFramesByDateRangeRequest):
 @app.post("/api/recording/stop")
 def stop_recording_api():
     """
-    停止录制信号：仅用于触发后端批量写入缓冲区的强制刷新
+    停止录制信号：触发后端所有缓冲区的强制刷新
+    - 视频帧缓冲区 -> 压缩成MP4
+    - 批量写入缓冲区 -> 写入LanceDB和SQLite
     """
+    logger.info("收到前端录制停止信号...")
+    
+    # 1. 先刷新视频帧缓冲区（压缩剩余帧为MP4）
+    if temp_frame_buffer is not None:
+        logger.info("刷新视频帧缓冲区...")
+        _flush_all_video_buffers()
+    
+    # 2. 再刷新批量写入缓冲区
     if batch_write_buffer is not None:
-        logger.info("收到前端录制停止信号，强制刷新缓冲区...")
+        logger.info("刷新批量写入缓冲区...")
         batch_write_buffer._flush_buffer()
-    return {"status": "success", "message": "Buffer flushed"}
+    
+    return {"status": "success", "message": "All buffers flushed"}
+
+
+@app.get("/api/video/extract_frame")
+def extract_frame_from_video(
+    video_path: str = Query(..., description="MP4视频文件路径"),
+    frame_index: int = Query(0, description="帧索引（0开始）"),
+    fps: float = Query(1.0, description="视频帧率")
+):
+    """
+    从MP4视频中提取单帧并返回base64
+    用于前端浏览历史时从视频中提取帧显示
+    """
+    global ffmpeg_extractor
+    
+    if ffmpeg_extractor is None:
+        ffmpeg_extractor = FFmpegFrameExtractor()
+    
+    # 处理路径
+    if not Path(video_path).is_absolute():
+        video_path = str(Path(config.STORAGE_ROOT) / video_path)
+    
+    if not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail=f"Video file not found: {video_path}")
+    
+    # 提取帧
+    image = ffmpeg_extractor.extract_frame_by_index(video_path, frame_index, fps)
+    if image is None:
+        raise HTTPException(status_code=500, detail="Failed to extract frame from video")
+    
+    # 转换为base64
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=80)
+    img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    
+    return {
+        "image_base64": img_b64,
+        "width": image.width,
+        "height": image.height
+    }
+
+
+@app.get("/api/video/frame_image")
+def get_video_frame_image(
+    video_path: str = Query(..., description="MP4视频文件路径"),
+    frame_index: int = Query(0, description="帧索引（0开始）"),
+    fps: float = Query(1.0, description="视频帧率")
+):
+    """
+    从MP4视频中提取单帧并直接返回图片
+    用于 <img> 标签直接引用
+    """
+    from fastapi.responses import Response
+    
+    global ffmpeg_extractor
+    
+    if ffmpeg_extractor is None:
+        ffmpeg_extractor = FFmpegFrameExtractor()
+    
+    # 处理路径
+    if not Path(video_path).is_absolute():
+        video_path = str(Path(config.STORAGE_ROOT) / video_path)
+    
+    if not Path(video_path).exists():
+        raise HTTPException(status_code=404, detail=f"Video file not found: {video_path}")
+    
+    # 提取帧
+    image = ffmpeg_extractor.extract_frame_by_index(video_path, frame_index, fps)
+    if image is None:
+        raise HTTPException(status_code=500, detail="Failed to extract frame from video")
+    
+    # 转换为JPEG bytes
+    buf = io.BytesIO()
+    image.save(buf, format="JPEG", quality=80)
+    
+    return Response(
+        content=buf.getvalue(),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"}  # 缓存1小时
+    )
+
+
+@app.get("/api/video/buffer_stats")
+def get_video_buffer_stats():
+    """
+    获取视频缓冲区统计信息
+    """
+    if temp_frame_buffer is None:
+        return {"error": "Video buffer not initialized"}
+    
+    return temp_frame_buffer.get_stats()
 
 
 if __name__ == "__main__":

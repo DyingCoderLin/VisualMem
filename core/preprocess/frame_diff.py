@@ -226,9 +226,9 @@ class FrameDiffDetector:
             f"(screen_threshold={screen_threshold}, window_threshold={window_threshold})"
         )
     
-    def _get_window_key(self, app_name: str, window_name: str, process_id: int) -> str:
+    def _get_window_key(self, app_name: str, window_name: str) -> str:
         """Generate a unique key for a window"""
-        return f"{app_name}::{window_name}::{process_id}"
+        return f"{app_name}::{window_name}"
     
     def _compare_images(
         self,
@@ -363,8 +363,7 @@ class FrameDiffDetector:
         """
         window_key = self._get_window_key(
             window.app_name,
-            window.window_name,
-            window.process_id
+            window.window_name
         )
         
         current_image = window.image

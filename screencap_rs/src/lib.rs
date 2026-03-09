@@ -14,51 +14,159 @@ use xcap::{Monitor, Window};
 // Platform-specific skip lists
 // ============================================================================
 
+// Common keywords to skip across all platforms (user configurable defaults)
+static SKIP_KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
+    HashSet::from([
+        "bit", "vpn", "trash", "private", "incognito", "wallpaper",
+        "settings", "keepass", "recorder", "vaults", "obs studio",
+        "screenpipe", "visualmem",
+    ])
+});
+
+// apps that should be sk
 #[cfg(target_os = "macos")]
 static SKIP_APPS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Window Server", "SystemUIServer", "ControlCenter", "Dock",
-        "NotificationCenter", "loginwindow", "WindowManager", "Spotlight",
+        // System apps (English)
+        "Window Server",
+        "SystemUIServer",
+        "ControlCenter",
+        "Dock",
+        "NotificationCenter",
+        "loginwindow",
+        "WindowManager",
+        "Contexts",
+        "Screenshot",
+        "Spotlight",
+        // System apps (Chinese/localized)
+        "控制中心",  // Control Center
+        "程序坞",    // Dock
+        "聚焦",      // Spotlight
+        "系统设置",  // System Settings
+        // User configurable defaults
+        "DeepL",
     ])
 });
 
 #[cfg(target_os = "windows")]
 static SKIP_APPS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Windows Shell Experience Host", "Microsoft Text Input Application",
-        "Windows Explorer", "Program Manager", "TaskBar",
+        // System apps
+        "Windows Shell Experience Host",
+        "Microsoft Text Input Application",
+        "Windows Explorer",
+        "Program Manager",
+        "Microsoft Store",
+        "Search",
+        "TaskBar",
+        // User configurable defaults
+        "Nvidia",
     ])
 });
 
 #[cfg(target_os = "linux")]
 static SKIP_APPS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Gnome-shell", "gnome-shell", "Plasma", "plasma",
-        "Polybar", "i3bar", "Plank", "Dock", "Panel",
+        // System apps
+        "Gnome-shell",
+        "gnome-shell",
+        "Plasma",
+        "plasma",
+        "Xfdesktop",
+        "Polybar",
+        "i3bar",
+        "Plank",
+        "Dock",
     ])
 });
 
 #[cfg(target_os = "macos")]
 static SKIP_TITLES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Menu Bar", "Notification Center", "Control Center",
-        "Spotlight", "Mission Control", "Desktop", "",
+        // System window titles (English)
+        "Item-0",
+        "App Icon Window",
+        "Dock",
+        "NowPlaying",
+        "FocusModes",
+        "Shortcuts",
+        "AudioVideoModule",
+        "Clock",
+        "WiFi",
+        "Battery",
+        "BentoBox",
+        "Menu Bar",
+        "Menubar",  // Alternative naming
+        "Notification Center",
+        "Control Center",
+        "Spotlight",
+        "Mission Control",
+        "Desktop",
+        "Screen Sharing",
+        "Touch Bar",
+        "Status Bar",
+        "Menu Extra",
+        "System Settings",
+        // System window titles (Chinese/localized)
+        "程序坞",       // Dock
+        "控制中心",     // Control Center
+        "通知中心",     // Notification Center
+        "调度中心",     // Mission Control
+        "聚焦",         // Spotlight
+        "电池",         // Battery
+        "无线局域网",   // WiFi
+        "蓝牙",         // Bluetooth
+        "系统设置",     // System Settings
+        "辅助功能",     // Accessibility
+        "屏幕共享",     // Screen Sharing
+        "菜单栏",       // Menu Bar
+        "桌面",         // Desktop
+        // Empty title
+        "",
     ])
 });
 
 #[cfg(target_os = "windows")]
 static SKIP_TITLES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Program Manager", "Task View", "Start",
-        "System Tray", "Task Bar", "Desktop", "",
+        // System window titles
+        "Program Manager",
+        "Windows Input Experience",
+        "Microsoft Text Input Application",
+        "Task View",
+        "Start",
+        "System Tray",
+        "Notification Area",
+        "Action Center",
+        "Task Bar",
+        "Desktop",
+        // User configurable defaults
+        "Control Panel",
+        "System Properties",
+        // Empty title
+        "",
     ])
 });
 
 #[cfg(target_os = "linux")]
 static SKIP_TITLES: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
-        "Desktop", "Panel", "Top Bar", "Status Bar",
-        "Dock", "Activities", "System Tray", "",
+        // System window titles
+        "Desktop",
+        "Panel",
+        "Top Bar",
+        "Status Bar",
+        "Dock",
+        "Dashboard",
+        "Activities",
+        "System Tray",
+        "Notification Area",
+        // User configurable defaults
+        "Info center",
+        "Discover",
+        "Parted",
+        // Empty title
+        "",
     ])
 });
 
@@ -194,14 +302,39 @@ fn should_skip_window(app_name: &str, title: &str) -> bool {
     let app_lower = app_name.to_lowercase();
     let title_lower = title.to_lowercase();
 
+    // Skip "Unknown" app names
+    if app_lower == "unknown" || app_name == "Unknown" {
+        return true;
+    }
+
+    // Check platform-specific app names (contains match)
     for skip_app in SKIP_APPS.iter() {
         if app_lower.contains(&skip_app.to_lowercase()) {
             return true;
         }
     }
 
+    // Check platform-specific window titles (contains match for better coverage)
+    // This handles cases like "BentoBox-0", "BentoBox-1", etc.
     for skip_title in SKIP_TITLES.iter() {
-        if skip_title.to_lowercase() == title_lower {
+        let skip_lower = skip_title.to_lowercase();
+        if !skip_lower.is_empty() {
+            // Use contains match for non-empty titles
+            if title_lower.contains(&skip_lower) {
+                return true;
+            }
+        } else {
+            // Exact match for empty titles
+            if title_lower.is_empty() {
+                return true;
+            }
+        }
+    }
+
+    // Check common keywords (contains match in both app name and title)
+    for keyword in SKIP_KEYWORDS.iter() {
+        let keyword_lower = keyword.to_lowercase();
+        if app_lower.contains(&keyword_lower) || title_lower.contains(&keyword_lower) {
             return true;
         }
     }
@@ -209,29 +342,29 @@ fn should_skip_window(app_name: &str, title: &str) -> bool {
     false
 }
 
-fn window_to_info(window: &Window) -> WindowInfo {
-    WindowInfo {
-        id: window.id(),
-        app_name: window.app_name().to_string(),
-        title: window.title().to_string(),
-        x: window.x(),
-        y: window.y(),
-        width: window.width(),
-        height: window.height(),
-        is_minimized: window.is_minimized(),
-    }
+fn window_to_info(window: &Window) -> Result<WindowInfo, xcap::XCapError> {
+    Ok(WindowInfo {
+        id: window.id()?,
+        app_name: window.app_name()?,
+        title: window.title()?,
+        x: window.x()?,
+        y: window.y()?,
+        width: window.width()?,
+        height: window.height()?,
+        is_minimized: window.is_minimized()?,
+    })
 }
 
-fn monitor_to_info(monitor: &Monitor, index: u32) -> MonitorInfo {
-    MonitorInfo {
-        id: monitor.id(),
-        name: monitor.name().to_string(),
-        x: monitor.x(),
-        y: monitor.y(),
-        width: monitor.width(),
-        height: monitor.height(),
+fn monitor_to_info(monitor: &Monitor, index: u32) -> Result<MonitorInfo, xcap::XCapError> {
+    Ok(MonitorInfo {
+        id: monitor.id()?,
+        name: monitor.name()?,
+        x: monitor.x()?,
+        y: monitor.y()?,
+        width: monitor.width()?,
+        height: monitor.height()?,
         is_primary: index == 0,
-    }
+    })
 }
 
 fn image_to_png_bytes(image: &image::RgbaImage) -> Result<Vec<u8>, String> {
@@ -267,11 +400,14 @@ fn get_monitors() -> PyResult<Vec<MonitorInfo>> {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get monitors: {}", e))
     })?;
 
-    Ok(monitors
-        .iter()
-        .enumerate()
-        .map(|(i, m)| monitor_to_info(m, i as u32))
-        .collect())
+    let mut result = Vec::new();
+    for (i, m) in monitors.iter().enumerate() {
+        if let Ok(info) = monitor_to_info(m, i as u32) {
+            result.push(info);
+        }
+    }
+
+    Ok(result)
 }
 
 /// Get list of all visible windows
@@ -284,19 +420,45 @@ fn get_windows(include_minimized: bool, filter_system: bool) -> PyResult<Vec<Win
 
     let mut result = Vec::new();
     for window in windows {
-        if !include_minimized && window.is_minimized() {
+        // Skip windows that fail to provide properties (e.g. just closed)
+        let is_minimized = match window.is_minimized() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        if !include_minimized && is_minimized {
             continue;
         }
 
-        if filter_system && should_skip_window(window.app_name(), window.title()) {
+        let app_name = match window.app_name() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let title = match window.title() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if filter_system && should_skip_window(&app_name, &title) {
             continue;
         }
 
-        if window.width() == 0 || window.height() == 0 {
+        let width = match window.width() {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let height = match window.height() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        if width == 0 || height == 0 {
             continue;
         }
 
-        result.push(window_to_info(&window));
+        if let Ok(info) = window_to_info(&window) {
+            result.push(info);
+        }
     }
 
     Ok(result)
@@ -310,7 +472,12 @@ fn capture_window(window_id: u32) -> PyResult<Option<CapturedWindow>> {
     })?;
 
     for window in windows {
-        if window.id() == window_id {
+        let current_id = match window.id() {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+
+        if current_id == window_id {
             let image = window.capture_image().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to capture: {}", e))
             })?;
@@ -319,10 +486,12 @@ fn capture_window(window_id: u32) -> PyResult<Option<CapturedWindow>> {
                 pyo3::exceptions::PyRuntimeError::new_err(e)
             })?;
 
-            return Ok(Some(CapturedWindow {
-                info: window_to_info(&window),
-                image_data,
-            }));
+            if let Ok(info) = window_to_info(&window) {
+                return Ok(Some(CapturedWindow {
+                    info,
+                    image_data,
+                }));
+            }
         }
     }
 
@@ -339,24 +508,49 @@ fn capture_all_windows(include_minimized: bool, filter_system: bool) -> PyResult
 
     let mut result = Vec::new();
     for window in windows {
-        if !include_minimized && window.is_minimized() {
+        let is_minimized = match window.is_minimized() {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        if !include_minimized && is_minimized {
             continue;
         }
 
-        if filter_system && should_skip_window(window.app_name(), window.title()) {
+        let app_name = match window.app_name() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let title = match window.title() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        if filter_system && should_skip_window(&app_name, &title) {
             continue;
         }
 
-        if window.width() == 0 || window.height() == 0 {
+        let width = match window.width() {
+            Ok(w) => w,
+            Err(_) => continue,
+        };
+        let height = match window.height() {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+
+        if width == 0 || height == 0 {
             continue;
         }
 
         if let Ok(image) = window.capture_image() {
             if let Ok(image_data) = image_to_png_bytes(&image) {
-                result.push(CapturedWindow {
-                    info: window_to_info(&window),
-                    image_data,
-                });
+                if let Ok(info) = window_to_info(&window) {
+                    result.push(CapturedWindow {
+                        info,
+                        image_data,
+                    });
+                }
             }
         }
     }
@@ -372,16 +566,19 @@ fn capture_screen(monitor_id: Option<u32>) -> PyResult<Option<CapturedScreen>> {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to get monitors: {}", e))
     })?;
 
-    let (index, monitor) = if let Some(id) = monitor_id {
+    let found = if let Some(id) = monitor_id {
         monitors
             .iter()
             .enumerate()
-            .find(|(_, m)| m.id() == id)
-            .map(|(i, m)| (i, m))
+            .find(|(_, m)| m.id().map(|mid| mid == id).unwrap_or(false))
     } else {
         monitors.first().map(|m| (0, m))
-    }
-    .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("No monitor found"))?;
+    };
+
+    let (index, monitor) = match found {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
 
     let image = monitor.capture_image().map_err(|e| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to capture screen: {}", e))
@@ -391,10 +588,14 @@ fn capture_screen(monitor_id: Option<u32>) -> PyResult<Option<CapturedScreen>> {
         pyo3::exceptions::PyRuntimeError::new_err(e)
     })?;
 
-    Ok(Some(CapturedScreen {
-        monitor: monitor_to_info(monitor, index as u32),
-        image_data,
-    }))
+    if let Ok(info) = monitor_to_info(monitor, index as u32) {
+        return Ok(Some(CapturedScreen {
+            monitor: info,
+            image_data,
+        }));
+    }
+
+    Ok(None)
 }
 
 /// Capture full screen and all visible windows in one call

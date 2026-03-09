@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Cross-platform window capture
-xcap = "0.0.14"
+xcap = "0.8.1"
 
 # Python bindings (use 0.20 for stable API)
 pyo3 = { version = "0.20", features = ["extension-module"] }

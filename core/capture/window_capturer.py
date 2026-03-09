@@ -37,7 +37,8 @@ def calculate_image_hash(image: Image.Image) -> int:
     small = image.resize((64, 64), Image.Resampling.LANCZOS)
     # Convert to bytes and hash
     img_bytes = small.tobytes()
-    return int(hashlib.md5(img_bytes).hexdigest()[:16], 16)
+    # Use 15 hex chars (60 bits) to ensure it fits in SQLite's signed 64-bit INTEGER
+    return int(hashlib.md5(img_bytes).hexdigest()[:15], 16)
 
 
 def should_skip_window(app_name: str, title: str) -> bool:
@@ -187,10 +188,8 @@ class RustWindowCapturer(AbstractCapturer):
                         windows.append(WindowFrame(
                             app_name=w.info.app_name,
                             window_name=w.info.title,
-                            process_id=0,  # xcap doesn't provide pid
-                            is_focused=False,  # xcap doesn't provide this
                             image=window_image,
-                            image_hash=window_hash,
+                            image_hash=window_hash,  # 内存中的 hash，用于快速比较
                             timestamp=timestamp
                         ))
                     except Exception as e:
@@ -590,10 +589,8 @@ if not _USE_RUST:
                         windows.append(WindowFrame(
                             app_name=win_info.app_name,
                             window_name=win_info.title,
-                            process_id=win_info.process_id,
-                            is_focused=win_info.is_focused,
                             image=window_image,
-                            image_hash=window_hash,
+                            image_hash=window_hash,  # 内存中的 hash，用于快速比较
                             timestamp=timestamp
                         ))
                     

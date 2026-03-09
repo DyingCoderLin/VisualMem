@@ -4,16 +4,26 @@ import { apiClient } from '../services/api'
 import ImagePreview from '../components/ImagePreview'
 import { useAppStore } from '../store/AppStore'
 
+interface SubFrame {
+  sub_frame_id: string
+  timestamp: string
+  app_name: string
+  window_name: string
+  image_path: string | null
+}
+
 interface Frame {
   frame_id: string
   timestamp: string
   image_base64?: string
   image_path?: string
+  sub_frames?: SubFrame[]
 }
 
 interface DateGroup {
   date: string
   frames: Frame[]
+  groupedFrames?: Frame[][]
   totalCount: number
   loadedCount: number
   isLoading: boolean
@@ -30,6 +40,107 @@ const MAX_EMPTY_CHECKS = 30       // 关键参数：如果连着查了30天都�
 const ITEM_WIDTH = 200
 const GAP = 8
 // =================================
+
+function groupFramesByTime(frames: Frame[]): Frame[][] {
+  if (!frames || frames.length === 0) return [];
+  const groups: Frame[][] = [];
+  let currentGroup: Frame[] = [frames[0]];
+  
+  for (let i = 1; i < frames.length; i++) {
+    const f1 = currentGroup[0];
+    const f2 = frames[i];
+    const t1 = new Date(f1.timestamp).getTime();
+    const t2 = new Date(f2.timestamp).getTime();
+    
+    // Group if within 1000ms
+    if (Math.abs(t2 - t1) < 1000) {
+      currentGroup.push(f2);
+    } else {
+      groups.push(currentGroup);
+      currentGroup = [f2];
+    }
+  }
+  groups.push(currentGroup);
+  return groups;
+}
+
+const FrameGroupItem = ({ 
+  frames, 
+  onPreview, 
+  getImageUrl, 
+  formatTimestamp 
+}: { 
+  frames: Frame[], 
+  onPreview: (url: string, ts: string) => void, 
+  getImageUrl: (f: Frame) => string, 
+  formatTimestamp: (ts: string) => string 
+}) => {
+  const [mainIndex, setMainIndex] = useState(0);
+  const safeIndex = mainIndex < frames.length ? mainIndex : 0;
+  const mainFrame = frames[safeIndex];
+
+  return (
+    <div className="scroll-item" style={{ flex: '0 0 auto', width: `${ITEM_WIDTH}px`, position: 'relative' }}>
+      {/* Main Image */}
+      {mainFrame && (
+        <img
+          src={getImageUrl(mainFrame)}
+          alt={`Frame ${mainFrame.frame_id}`}
+          loading="lazy"
+          style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer', backgroundColor: '#1a1a1a' }}
+          onClick={() => onPreview(getImageUrl(mainFrame), formatTimestamp(mainFrame.timestamp))}
+        />
+      )}
+      
+      {/* Thumbnails for other screens */}
+      {frames.length > 1 && (
+        <div style={{ 
+          position: 'absolute', 
+          bottom: '28px', // right above the timestamp label
+          right: '4px', 
+          display: 'flex', 
+          gap: '4px',
+          padding: '4px',
+          background: 'rgba(0,0,0,0.6)',
+          borderRadius: '4px',
+          backdropFilter: 'blur(4px)',
+          maxWidth: '90%',
+          overflowX: 'auto'
+        }}>
+          {frames.map((f, idx) => {
+            if (idx === safeIndex) return null;
+            return (
+              <img
+                key={f.frame_id}
+                src={getImageUrl(f)}
+                alt={`Screen ${idx}`}
+                style={{ 
+                  width: '40px', 
+                  height: '24px', 
+                  objectFit: 'cover', 
+                  borderRadius: '2px', 
+                  cursor: 'pointer', 
+                  border: '1px solid rgba(255,255,255,0.8)',
+                  boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+                  flexShrink: 0
+                }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setMainIndex(idx);
+                }}
+                title={`切换到屏幕 ${idx + 1}`}
+              />
+            )
+          })}
+        </div>
+      )}
+      
+      <div className="timestamp-label" style={{ fontSize: '12px', color: '#666', marginTop: '4px', paddingBottom: '4px' }}>
+        {mainFrame ? formatTimestamp(mainFrame.timestamp) : ''}
+      </div>
+    </div>
+  );
+};
 
 const TimelineView: React.FC = () => {
   const [dateGroups, setDateGroups] = useState<DateGroup[]>([])
@@ -131,6 +242,7 @@ const TimelineView: React.FC = () => {
               const newGroup: DateGroup = {
                 date: today,
                 frames: sortedFrames,
+                groupedFrames: groupFramesByTime(sortedFrames),
                 totalCount: totalCount,
                 loadedCount: sortedFrames.length,
                 isLoading: false
@@ -289,6 +401,7 @@ const TimelineView: React.FC = () => {
               newGroups.push({
                 date: dateStr,
                 frames: sortedFrames,
+                groupedFrames: groupFramesByTime(sortedFrames),
                 totalCount: countResponse.total_count,
                 loadedCount: sortedFrames.length,
                 isLoading: false
@@ -406,6 +519,7 @@ const TimelineView: React.FC = () => {
         return {
           ...g,
           frames: sortedFrames,
+          groupedFrames: groupFramesByTime(sortedFrames),
           loadedCount: sortedFrames.length, // 使用实际长度更新 count，防止偏差
           isLoading: false
         }
@@ -475,7 +589,8 @@ const TimelineView: React.FC = () => {
     const clientWidth = scrollElement.clientWidth
     
     // 计算距离已加载内容末尾的距离
-    const loadedWidth = group.loadedCount * (ITEM_WIDTH + GAP)
+    const groupedFrames = group.groupedFrames || groupFramesByTime(group.frames);
+    const loadedWidth = groupedFrames.length * (ITEM_WIDTH + GAP)
     const distanceToLoadedEnd = loadedWidth - scrollLeft - clientWidth
     const itemWidth = ITEM_WIDTH + GAP
     const threshold = itemWidth * LOAD_MORE_THRESHOLD
@@ -678,7 +793,8 @@ const TimelineView: React.FC = () => {
       
       // 初始检查：如果已经滚动到已加载内容末尾附近，立即触发加载
       const { scrollLeft, clientWidth } = scrollContainer
-      const loadedWidth = group.loadedCount * (ITEM_WIDTH + GAP)
+      const groupedFrames = group.groupedFrames || groupFramesByTime(group.frames);
+      const loadedWidth = groupedFrames.length * (ITEM_WIDTH + GAP)
       const distanceToLoadedEnd = loadedWidth - scrollLeft - clientWidth
       const itemWidth = ITEM_WIDTH + GAP
       const threshold = itemWidth * LOAD_MORE_THRESHOLD
@@ -714,24 +830,7 @@ const TimelineView: React.FC = () => {
       return `data:image/jpeg;base64,${frame.image_base64}`
     }
     if (frame.image_path) {
-      let fullPath = frame.image_path
-      const isAbsolute = fullPath.startsWith('/') || fullPath.includes(':')
-      
-      if (isAbsolute) {
-        // 绝对路径直接使用 file://
-        return `file://${fullPath}`
-      } else {
-        // 相对路径处理
-        if (projectRoot) {
-          // 如果拿到了项目根目录，拼接成绝对路径使用 file://
-          const cleanPath = fullPath.startsWith('./') ? fullPath.substring(2) : fullPath
-          return `file://${projectRoot}/${cleanPath}`
-        } else {
-          // 如果还没拿到 projectRoot，使用后端 API 兜底
-          // 这样可以保证图片在任何情况下都能显示，只是速度稍慢
-          return apiClient.getImageUrl(fullPath)
-        }
-      }
+      return apiClient.getImageUrl(frame.image_path)
     }
     return ''
   }
@@ -759,10 +858,14 @@ const TimelineView: React.FC = () => {
       className="timeline-container"
     >
       {dateGroups.map((group) => {
+        const groupedFrames = group.groupedFrames || groupFramesByTime(group.frames);
+        const avgScreens = group.frames.length > 0 ? (group.frames.length / groupedFrames.length) : 1;
+        
         // 计算剩余未加载的照片数量，用于撑开滚动条
         // 使用 loadedCount 而不是 frames.length，因为可能有无效的帧被过滤掉了
         const remainingCount = Math.max(0, group.totalCount - group.loadedCount);
-        const spacerWidth = remainingCount * (ITEM_WIDTH + GAP);
+        const remainingGroups = Math.ceil(remainingCount / avgScreens);
+        const spacerWidth = remainingGroups * (ITEM_WIDTH + GAP);
         
         // 调试日志：只在有剩余时才输出
         if (remainingCount > 0) {
@@ -788,19 +891,14 @@ const TimelineView: React.FC = () => {
               data-loaded={group.loadedCount}
               data-total={group.totalCount}
             >
-              {group.frames.map((frame) => (
-                <div key={frame.frame_id} className="scroll-item" style={{ flex: '0 0 auto', width: `${ITEM_WIDTH}px` }}>
-                  <img
-                    src={getImageUrl(frame)}
-                    alt={`Frame ${frame.frame_id}`}
-                    loading="lazy"
-                    style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer' }}
-                    onClick={() => setPreviewImage({ url: getImageUrl(frame), timestamp: formatTimestamp(frame.timestamp) })}
-                  />
-                  <div className="timestamp-label" style={{ fontSize: '12px', color: '#666', marginTop: '4px', paddingBottom: '4px' }}>
-                    {formatTimestamp(frame.timestamp)}
-                  </div>
-                </div>
+              {groupedFrames.map((gFrames) => (
+                <FrameGroupItem 
+                  key={gFrames[0].frame_id} 
+                  frames={gFrames} 
+                  onPreview={(url, ts) => setPreviewImage({ url, timestamp: ts })}
+                  getImageUrl={getImageUrl}
+                  formatTimestamp={formatTimestamp}
+                />
               ))}
               
               {/* 加载指示器：放在已加载内容的末尾 */}

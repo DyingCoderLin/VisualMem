@@ -178,29 +178,63 @@ class VideoChunkWriter:
         if self.ffmpeg_process is None:
             return
         
+        process = self.ffmpeg_process
+        chunk_path = self.current_chunk_path  # Save path before clearing
+        frame_count = self.frame_count  # Save count before clearing
+        self.ffmpeg_process = None  # Clear reference immediately to prevent double-close
+        
         try:
-            # Close stdin to signal end of input
-            if self.ffmpeg_process.stdin:
-                self.ffmpeg_process.stdin.close()
+            # Try to close stdin if it's still open
+            # This signals FFmpeg that no more input is coming
+            if process.stdin and not process.stdin.closed:
+                try:
+                    process.stdin.close()
+                except (ValueError, OSError):
+                    # stdin may already be closed, ignore
+                    pass
             
-            # Wait for process to complete
-            stdout, stderr = self.ffmpeg_process.communicate(timeout=30)
+            # IMPORTANT: Set stdin to None before communicate()
+            # This prevents communicate() from trying to flush the closed stdin
+            # which would cause "ValueError: flush of closed file"
+            process.stdin = None
             
-            if self.ffmpeg_process.returncode != 0:
-                logger.warning(f"FFmpeg finished with non-zero exit: {stderr.decode()}")
-            else:
-                logger.info(
-                    f"Finished video chunk: {self.current_chunk_path} "
-                    f"({self.frame_count} frames)"
-                )
+            # Now we can safely use communicate() to read stdout/stderr
+            # without it trying to access stdin
+            try:
+                stdout, stderr = process.communicate(timeout=30)
+                returncode = process.returncode
                 
-        except subprocess.TimeoutExpired:
-            logger.warning("FFmpeg process timed out, killing...")
-            self.ffmpeg_process.kill()
+                if returncode != 0:
+                    stderr_text = stderr.decode('utf-8', errors='ignore') if stderr else ""
+                    if stderr_text:
+                        # Log last few lines of stderr for debugging
+                        lines = stderr_text.strip().split('\n')
+                        last_lines = '\n'.join(lines[-5:]) if len(lines) > 5 else stderr_text
+                        logger.warning(f"FFmpeg finished with non-zero exit ({returncode}):\n{last_lines}")
+                    else:
+                        logger.warning(f"FFmpeg finished with non-zero exit ({returncode})")
+                else:
+                    logger.info(
+                        f"Finished video chunk: {chunk_path} "
+                        f"({frame_count} frames)"
+                    )
+            except subprocess.TimeoutExpired:
+                logger.warning("FFmpeg process timed out, killing...")
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning("FFmpeg process did not terminate after kill")
+                    
         except Exception as e:
-            logger.error(f"Error finishing FFmpeg process: {e}")
-        finally:
-            self.ffmpeg_process = None
+            logger.error(f"Error finishing FFmpeg process: {e}", exc_info=True)
+            # Try to kill the process if it's still running
+            try:
+                if process.poll() is None:  # Process still running
+                    process.kill()
+                    process.wait(timeout=2)
+            except Exception:
+                pass
     
     def write_frame(self, image: Image.Image) -> Optional[int]:
         """
@@ -229,6 +263,21 @@ class VideoChunkWriter:
                 image.save(buffer, format='PNG')
                 png_data = buffer.getvalue()
                 
+                # Check if process and stdin are still valid
+                if self.ffmpeg_process is None or self.ffmpeg_process.stdin is None:
+                    logger.warning("FFmpeg process or stdin is None, cannot write frame")
+                    return None
+                
+                if self.ffmpeg_process.stdin.closed:
+                    logger.warning("FFmpeg stdin is closed, restarting...")
+                    self._finish_ffmpeg_process()
+                    if not self._start_ffmpeg_process():
+                        return None
+                    # Retry writing after restart
+                    buffer = io.BytesIO()
+                    image.save(buffer, format='PNG')
+                    png_data = buffer.getvalue()
+                
                 # Write to FFmpeg stdin
                 self.ffmpeg_process.stdin.write(png_data)
                 self.ffmpeg_process.stdin.flush()
@@ -239,9 +288,18 @@ class VideoChunkWriter:
                 return offset_index
                 
             except BrokenPipeError:
-                logger.error("FFmpeg pipe broken, restarting...")
+                logger.warning("FFmpeg pipe broken, restarting...")
                 self._finish_ffmpeg_process()
                 return None
+            except (OSError, ValueError) as e:
+                # Handle closed file errors gracefully
+                if "closed" in str(e).lower() or "flush" in str(e).lower():
+                    logger.warning(f"FFmpeg stdin closed during write: {e}, restarting...")
+                    self._finish_ffmpeg_process()
+                    return None
+                else:
+                    logger.error(f"Failed to write frame: {e}")
+                    return None
             except Exception as e:
                 logger.error(f"Failed to write frame: {e}")
                 return None
@@ -257,6 +315,7 @@ class VideoChunkWriter:
     def close(self):
         """Close the writer and finish any pending chunk"""
         with self._lock:
+            # Check if already closed to avoid double-close
             if self.ffmpeg_process is not None:
                 self._finish_ffmpeg_process()
         
@@ -331,11 +390,10 @@ class VideoChunkManager:
     def get_window_writer(
         self,
         app_name: str,
-        window_name: str,
-        process_id: int
+        window_name: str
     ) -> VideoChunkWriter:
         """Get or create a writer for a specific window"""
-        window_key = f"{app_name}::{window_name}::{process_id}"
+        window_key = f"{app_name}::{window_name}"
         
         with self._lock:
             if window_key not in self.window_writers:
@@ -370,7 +428,6 @@ class VideoChunkManager:
         self,
         app_name: str,
         window_name: str,
-        process_id: int,
         image: Image.Image
     ) -> Optional[tuple]:
         """
@@ -379,7 +436,7 @@ class VideoChunkManager:
         Returns:
             Tuple of (chunk_path, offset_index) or None if failed
         """
-        writer = self.get_window_writer(app_name, window_name, process_id)
+        writer = self.get_window_writer(app_name, window_name)
         offset = writer.write_frame(image)
         if offset is not None:
             return (writer.get_current_chunk_path(), offset)

@@ -26,8 +26,6 @@ class WindowFrame(BaseModel):
     sub_frame_id: Optional[str] = None  # Assigned after frame diff check confirms storage
     app_name: str
     window_name: str
-    process_id: int
-    is_focused: bool = False
     image: Image  # PIL 图像对象
     image_hash: int = 0  # Hash for quick comparison
     ocr_text: Optional[str] = None

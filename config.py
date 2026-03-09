@@ -2,16 +2,17 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # Load .env file
+ENV_FILE = os.environ.get("VISUALMEM_ENV_FILE", ".env")
+load_dotenv(dotenv_path=ENV_FILE)  # Load selected env file (default: .env)
 
 class Config:
     # ============================================
     # Storage Mode Selection (Core)
     # ============================================
     # Options:
-    #   - simple: Simple file storage (default, Naive implementation)
+    #   - simple: Simple file storage (Naive implementation)
     #   - vector: Vector database storage (advanced, requires CLIP+LanceDB)
-    STORAGE_MODE = os.environ.get("STORAGE_MODE", "simple")
+    STORAGE_MODE = os.environ.get("STORAGE_MODE", "vector")
 
     # ============================================
     # Module Selection
@@ -53,7 +54,7 @@ class Config:
         "TEXT_LANCEDB_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_textdb"),
     )
-    MAX_IMAGES_TO_LOAD = int(os.environ.get("MAX_IMAGES_TO_LOAD", "19"))
+    MAX_IMAGES_TO_LOAD = int(os.environ.get("MAX_IMAGES_TO_LOAD", "20"))
     
     # ============================================
     # Vector Mode Configuration (if STORAGE_MODE=vector)
@@ -78,8 +79,8 @@ class Config:
     # ============================================
     # Query Enhancement
     # ============================================
-    ENABLE_LLM_REWRITE = os.environ.get("ENABLE_LLM_REWRITE", "false").lower() == "true"
-    ENABLE_TIME_FILTER = os.environ.get("ENABLE_TIME_FILTER", "false").lower() == "true"
+    ENABLE_LLM_REWRITE = os.environ.get("ENABLE_LLM_REWRITE", "true").lower() == "true"
+    ENABLE_TIME_FILTER = os.environ.get("ENABLE_TIME_FILTER", "true").lower() == "true"
     QUERY_REWRITE_NUM = int(os.environ.get("QUERY_REWRITE_NUM", "3"))
 
     # ============================================
@@ -94,7 +95,7 @@ class Config:
     # ============================================
     # Hybrid Search Configuration
     # ============================================
-    ENABLE_HYBRID = os.environ.get("ENABLE_HYBRID", "false").lower() == "true"
+    ENABLE_HYBRID = os.environ.get("ENABLE_HYBRID", "true").lower() == "true"
     
 
     # Query Rewrite Independent API Configuration (optional, defaults to VLM config)
@@ -107,7 +108,7 @@ class Config:
     # Reranker Configuration
     # ============================================
     ENABLE_RERANK = os.environ.get("ENABLE_RERANK", "false").lower() == "true"
-    RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "10"))
+    RERANK_TOP_K = int(os.environ.get("RERANK_TOP_K", "20"))
     
     # Reranker model configuration (local mode)
     RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-2B")
@@ -143,7 +144,7 @@ class Config:
     VLM_API_KEY = os.environ.get("VLM_API_KEY", "")
     # API base address (only needs host:port, endpoint path will be automatically added based on VLM_BACKEND_TYPE)
     VLM_API_URI = os.environ.get("VLM_API_URI", "http://localhost:8081")
-    VLM_API_MODEL = os.environ.get("VLM_API_MODEL", "Qwen3-VL-8B-Instruct")
+    VLM_API_MODEL = os.environ.get("VLM_API_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
 
     # ============================================
     # Runtime Parameters
@@ -182,5 +183,3 @@ class Config:
 
 # Export a singleton instance
 config = Config()
-
-

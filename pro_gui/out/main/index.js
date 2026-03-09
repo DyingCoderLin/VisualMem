@@ -27,8 +27,22 @@ const isDev = process.env.NODE_ENV === "development" || !electron.app.isPackaged
 let mainWindow = null;
 let pythonProcess = null;
 let isDownloading = false;
+let isLoadingModel = false;
 let isStartingUp = true;
 const BACKEND_PORT = 8080;
+electron.app.commandLine.appendSwitch("disable-features", [
+  "SafeBrowsing",
+  "Translate",
+  "TranslateUI",
+  "OptimizationHints",
+  "OptimizationHintsFetching",
+  "BackupSignedInSyncTransport",
+  "SyncService"
+].join(","));
+electron.app.commandLine.appendSwitch("disable-background-networking");
+electron.app.commandLine.appendSwitch("disable-component-update");
+electron.app.commandLine.appendSwitch("no-first-run");
+electron.app.commandLine.appendSwitch("no-default-browser-check");
 function setupIPC() {
   electron.ipcMain.handle("desktop-capturer-get-sources", async (_event, options) => {
     try {
@@ -138,7 +152,7 @@ function checkBackendHealth() {
     });
     req.on("error", (err) => {
       const errCode = err.code;
-      if (errCode !== "ECONNREFUSED") {
+      if (errCode !== "ECONNREFUSED" && errCode !== "ECONNRESET") {
         console.error("Health check request error:", errCode, err);
       }
       resolve2(false);
@@ -149,21 +163,28 @@ function checkBackendHealth() {
     });
   });
 }
-async function waitForBackend(maxRetries = 60, interval = 1e3) {
+async function waitForBackend(maxRetries = 180, interval = 1e3) {
   console.log("\nWaiting for backend to be ready...");
   let retries = 0;
-  while (retries < maxRetries || isDownloading) {
+  while (retries < maxRetries || isDownloading || isLoadingModel) {
     const isReady = await checkBackendHealth();
     if (isReady) {
       console.log("✅ Backend is ready!");
       return true;
     }
-    if (isDownloading) ;
-    else {
+    if (isDownloading || isLoadingModel) {
+      if (retries % 30 === 0 && retries > 0) {
+        if (isDownloading) {
+          console.log("⏳ Still downloading model...");
+        } else if (isLoadingModel) {
+          console.log("⏳ Still loading model into memory (this may take 1-2 minutes on first run)...");
+        }
+      }
+    } else {
       retries++;
     }
     if (pythonProcess && pythonProcess.exitCode !== null) {
-      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}`);
+      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}. Check logs/backend_server.log for details.`);
       return false;
     }
     await new Promise((resolve2) => setTimeout(resolve2, interval));
@@ -193,52 +214,42 @@ function startPythonBackend() {
         stdio: ["ignore", "pipe", "pipe"],
         shell: process.platform === "win32"
       });
-      if (pythonProcess.stdout) {
-        pythonProcess.stdout.on("data", (data) => {
-          const str = data.toString();
-          if (isStartingUp) {
+      const handleOutput = (data, isStderr) => {
+        const str = data.toString();
+        if (isStartingUp) {
+          if (isStderr) {
+            process.stderr.write(data);
+          } else {
             process.stdout.write(data);
           }
-          if (str.includes("Starting download")) {
-            if (!isDownloading) {
-              isDownloading = true;
-              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
-            }
+        }
+        if (str.includes("Starting download")) {
+          if (!isDownloading) {
+            isDownloading = true;
+            console.log("⏳ Detected model download, waiting for it to complete...");
           }
-          if (str.includes("download complete!")) {
-            console.log("✅ A model download has finished!");
-          }
-          if (str.includes("[1/7] Loading CLIP encoder...")) {
-            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
-            isDownloading = false;
-          }
-          if (str.includes("All backend components initialized successfully!")) {
-            isStartingUp = false;
-          }
-        });
+        }
+        if (str.includes("download complete!")) {
+          console.log("✅ A model download has finished!");
+        }
+        if (str.includes("Loading encoder") && str.includes("[1/")) {
+          console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
+          console.log("⏳ This may take 1-2 minutes on first run (loading 2B+ parameter model)...");
+          isDownloading = false;
+          isLoadingModel = true;
+        }
+        if (str.includes("All backend components initialized successfully!")) {
+          console.log("✅ All models loaded successfully!");
+          isLoadingModel = false;
+          isStartingUp = false;
+        }
+      };
+      if (pythonProcess.stdout) {
+        pythonProcess.stdout.on("data", (data) => handleOutput(data, false));
         pythonProcess.stdout.pipe(logStream);
       }
       if (pythonProcess.stderr) {
-        pythonProcess.stderr.on("data", (data) => {
-          const str = data.toString();
-          if (isStartingUp) {
-            process.stderr.write(data);
-          }
-          if (str.includes("Starting download")) {
-            if (!isDownloading) {
-              isDownloading = true;
-              console.log("⏳ Detected model download or heavy loading, waiting for it to complete...");
-            }
-          }
-          if (str.includes("download complete!")) {
-            console.log("✅ A model download has finished!");
-          }
-          if (str.includes("[1/7] Loading CLIP encoder...")) {
-            console.log("🚀 All pre-flight downloads finished. Backend is now loading models into memory...");
-            isDownloading = false;
-            isStartingUp = false;
-          }
-        });
+        pythonProcess.stderr.on("data", (data) => handleOutput(data, true));
         pythonProcess.stderr.pipe(logStream);
       }
       pythonProcess.on("error", (error) => {
@@ -282,7 +293,7 @@ electron.app.whenReady().then(async () => {
     if (backendReady) {
       createWindow();
     } else {
-      console.error("Failed to start backend, exiting...");
+      console.error("Failed to start backend (timeout or backend exited). Check logs/backend_server.log, then try: python gui_backend_server.py");
       electron.app.quit();
     }
   } catch (error) {
