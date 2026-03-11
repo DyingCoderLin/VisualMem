@@ -22,6 +22,7 @@ from PIL import Image
 
 from utils.logger import setup_logger
 from utils.data_models import ScreenObject, WindowFrame
+from utils.app_name_manager import app_name_manager
 from config import config
 
 from .window_capturer import WindowCapturer
@@ -271,11 +272,18 @@ class RecordingCoordinator:
         # 1. Check screen frame diff
         screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
         
-        # 2. Track active windows
+        # 2. Track active windows and update app_name list
         current_window_keys = set()
+        current_app_names = []
         for window in screen_obj.windows:
             key = f"{window.app_name}::{window.window_name}"
             current_window_keys.add(key)
+            if window.app_name:
+                current_app_names.append(window.app_name)
+        
+        # Update app_name persistence
+        if current_app_names:
+            app_name_manager.add_apps(current_app_names)
         
         # Cleanup stale window writers
         self.video_manager.cleanup_inactive_windows(current_window_keys)

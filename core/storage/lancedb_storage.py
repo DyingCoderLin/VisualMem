@@ -295,7 +295,9 @@ class LanceDBStorage:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         app_name: Optional[str] = None,
-        window_name: Optional[str] = None
+        window_name: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         向量搜索：根据query embedding找到最相关的图片（支持时间范围和应用/窗口过滤）
@@ -307,6 +309,8 @@ class LanceDBStorage:
             end_time: 结束时间（可选，用于 Pre-filtering）
             app_name: 应用名称过滤（可选，精确匹配）
             window_name: 窗口名称过滤（可选，精确匹配）
+            related_apps: 相关应用列表（可选，用于过滤）
+            unrelated_apps: 不相关应用列表（可选，用于排除）
         
         Returns:
             List of dicts containing: frame_id, timestamp, image_path, similarity, ocr_text, app_name, window_name
@@ -345,6 +349,16 @@ class LanceDBStorage:
                 # 转义单引号，防止 SQL 注入
                 window_name_escaped = window_name.replace("'", "''")
                 conditions.append(f"window_name = '{window_name_escaped}'")
+
+            # 处理 related_apps 和 unrelated_apps 过滤逻辑
+            if related_apps:
+                # 如果有相关应用，只搜索这些应用的应用帧（以及全屏帧，如果需要的话，但这里按要求只搜相关应用）
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps:
+                # 如果没有相关应用但有不相关应用，排除掉不相关应用
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
             
             # 应用 Pre-filtering
             if conditions:
@@ -435,7 +449,9 @@ class LanceDBStorage:
         start_time: Optional[datetime] = None,
         end_time: Optional[datetime] = None,
         app_name: Optional[str] = None,
-        window_name: Optional[str] = None
+        window_name: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         搜索 OCR 文本 embedding（支持时间范围和应用/窗口过滤）
@@ -447,6 +463,8 @@ class LanceDBStorage:
             end_time: 结束时间（可选，用于 Pre-filtering）
             app_name: 应用名称过滤（可选，精确匹配）
             window_name: 窗口名称过滤（可选，精确匹配）
+            related_apps: 相关应用列表（可选）
+            unrelated_apps: 不相关应用列表（可选）
             
         Returns:
             相关帧列表，包含 frame_id, timestamp, image_path, ocr_text, distance, app_name, window_name
@@ -479,6 +497,14 @@ class LanceDBStorage:
             if window_name is not None and window_name != "":
                 window_name_escaped = window_name.replace("'", "''")
                 conditions.append(f"window_name = '{window_name_escaped}'")
+
+            # 处理 related_apps 和 unrelated_apps 过滤逻辑
+            if related_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
             
             if conditions:
                 where_clause = " AND ".join(conditions)

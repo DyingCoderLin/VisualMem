@@ -28,6 +28,7 @@ from pathlib import Path
 
 from config import config
 from utils.logger import setup_logger
+from utils.app_name_manager import app_name_manager
 from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.storage.sqlite_storage import SQLiteStorage
@@ -1067,10 +1068,15 @@ def store_frame(req: StoreFrameRequest):
         except Exception as e:
             logger.warning(f"Backend window capture failed: {e}")
     
-    # 处理窗口（帧差去重 + embedding）
+    # 处理窗口（帧差去重 + embedding + app_name 记录）
     if windows_to_process and temp_frame_buffer is not None:
         from utils.data_models import WindowFrame as WF
         from core.capture.window_capturer import calculate_image_hash
+        
+        # 收集所有窗口的应用名称进行持久化
+        current_apps = [win_data["app_name"] for win_data in windows_to_process if win_data.get("app_name")]
+        if current_apps:
+            app_name_manager.add_apps(current_apps)
         
         for i, win_data in enumerate(windows_to_process):
             try:
@@ -1196,14 +1202,16 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
     start_time = explicit_start
     end_time = explicit_end
 
-    # 3) 调用 LLM 做 query rewrite + time_range 解析
-    #    - 无论是否开启 rewrite，都允许 LLM 解析 time_range
+    # 3) 调用 LLM 做 query rewrite + time_range 解析 + app_name 过滤
+    #    - 无论是否开启 rewrite，都允许 LLM 解析 time_range 和 app_name
     #    - 是否采用扩写结果由 ENABLE_LLM_REWRITE 决定
     dense_queries = [req.query]
     sparse_queries = [req.query]
     llm_time_range = None
+    related_apps = None
+    unrelated_apps = None
     try:
-        dense_llm, sparse_llm, llm_time_range = rewrite_and_time(
+        dense_llm, sparse_llm, llm_time_range, related_apps, unrelated_apps = rewrite_and_time(
             req.query,
             enable_rewrite=config.ENABLE_LLM_REWRITE,
             enable_time=True,  # 总是允许解析时间范围
@@ -1252,6 +1260,15 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
             else:
                 start_time, end_time = llm_start, llm_end
 
+    # Log final search parameters
+    logger.info(f"Final search parameters for query '{req.query}':")
+    if start_time or end_time:
+        logger.info(f"  • Time range: {start_time} to {end_time}")
+    else:
+        logger.info(f"  • Time range: Global (None)")
+    logger.info(f"  • Related apps: {related_apps}")
+    logger.info(f"  • Unrelated apps: {unrelated_apps}")
+
     top_k = config.MAX_IMAGES_TO_LOAD
 
     # Dense search
@@ -1268,6 +1285,8 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
                     top_k=top_k,
                     start_time=start_time,
                     end_time=end_time,
+                    related_apps=related_apps,
+                    unrelated_apps=unrelated_apps
                 )
             else:
                 logger.info(f"Performing image dense search for: {q}")
@@ -1276,6 +1295,8 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
                     top_k=top_k,
                     start_time=start_time,
                     end_time=end_time,
+                    related_apps=related_apps,
+                    unrelated_apps=unrelated_apps
                 )
             frames.extend(res)
         return frames
@@ -1286,9 +1307,18 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
             return []
         frames: List[Dict] = []
         for q in sparse_queries:
+            # TODO: SQLiteStorage.search_by_text currently doesn't support related_apps/unrelated_apps
+            # We filter by time first, then we could add app filtering here if needed.
             res = sqlite_storage.search_by_text(q, limit=top_k)
             if start_time or end_time:
                 res = filter_by_time(res, (start_time, end_time))
+            
+            # Apply app filtering for sparse results
+            if related_apps:
+                res = [r for r in res if r.get("app_name") in related_apps]
+            elif unrelated_apps:
+                res = [r for r in res if r.get("app_name") not in unrelated_apps]
+                
             for r in res:
                 fid = r.get("frame_id")
                 if not fid:
