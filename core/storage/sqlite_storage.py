@@ -97,13 +97,17 @@ class SQLiteStorage:
             ("offset_index", "INTEGER", None),
             ("monitor_id", "INTEGER", "0"),
             ("created_at", "TEXT", "CURRENT_TIMESTAMP"),
-            ("app_name", "TEXT", None),  # 应用名称（frame为空，sub_frame填写）
-            ("window_name", "TEXT", None),  # 窗口名称（frame为空，sub_frame填写）
+            ("app_name", "TEXT", None),
+            ("window_name", "TEXT", None),
+            ("focused_app_name", "TEXT", None),
+            ("focused_window_name", "TEXT", None),
         ]
         
         # 定义ocr_text表需要的新列
         ocr_text_new_columns = [
             ("sub_frame_id", "TEXT", None),
+            ("focused_app_name", "TEXT", None),
+            ("focused_window_name", "TEXT", None),
         ]
         
         # 检查并添加frames表的列
@@ -163,11 +167,13 @@ class SQLiteStorage:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 app_name TEXT,
                 window_name TEXT,
+                focused_app_name TEXT,
+                focused_window_name TEXT,
                 FOREIGN KEY (video_chunk_id) REFERENCES video_chunks(id)
             )
         """)
         
-        # 创建 ocr_text 表（扩展支持sub_frame_id）
+        # 创建 ocr_text 表（扩展支持sub_frame_id和focused window信息）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS ocr_text (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,6 +184,8 @@ class SQLiteStorage:
                 ocr_engine TEXT NOT NULL,
                 text_length INTEGER NOT NULL,
                 confidence REAL DEFAULT 0.0,
+                focused_app_name TEXT,
+                focused_window_name TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (frame_id) REFERENCES frames(frame_id),
                 FOREIGN KEY (sub_frame_id) REFERENCES sub_frames(sub_frame_id)
@@ -340,7 +348,9 @@ class SQLiteStorage:
         device_name: str = "default",
         metadata: Optional[Dict] = None,
         app_name: Optional[str] = None,
-        window_name: Optional[str] = None
+        window_name: Optional[str] = None,
+        focused_app_name: Optional[str] = None,
+        focused_window_name: Optional[str] = None
     ) -> bool:
         """
         存储帧和 OCR 结果
@@ -357,6 +367,8 @@ class SQLiteStorage:
             metadata: 其他元数据
             app_name: 应用名称（frame为空，sub_frame填写）
             window_name: 窗口名称（frame为空，sub_frame填写）
+            focused_app_name: 截图时用户聚焦的应用名称
+            focused_window_name: 截图时用户聚焦的窗口名称
         """
         try:
             conn = self._get_connection()
@@ -367,12 +379,9 @@ class SQLiteStorage:
             existing_row = cursor.fetchone()
 
             if existing_row:
-                # 记录已存在，仅更新不覆盖 video_chunk 相关的 image_path
                 existing_image_path = existing_row["image_path"]
                 final_image_path = str(image_path)
                 
-                # 如果原路径已经是 video_chunk/window_chunk，并且新路径不是，则保留原路径
-                # 但是如果新路径是 video_chunk/window_chunk (这通常不会发生在这个函数，但为了安全)，则允许覆盖
                 if existing_image_path and ("video_chunk:" in existing_image_path or "window_chunk:" in existing_image_path) and not ("video_chunk:" in final_image_path or "window_chunk:" in final_image_path):
                     final_image_path = existing_image_path
 
@@ -383,7 +392,9 @@ class SQLiteStorage:
                         device_name = ?, 
                         metadata = ?, 
                         app_name = ?, 
-                        window_name = ?
+                        window_name = ?,
+                        focused_app_name = COALESCE(?, focused_app_name),
+                        focused_window_name = COALESCE(?, focused_window_name)
                     WHERE frame_id = ?
                 """, (
                     timestamp.isoformat(),
@@ -392,14 +403,16 @@ class SQLiteStorage:
                     json.dumps(metadata) if metadata else "{}",
                     app_name,
                     window_name,
+                    focused_app_name,
+                    focused_window_name,
                     frame_id
                 ))
             else:
-                # 1. 插入 frame
                 cursor.execute("""
                     INSERT INTO frames 
-                    (frame_id, timestamp, image_path, device_name, metadata, app_name, window_name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (frame_id, timestamp, image_path, device_name, metadata,
+                     app_name, window_name, focused_app_name, focused_window_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     frame_id,
                     timestamp.isoformat(),
@@ -407,10 +420,11 @@ class SQLiteStorage:
                     device_name,
                     json.dumps(metadata) if metadata else "{}",
                     app_name,
-                    window_name
+                    window_name,
+                    focused_app_name,
+                    focused_window_name
                 ))
             
-            # 2. 插入 OCR 结果（如果有文本）
             if ocr_text:
                 text_length = len(ocr_text)
                 cursor.execute("""
@@ -423,13 +437,13 @@ class SQLiteStorage:
                     ocr_text_json,
                     ocr_engine,
                     text_length,
-                    ocr_confidence
+                    ocr_confidence,
                 ))
             
             conn.commit()
             conn.close()
             
-            logger.debug(f"Stored frame {frame_id} with OCR (text_length={len(ocr_text)})")
+            logger.debug(f"Stored frame {frame_id} with OCR (text_length={len(ocr_text)}, focused={focused_app_name})")
             return True
             
         except Exception as e:
@@ -940,7 +954,9 @@ class SQLiteStorage:
         device_name: str = "default",
         metadata: Optional[Dict] = None,
         app_name: Optional[str] = None,
-        window_name: Optional[str] = None
+        window_name: Optional[str] = None,
+        focused_app_name: Optional[str] = None,
+        focused_window_name: Optional[str] = None
     ) -> bool:
         """
         更新帧的 video_chunk 引用（如果帧已存在则更新，否则插入）
@@ -957,15 +973,15 @@ class SQLiteStorage:
             metadata: 其他元数据
             app_name: 应用名称（frame为空，sub_frame填写）
             window_name: 窗口名称（frame为空，sub_frame填写）
+            focused_app_name: 截图时用户聚焦的应用名称
+            focused_window_name: 截图时用户聚焦的窗口名称
         """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            # image_path 设为 video chunk 引用
             image_path = f"video_chunk:{video_chunk_id}:{offset_index}"
             
-            # 先尝试更新现有记录
             cursor.execute("""
                 UPDATE frames 
                 SET image_path = ?,
@@ -973,7 +989,9 @@ class SQLiteStorage:
                     offset_index = ?,
                     monitor_id = ?,
                     app_name = ?,
-                    window_name = ?
+                    window_name = ?,
+                    focused_app_name = COALESCE(?, focused_app_name),
+                    focused_window_name = COALESCE(?, focused_window_name)
                 WHERE frame_id = ?
             """, (
                 image_path,
@@ -982,16 +1000,18 @@ class SQLiteStorage:
                 monitor_id,
                 app_name,
                 window_name,
+                focused_app_name,
+                focused_window_name,
                 frame_id
             ))
             
-            # 如果没有更新到任何记录，则插入新记录
             if cursor.rowcount == 0:
                 cursor.execute("""
                     INSERT INTO frames 
                     (frame_id, timestamp, image_path, device_name, metadata, 
-                     video_chunk_id, offset_index, monitor_id, app_name, window_name)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     video_chunk_id, offset_index, monitor_id, app_name, window_name,
+                     focused_app_name, focused_window_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     frame_id,
                     timestamp.isoformat(),
@@ -1002,7 +1022,9 @@ class SQLiteStorage:
                     offset_index,
                     monitor_id,
                     app_name,
-                    window_name
+                    window_name,
+                    focused_app_name,
+                    focused_window_name
                 ))
             
             conn.commit()
@@ -1090,7 +1112,7 @@ class SQLiteStorage:
                     ocr_text_json,
                     ocr_engine,
                     text_length,
-                    ocr_confidence
+                    ocr_confidence,
                 ))
             
             conn.commit()

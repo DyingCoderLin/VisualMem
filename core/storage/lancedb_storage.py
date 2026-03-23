@@ -109,11 +109,11 @@ class LanceDBStorage:
         return str(image_path.resolve())
     
     def _load_image(self, image_path: str) -> Optional[Image.Image]:
-        """从路径加载图片"""
+        """从路径加载图片。失败时仅打 DEBUG，因上层可能通过 fallback（SQLite/视频帧）再次加载。"""
         try:
             return Image.open(image_path)
         except Exception as e:
-            logger.error(f"Failed to load image from {image_path}: {e}")
+            logger.debug(f"Load image failed (may retry via fallback): {image_path}: {e}")
             return None
     
     def store_frame(
@@ -297,7 +297,8 @@ class LanceDBStorage:
         app_name: Optional[str] = None,
         window_name: Optional[str] = None,
         related_apps: Optional[List[str]] = None,
-        unrelated_apps: Optional[List[str]] = None
+        unrelated_apps: Optional[List[str]] = None,
+        window_filters: Optional[Dict[str, Dict[str, List[str]]]] = None,
     ) -> List[Dict]:
         """
         向量搜索：根据query embedding找到最相关的图片（支持时间范围和应用/窗口过滤）
@@ -351,14 +352,63 @@ class LanceDBStorage:
                 conditions.append(f"window_name = '{window_name_escaped}'")
 
             # 处理 related_apps 和 unrelated_apps 过滤逻辑
-            if related_apps:
-                # 如果有相关应用，只搜索这些应用的应用帧（以及全屏帧，如果需要的话，但这里按要求只搜相关应用）
-                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+            has_include_windows = bool(window_filters and window_filters.get("include"))
+            if related_apps and not has_include_windows:
+                # 如果有相关应用且没有窗口级 include，只搜索这些应用
+                escaped_apps = [app.replace("'", "''") for app in related_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
                 conditions.append(f"app_name IN ({app_list_str})")
-            elif unrelated_apps:
-                # 如果没有相关应用但有不相关应用，排除掉不相关应用
-                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+            elif unrelated_apps and not has_include_windows:
+                # 如果没有相关应用但有不相关应用，且没有窗口级 include，排除掉不相关应用
+                escaped_apps = [app.replace("'", "''") for app in unrelated_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
                 conditions.append(f"app_name NOT IN ({app_list_str})")
+
+            # 处理窗口级 include/exclude 过滤逻辑
+            if window_filters:
+                include_map = window_filters.get("include") or {}
+                exclude_map = window_filters.get("exclude") or {}
+
+                window_clauses = []
+
+                # 1) 如果有 include，则只保留这些 (app, window) 组合
+                if include_map:
+                    include_parts = []
+                    for app, wins in include_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            # 只有 app，没有指定 window，则表示该 app 下所有窗口
+                            include_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            include_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if include_parts:
+                        window_clauses.append("(" + " OR ".join(include_parts) + ")")
+
+                # 2) 如果没有 include 但有 exclude，则排除这些 (app, window) 组合
+                elif exclude_map:
+                    exclude_parts = []
+                    for app, wins in exclude_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            # 只有 app，没有指定 window，则排除该 app 下所有窗口
+                            exclude_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            exclude_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if exclude_parts:
+                        window_clauses.append("NOT (" + " OR ".join(exclude_parts) + ")")
+
+                if window_clauses:
+                    conditions.append(" AND ".join(window_clauses))
             
             # 应用 Pre-filtering
             if conditions:
@@ -451,7 +501,8 @@ class LanceDBStorage:
         app_name: Optional[str] = None,
         window_name: Optional[str] = None,
         related_apps: Optional[List[str]] = None,
-        unrelated_apps: Optional[List[str]] = None
+        unrelated_apps: Optional[List[str]] = None,
+        window_filters: Optional[Dict[str, Dict[str, List[str]]]] = None,
     ) -> List[Dict]:
         """
         搜索 OCR 文本 embedding（支持时间范围和应用/窗口过滤）
@@ -499,12 +550,59 @@ class LanceDBStorage:
                 conditions.append(f"window_name = '{window_name_escaped}'")
 
             # 处理 related_apps 和 unrelated_apps 过滤逻辑
-            if related_apps:
-                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+            has_include_windows = bool(window_filters and window_filters.get("include"))
+            if related_apps and not has_include_windows:
+                escaped_apps = [app.replace("'", "''") for app in related_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
                 conditions.append(f"app_name IN ({app_list_str})")
-            elif unrelated_apps:
-                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+            elif unrelated_apps and not has_include_windows:
+                escaped_apps = [app.replace("'", "''") for app in unrelated_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
                 conditions.append(f"app_name NOT IN ({app_list_str})")
+
+            # 处理窗口级 include/exclude 过滤逻辑
+            if window_filters:
+                include_map = window_filters.get("include") or {}
+                exclude_map = window_filters.get("exclude") or {}
+
+                window_clauses = []
+
+                # 1) 如果有 include，则只保留这些 (app, window) 组合
+                if include_map:
+                    include_parts = []
+                    for app, wins in include_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            include_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            include_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if include_parts:
+                        window_clauses.append("(" + " OR ".join(include_parts) + ")")
+
+                # 2) 如果没有 include 但有 exclude，则排除这些 (app, window) 组合
+                elif exclude_map:
+                    exclude_parts = []
+                    for app, wins in exclude_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            exclude_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            exclude_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if exclude_parts:
+                        window_clauses.append("NOT (" + " OR ".join(exclude_parts) + ")")
+
+                if window_clauses:
+                    conditions.append(" AND ".join(window_clauses))
             
             if conditions:
                 where_clause = " AND ".join(conditions)

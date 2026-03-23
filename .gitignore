@@ -20,3 +20,7 @@ findings.md
 task_plan.md
 progress.md
 agent-sync.md
+
+/graduate_design_docs/*
+/ocr_compare_output/*
+*.pt

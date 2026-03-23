@@ -246,14 +246,24 @@ class QueryWorker(QObject):
                     seen.add(fid)
                     frames.append(r)
             
+            # 合并后按 MAX_IMAGES_TO_LOAD 截断；多取几条以弥补部分帧图片加载失败
+            max_to_try = config.MAX_IMAGES_TO_LOAD + 10
+            if len(frames) > max_to_try:
+                frames = frames[:max_to_try]
+            
             if not frames:
                 self.result_signal.emit("未找到相关的屏幕记录。")
                 return
             
             logger.info(f"找到 {len(frames)} 个帧")
             
-            # 确保所有 frame 都有图片
+            # 确保所有 frame 都有图片，并只保留前 MAX_IMAGES_TO_LOAD 张（与配置一致）
             frames_with_images = [f for f in frames if f.get("image") is not None]
+            loaded_count = len(frames_with_images)
+            if loaded_count > config.MAX_IMAGES_TO_LOAD:
+                frames_with_images = frames_with_images[:config.MAX_IMAGES_TO_LOAD]
+            if loaded_count < len(frames):
+                logger.warning(f"图片加载: 成功 {loaded_count}/{len(frames)} 张，部分帧的 image_path 无法加载")
             if not frames_with_images:
                 self.result_signal.emit("检索到的图片无法加载。")
                 return
@@ -484,6 +494,11 @@ class QueryWorker(QObject):
                 seen.add(fid)
                 frames.append(r)
             
+            # 合并后按 MAX_IMAGES_TO_LOAD 截断；多取几条以弥补部分帧图片加载失败
+            max_to_try = config.MAX_IMAGES_TO_LOAD + 10
+            if len(frames) > max_to_try:
+                frames = frames[:max_to_try]
+            
             if not frames:
                 self.result_signal.emit("在指定时间范围内未找到相关的屏幕记录。")
                 return
@@ -495,8 +510,13 @@ class QueryWorker(QObject):
                 if 'image' not in frame or frame['image'] is None:
                     self._load_frame_image(frame)
             
-            # 确保所有 frame 都有图片
+            # 确保所有 frame 都有图片，并只保留前 MAX_IMAGES_TO_LOAD 张（与配置一致）
             frames_with_images = [f for f in frames if f.get("image") is not None]
+            loaded_count = len(frames_with_images)
+            if loaded_count > config.MAX_IMAGES_TO_LOAD:
+                frames_with_images = frames_with_images[:config.MAX_IMAGES_TO_LOAD]
+            if loaded_count < len(frames):
+                logger.warning(f"图片加载: 成功 {loaded_count}/{len(frames)} 张，部分帧的 image_path 无法加载")
             if not frames_with_images:
                 self.result_signal.emit("检索到的图片无法加载。")
                 return

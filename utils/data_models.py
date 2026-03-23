@@ -66,6 +66,10 @@ class ScreenObject(BaseModel):
     video_chunk_id: Optional[int] = None
     offset_index: Optional[int] = None
     
+    # Currently focused window at capture time
+    focused_app_name: Optional[str] = None
+    focused_window_name: Optional[str] = None
+    
     # OCR results for full screen (optional)
     ocr_text: Optional[str] = None
     ocr_text_json: Optional[str] = None

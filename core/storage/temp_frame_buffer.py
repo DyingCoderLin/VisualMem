@@ -139,11 +139,24 @@ class TempFrameBuffer:
     
     def _get_window_dir(self, app_name: str, window_name: str) -> Path:
         """Get temp directory for window frames"""
-        safe_name = f"{self._sanitize_name(app_name)}_{self._sanitize_name(window_name)}"
+        safe_name = self._safe_dir_name(f"{app_name}_{window_name}")
         dir_path = self.windows_temp_dir / safe_name
         dir_path.mkdir(parents=True, exist_ok=True)
         return dir_path
     
+    def _safe_dir_name(self, name: str, max_len: int = 120) -> str:
+        """Sanitize and truncate a name for use as a directory name.
+
+        If the sanitized name exceeds max_len, truncate and append a short hash
+        to preserve uniqueness.
+        """
+        import hashlib
+        safe = self._sanitize_name(name)
+        if len(safe) <= max_len:
+            return safe
+        hash_suffix = hashlib.md5(name.encode()).hexdigest()[:8]
+        return f"{safe[:max_len - 9]}_{hash_suffix}"
+
     def _get_video_output_path(
         self,
         batch_type: str,
@@ -152,13 +165,13 @@ class TempFrameBuffer:
     ) -> Path:
         """
         Get output path for compressed video
-        
+
         Full screen: visualmem_storage/visualmem_video/full_screen_<monitor_id>/<date>/
         Windows: visualmem_storage/visualmem_video/<date>/<window_name>/
         """
         date_str = timestamp.strftime("%Y-%m-%d")
         time_str = timestamp.strftime("%H-%M-%S")
-        
+
         if batch_type == "full_screen":
             # Format: visualmem_video/full_screen_<monitor_id>/<date>/monitor_<id>_<timestamp>.mp4
             output_dir = self.video_dir / f"full_screen_{identifier}" / date_str
@@ -167,7 +180,8 @@ class TempFrameBuffer:
         else:
             # Format: visualmem_video/<date>/<window_name>/monitor_<id>_<timestamp>.mp4
             # identifier format: "{app_name}_{window_name}"
-            output_dir = self.video_dir / date_str / identifier
+            safe_id = self._safe_dir_name(identifier)
+            output_dir = self.video_dir / date_str / safe_id
             output_dir.mkdir(parents=True, exist_ok=True)
             return (output_dir / f"monitor_0_{time_str}.mp4").resolve()  # 绝对路径
     

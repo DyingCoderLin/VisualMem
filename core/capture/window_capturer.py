@@ -15,6 +15,7 @@ from PIL import Image
 from io import BytesIO
 from dataclasses import dataclass
 from .base_capturer import AbstractCapturer
+from .focused_window import get_focused_window
 from utils.data_models import ScreenFrame, WindowFrame, ScreenObject
 from utils.logger import setup_logger
 from config import config
@@ -198,6 +199,9 @@ class RustWindowCapturer(AbstractCapturer):
                 
                 logger.debug(f"Captured {len(windows)} windows")
             
+            # Detect focused window
+            focused_app, focused_win = get_focused_window()
+            
             # Create ScreenObject
             screen_obj = ScreenObject(
                 monitor_id=self.monitor_id,
@@ -205,10 +209,15 @@ class RustWindowCapturer(AbstractCapturer):
                 timestamp=timestamp,
                 full_screen_image=full_screen,
                 full_screen_hash=full_screen_hash,
-                windows=windows
+                windows=windows,
+                focused_app_name=focused_app or None,
+                focused_window_name=focused_win or None,
             )
             
-            logger.debug(f"Screen capture complete: {full_screen.size}, {len(windows)} windows")
+            logger.debug(
+                f"Screen capture complete: {full_screen.size}, "
+                f"{len(windows)} windows, focused={focused_app}/{focused_win}"
+            )
             return screen_obj
             
         except Exception as e:
@@ -596,13 +605,18 @@ if not _USE_RUST:
                     
                     logger.debug(f"Captured {len(windows)} windows")
                 
+                # Detect focused window
+                focused_app, focused_win = get_focused_window()
+                
                 screen_obj = ScreenObject(
                     monitor_id=self.monitor_id,
                     device_name=f"monitor_{self.monitor_id}",
                     timestamp=timestamp,
                     full_screen_image=full_screen,
                     full_screen_hash=full_screen_hash,
-                    windows=windows
+                    windows=windows,
+                    focused_app_name=focused_app or None,
+                    focused_window_name=focused_win or None,
                 )
                 
                 return screen_obj

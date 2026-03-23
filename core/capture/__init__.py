@@ -1,6 +1,7 @@
 # core/capture/__init__.py
 from .base_capturer import AbstractCapturer
 from .screenshot_capturer import ScreenshotCapturer
+from .focused_window import get_focused_window
 from .window_capturer import (
     WindowCapturer,
     calculate_image_hash,
@@ -22,6 +23,7 @@ except ImportError:
 __all__ = [
     "AbstractCapturer",
     "ScreenshotCapturer",
+    "get_focused_window",
     "WindowCapturer",
     "calculate_image_hash",
     "should_skip_window",

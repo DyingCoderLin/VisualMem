@@ -145,16 +145,45 @@ class DummyOCR(OCREngine):
 def create_ocr_engine(engine_type: str = "pytesseract", **kwargs) -> OCREngine:
     """
     工厂函数：创建 OCR 引擎
-    
+
     Args:
         engine_type: OCR 引擎类型
+            - "auto": 自动检测平台（macOS→AppleVision, Windows→winocr, 其他→pytesseract）
+            - "apple_vision": macOS Apple Vision OCR
+            - "windows_ocr": Windows UWP OCR
             - "pytesseract": Pytesseract OCR
             - "dummy": 虚拟 OCR（禁用）
         **kwargs: 引擎特定参数
-        
+
     Returns:
         OCR 引擎实例
     """
+    import platform as _platform
+
+    if engine_type == "auto":
+        system = _platform.system()
+        if system == "Darwin":
+            try:
+                from .platform_ocr import AppleVisionOCR
+                return AppleVisionOCR(lang=kwargs.get("lang", "zh-Hans"))
+            except ImportError:
+                logger.warning("Apple Vision not available, falling back to pytesseract")
+        elif system == "Windows":
+            try:
+                from .platform_ocr import WindowsOCR
+                return WindowsOCR(lang=kwargs.get("lang", "zh-Hans-CN"))
+            except ImportError:
+                logger.warning("winocr not available, falling back to pytesseract")
+        return PytesseractOCR(**kwargs)
+
+    if engine_type == "apple_vision":
+        from .platform_ocr import AppleVisionOCR
+        return AppleVisionOCR(lang=kwargs.get("lang", "zh-Hans"))
+
+    if engine_type == "windows_ocr":
+        from .platform_ocr import WindowsOCR
+        return WindowsOCR(lang=kwargs.get("lang", "zh-Hans-CN"))
+
     if engine_type == "pytesseract":
         return PytesseractOCR(**kwargs)
     elif engine_type == "dummy":

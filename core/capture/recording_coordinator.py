@@ -259,12 +259,17 @@ class RecordingCoordinator:
         Returns:
             Processing result with frame_id, sub_frame_ids, etc.
         """
+        focused_app = screen_obj.focused_app_name or ""
+        focused_win = screen_obj.focused_window_name or ""
+        
         result = {
             "frame_id": None,
             "frame_stored": False,
             "sub_frame_ids": [],
             "sub_frames_stored": 0,
-            "timestamp": screen_obj.timestamp
+            "timestamp": screen_obj.timestamp,
+            "focused_app_name": focused_app,
+            "focused_window_name": focused_win,
         }
         
         self.stats.frames_captured += 1
@@ -272,22 +277,31 @@ class RecordingCoordinator:
         # 1. Check screen frame diff
         screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
         
-        # 2. Track active windows and update app_name list
+        # 2. Track active windows and update app_name + window_name list
         current_window_keys = set()
         current_app_names = []
+        app_window_pairs = []
         for window in screen_obj.windows:
             key = f"{window.app_name}::{window.window_name}"
             current_window_keys.add(key)
             if window.app_name:
                 current_app_names.append(window.app_name)
+                if window.window_name:
+                    app_window_pairs.append((window.app_name, window.window_name))
         
         # Update app_name persistence
         if current_app_names:
             app_name_manager.add_apps(current_app_names)
+        # Update window_name persistence grouped by app
+        if app_window_pairs:
+            app_name_manager.add_window_pairs(app_window_pairs)
         
         # Cleanup stale window writers
         self.video_manager.cleanup_inactive_windows(current_window_keys)
         self._active_window_keys = current_window_keys
+        
+        # Initialize sub_frame_ids early (may be populated by full-screen synthetic sub_frame)
+        sub_frame_ids = []
         
         # 3. Process screen if changed
         if screen_diff_result.should_store:
@@ -316,7 +330,9 @@ class RecordingCoordinator:
                     video_chunk_id=video_chunk_id,
                     offset_index=offset_index,
                     monitor_id=screen_obj.monitor_id,
-                    device_name=screen_obj.device_name
+                    device_name=screen_obj.device_name,
+                    focused_app_name=focused_app or None,
+                    focused_window_name=focused_win or None,
                 )
                 
                 # OCR (optional)
@@ -332,9 +348,45 @@ class RecordingCoordinator:
                             ocr_text=ocr_text,
                             ocr_text_json=ocr_json,
                             ocr_confidence=confidence,
-                            device_name=screen_obj.device_name
+                            device_name=screen_obj.device_name,
+                            focused_app_name=focused_app or None,
+                            focused_window_name=focused_win or None,
                         )
                         self.stats.ocr_processed += 1
+                
+                # If focused app is full-screen (not among captured windows),
+                # create a synthetic sub_frame referencing the same video
+                if focused_app:
+                    focused_in_windows = any(
+                        w.app_name == focused_app for w in screen_obj.windows
+                    )
+                    if not focused_in_windows:
+                        syn_id = self._generate_sub_frame_id(focused_app)
+                        self.db.store_sub_frame(
+                            sub_frame_id=syn_id,
+                            timestamp=screen_obj.timestamp,
+                            window_chunk_id=0,
+                            offset_index=offset_index,
+                            app_name=focused_app,
+                            window_name=focused_win or focused_app,
+                        )
+                        self.db.add_frame_subframe_mapping(frame_id, syn_id)
+                        # Create frames table entry pointing to same video chunk
+                        self.db.store_frame_with_video_ref(
+                            frame_id=syn_id,
+                            timestamp=screen_obj.timestamp,
+                            video_chunk_id=video_chunk_id,
+                            offset_index=offset_index,
+                            monitor_id=screen_obj.monitor_id,
+                            device_name=screen_obj.device_name,
+                            app_name=focused_app,
+                            window_name=focused_win or focused_app,
+                        )
+                        sub_frame_ids.append(syn_id)
+                        logger.debug(
+                            f"Created synthetic sub_frame {syn_id} for "
+                            f"full-screen app {focused_app}"
+                        )
                 
                 result["frame_id"] = frame_id
                 result["frame_stored"] = True
@@ -352,7 +404,6 @@ class RecordingCoordinator:
                 logger.debug(f"Stored frame {frame_id} (diff={screen_diff_result.diff_score:.4f})")
         
         # 4. Process each window independently
-        sub_frame_ids = []
         for window in screen_obj.windows:
             self.stats.windows_captured += 1
             
@@ -396,7 +447,7 @@ class RecordingCoordinator:
                                 sub_frame_id=sub_frame_id,
                                 ocr_text=ocr_text,
                                 ocr_text_json=ocr_json,
-                                ocr_confidence=confidence
+                                ocr_confidence=confidence,
                             )
                             self.stats.ocr_processed += 1
                     

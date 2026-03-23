@@ -42,6 +42,7 @@ from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
 from core.retrieval.reranker import Reranker
 from core.understand.api_vlm import ApiVLM
 from core.ocr import create_ocr_engine
+from core.capture.focused_window import get_focused_window
 from utils.model_utils import ensure_model_downloaded
 
 
@@ -241,8 +242,10 @@ class BatchWriteBuffer:
                             ocr_confidence=frame_data.get("ocr_confidence", 0.0),
                             device_name=frame_data.get("device_name", "remote-gui"),
                             metadata=frame_data.get("metadata", {}),
-                            app_name=frame_data.get("app_name"),  # frame 为空，sub_frame 填写
-                            window_name=frame_data.get("window_name"),  # frame 为空，sub_frame 填写
+                            app_name=frame_data.get("app_name"),
+                            window_name=frame_data.get("window_name"),
+                            focused_app_name=frame_data.get("focused_app_name"),
+                            focused_window_name=frame_data.get("focused_window_name"),
                         )
                     except Exception as e:
                         logger.error(f"写入 SQLite 失败 (frame_id={frame_data.get('frame_id')}): {e}")
@@ -280,6 +283,35 @@ class BatchWriteBuffer:
 
 # 全局批量写入缓冲区
 batch_write_buffer: Optional[BatchWriteBuffer] = None
+
+
+def _resolve_sub_frame_image_path(sf: dict) -> Optional[str]:
+    """
+    Build image_path for a sub_frame response.
+
+    Normal sub_frames use ``window_chunk:{id}:{offset}``.
+    Synthetic full-screen sub_frames (window_chunk_id==0) fall back
+    to the ``frames`` table entry which holds the ``video_chunk:...`` reference.
+    """
+    wc_id = sf.get("window_chunk_id") or 0
+    off = sf.get("offset_index")
+    if wc_id > 0 and off is not None:
+        return f"window_chunk:{wc_id}:{off}"
+    if sqlite_storage is not None:
+        try:
+            conn = sqlite_storage._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT image_path FROM frames WHERE frame_id = ?",
+                (sf["sub_frame_id"],),
+            )
+            row = cursor.fetchone()
+            conn.close()
+            if row and row["image_path"]:
+                return row["image_path"]
+        except Exception:
+            pass
+    return None
 
 
 def _on_video_batch_ready(batch_type: str, identifier: str, frames: List[FrameInfo]):
@@ -336,7 +368,6 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
                         fps=VIDEO_FPS
                     )
                     
-                    # 更新所有帧的video_chunk_id
                     if chunk_id > 0:
                         sqlite_storage.update_chunk_frame_count(chunk_id, len(frames), "video")
                         for i, frame in enumerate(frames):
@@ -348,9 +379,49 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
                                 monitor_id=frame.monitor_id,
                                 device_name=identifier,
                                 metadata=frame.metadata,
-                                app_name=None,  # frame 类型，app_name 为空
-                                window_name=None  # frame 类型，window_name 为空
+                                app_name=None,
+                                window_name=None
                             )
+                            
+                            # Back-fill synthetic sub_frames (full-screen apps)
+                            # with the same video_chunk reference
+                            try:
+                                subs = sqlite_storage.get_sub_frames_for_frame(frame.frame_id)
+                                video_ref = f"video_chunk:{chunk_id}:{i}"
+                                for sf in subs:
+                                    if (sf.get("window_chunk_id") or 0) == 0:
+                                        conn = sqlite_storage._get_connection()
+                                        cursor = conn.cursor()
+                                        cursor.execute(
+                                            "SELECT 1 FROM frames WHERE frame_id = ?",
+                                            (sf["sub_frame_id"],),
+                                        )
+                                        if cursor.fetchone():
+                                            cursor.execute("""
+                                                UPDATE frames
+                                                SET image_path = ?, offset_index = ?
+                                                WHERE frame_id = ?
+                                            """, (video_ref, i, sf["sub_frame_id"]))
+                                        else:
+                                            cursor.execute("""
+                                                INSERT INTO frames
+                                                (frame_id, timestamp, image_path, device_name,
+                                                 metadata, app_name, window_name, offset_index)
+                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                            """, (
+                                                sf["sub_frame_id"],
+                                                sf["timestamp"].isoformat(),
+                                                video_ref,
+                                                f"{sf['app_name']}/{sf['window_name']}",
+                                                "{}",
+                                                sf["app_name"],
+                                                sf["window_name"],
+                                                i,
+                                            ))
+                                        conn.commit()
+                                        conn.close()
+                            except Exception as e:
+                                logger.debug(f"Back-fill synthetic sub_frame for {frame.frame_id}: {e}")
                 else:
                     # 窗口视频
                     app_name = frames[0].app_name or "unknown"
@@ -598,8 +669,8 @@ def _init_components():
     global ocr_engine
     if ocr_engine is None and config.ENABLE_OCR:
         try:
-            ocr_engine = create_ocr_engine("pytesseract", lang="chi_sim+eng")
-            logger.info("OCR engine initialized (pytesseract).")
+            ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
+            logger.info(f"OCR engine initialized ({config.OCR_ENGINE_TYPE}).")
         except Exception as e:
             logger.warning(f"Failed to init OCR engine, fallback to dummy: {e}")
             ocr_engine = create_ocr_engine("dummy")
@@ -653,10 +724,11 @@ def _init_all_components():
     
     # 6. Initialize OCR engine (if enabled)
     if config.ENABLE_OCR:
-        logger.info("[6/7] Initializing OCR engine...")
+        logger.info(f"[6/7] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
         try:
-            ocr_engine = create_ocr_engine("pytesseract", lang="chi_sim+eng")
+            ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
         except Exception as e:
+            logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
             ocr_engine = create_ocr_engine("dummy")
     else:
         logger.info("[6/7] OCR engine disabled (ENABLE_OCR=False)")
@@ -794,8 +866,14 @@ async def startup_event():
     import threading
     watchdog_thread = threading.Thread(target=_parent_watchdog, daemon=True)
     watchdog_thread.start()
-    
-    _init_all_components()
+
+    try:
+        _init_all_components()
+    except Exception as e:
+        logger.critical(f"Fatal error during startup: {e}", exc_info=True)
+        # 让进程以非零状态退出，Electron 端可以感知到后端启动失败
+        import os
+        os._exit(1)
 
 
 @app.on_event("shutdown")
@@ -963,6 +1041,9 @@ def store_frame(req: StoreFrameRequest):
     base_frame_id = ts.strftime("%Y%m%d_%H%M%S_") + f"{ts.microsecond:06d}"
     frame_id = f"frame_{base_frame_id}_{req.monitor_id}"
 
+    # ========== 0. 检测当前聚焦窗口 ==========
+    focused_app, focused_win = get_focused_window()
+
     # ========== 1. 处理全屏截图 ==========
     
     # 保存到临时文件用于视频压缩
@@ -1022,6 +1103,8 @@ def store_frame(req: StoreFrameRequest):
         "metadata": req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
         "app_name": None,  # frame 类型，app_name 为空
         "window_name": None,  # frame 类型，window_name 为空
+        "focused_app_name": focused_app or None,
+        "focused_window_name": focused_win or None,
     }
     
     batch_write_buffer.add_frame(frame_data)
@@ -1068,15 +1151,26 @@ def store_frame(req: StoreFrameRequest):
         except Exception as e:
             logger.warning(f"Backend window capture failed: {e}")
     
-    # 处理窗口（帧差去重 + embedding + app_name 记录）
+    # 处理窗口（帧差去重 + embedding + app_name/window_name 记录）
     if windows_to_process and temp_frame_buffer is not None:
         from utils.data_models import WindowFrame as WF
         from core.capture.window_capturer import calculate_image_hash
         
-        # 收集所有窗口的应用名称进行持久化
-        current_apps = [win_data["app_name"] for win_data in windows_to_process if win_data.get("app_name")]
+        # 收集所有窗口的应用名称和窗口名称进行持久化
+        current_apps = []
+        app_window_pairs = []
+        for win_data in windows_to_process:
+            app_name = win_data.get("app_name")
+            window_name = win_data.get("window_name")
+            if app_name:
+                current_apps.append(app_name)
+                if window_name:
+                    app_window_pairs.append((app_name, window_name))
+
         if current_apps:
             app_name_manager.add_apps(current_apps)
+        if app_window_pairs:
+            app_name_manager.add_window_pairs(app_window_pairs)
         
         for i, win_data in enumerate(windows_to_process):
             try:
@@ -1168,7 +1262,68 @@ def store_frame(req: StoreFrameRequest):
                 logger.warning(f"Failed to process window {win_data.get('app_name', 'unknown')}: {e}")
                 continue
     
-    logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows")
+    # ========== 4. 全屏应用检测：如果聚焦的应用不在已捕获的窗口中，创建合成子帧 ==========
+    if focused_app and temp_frame_buffer is not None:
+        captured_app_names = {w.get("app_name", "") for w in windows_to_process}
+        if focused_app not in captured_app_names:
+            try:
+                safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
+                syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
+
+                # SQLite: sub_frames record (window_chunk_id=0 marks it as synthetic)
+                if sqlite_storage is not None:
+                    sqlite_storage.store_sub_frame(
+                        sub_frame_id=syn_sub_id,
+                        timestamp=ts,
+                        window_chunk_id=0,
+                        offset_index=0,
+                        app_name=focused_app,
+                        window_name=focused_win or focused_app,
+                    )
+                    sqlite_storage.add_frame_subframe_mapping(
+                        frame_id=frame_id,
+                        sub_frame_id=syn_sub_id,
+                    )
+                    # Also pre-create frames table entry (image_path updated on compression)
+                    sqlite_storage.store_frame_with_ocr(
+                        frame_id=syn_sub_id,
+                        timestamp=ts,
+                        image_path=temp_image_path,
+                        ocr_text=ocr_text,
+                        ocr_text_json=ocr_json,
+                        ocr_engine=ocr_engine_name,
+                        ocr_confidence=ocr_conf,
+                        device_name=f"{focused_app}/{focused_win}",
+                        app_name=focused_app,
+                        window_name=focused_win or focused_app,
+                    )
+
+                # LanceDB: reuse the same embedding (no re-encoding)
+                syn_frame_data = {
+                    "frame_id": syn_sub_id,
+                    "timestamp": ts,
+                    "image": image,
+                    "embedding": embedding,
+                    "ocr_text": ocr_text,
+                    "image_path": temp_image_path,
+                    "ocr_text_json": ocr_json,
+                    "ocr_engine": ocr_engine_name,
+                    "ocr_confidence": ocr_conf,
+                    "device_name": f"{focused_app}/{focused_win}",
+                    "metadata": {"is_fullscreen_synthetic": True, "parent_frame_id": frame_id},
+                    "app_name": focused_app,
+                    "window_name": focused_win or focused_app,
+                }
+                batch_write_buffer.add_frame(syn_frame_data)
+                sub_frame_ids.append(syn_sub_id)
+                logger.info(
+                    f"Created synthetic sub_frame {syn_sub_id} for "
+                    f"full-screen app {focused_app}/{focused_win}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create synthetic sub_frame for {focused_app}: {e}")
+
+    logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows (focused={focused_app})")
     return {"status": "ok", "frame_id": frame_id, "sub_frame_count": len(sub_frame_ids)}
 
 
@@ -1210,8 +1365,9 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
     llm_time_range = None
     related_apps = None
     unrelated_apps = None
+    window_filters = None
     try:
-        dense_llm, sparse_llm, llm_time_range, related_apps, unrelated_apps = rewrite_and_time(
+        dense_llm, sparse_llm, llm_time_range, related_apps, unrelated_apps, window_filters = rewrite_and_time(
             req.query,
             enable_rewrite=config.ENABLE_LLM_REWRITE,
             enable_time=True,  # 总是允许解析时间范围
@@ -1268,6 +1424,11 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
         logger.info(f"  • Time range: Global (None)")
     logger.info(f"  • Related apps: {related_apps}")
     logger.info(f"  • Unrelated apps: {unrelated_apps}")
+    if window_filters:
+        logger.info(f"  • Included windows (by app): {window_filters.get('include')}")
+        logger.info(f"  • Excluded windows (by app): {window_filters.get('exclude')}")
+    else:
+        logger.info(f"  • Window filters: None")
 
     top_k = config.MAX_IMAGES_TO_LOAD
 
@@ -1286,7 +1447,8 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
                     start_time=start_time,
                     end_time=end_time,
                     related_apps=related_apps,
-                    unrelated_apps=unrelated_apps
+                    unrelated_apps=unrelated_apps,
+                    window_filters=window_filters,
                 )
             else:
                 logger.info(f"Performing image dense search for: {q}")
@@ -1296,7 +1458,8 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
                     start_time=start_time,
                     end_time=end_time,
                     related_apps=related_apps,
-                    unrelated_apps=unrelated_apps
+                    unrelated_apps=unrelated_apps,
+                    window_filters=window_filters,
                 )
             frames.extend(res)
         return frames
@@ -1354,6 +1517,11 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
         seen.add(fid)
         frames.append(r)
 
+    logger.info(
+        f"RAG dense 原始 {len(dense_results)} 条, sparse 原始 {len(sparse_results)} 条, "
+        f"去重后 {len(frames)} 张"
+    )
+
     if not frames:
         return QueryRagWithTimeResponse(answer="在指定时间范围内未找到相关的屏幕记录。", frames=[])
 
@@ -1395,6 +1563,9 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
             loaded_frames.append(f)
         else:
             logger.debug(f"Skip frame (image not loadable): {f.get('frame_id')} path={path[:80]}")
+
+    failed_count = len(frames) - len(loaded_frames)
+    logger.info(f"图片加载成功 {len(loaded_frames)} 张，失败 {failed_count} 张")
 
     if not loaded_frames:
         return QueryRagWithTimeResponse(answer="检索到的图片无法加载。", frames=[])
@@ -1731,15 +1902,12 @@ def get_recent_frames(minutes: int = 5):
             sub_frames = sqlite_storage.get_sub_frames_for_frame(f["frame_id"])
             sub_list = []
             for sf in sub_frames:
-                wc_id = sf.get("window_chunk_id") or 0
-                off = sf.get("offset_index")
-                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
                 sub_list.append({
                     "sub_frame_id": sf["sub_frame_id"],
                     "timestamp": sf["timestamp"].isoformat(),
                     "app_name": sf.get("app_name", ""),
                     "window_name": sf.get("window_name", ""),
-                    "image_path": image_path,
+                    "image_path": _resolve_sub_frame_image_path(sf),
                 })
             recent_frames.append({
                 "frame_id": f["frame_id"],
@@ -1897,15 +2065,12 @@ def get_frames_by_date(req: GetFramesByDateRequest):
             sub_frames = sqlite_storage.get_sub_frames_for_frame(fid)
             sub_list = []
             for sf in sub_frames:
-                wc_id = sf.get("window_chunk_id") or 0
-                off = sf.get("offset_index")
-                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
                 sub_list.append({
                     "sub_frame_id": sf["sub_frame_id"],
                     "timestamp": sf["timestamp"].isoformat(),
                     "app_name": sf.get("app_name", ""),
                     "window_name": sf.get("window_name", ""),
-                    "image_path": image_path,
+                    "image_path": _resolve_sub_frame_image_path(sf),
                 })
             ts = datetime.fromisoformat(row["timestamp"])
             ts_str = ts.isoformat()
@@ -1962,15 +2127,12 @@ def get_frames_by_date_range(req: GetFramesByDateRangeRequest):
             sub_frames = sqlite_storage.get_sub_frames_for_frame(fid) if fid else []
             sub_list = []
             for sf in sub_frames:
-                wc_id = sf.get("window_chunk_id") or 0
-                off = sf.get("offset_index")
-                image_path = f"window_chunk:{wc_id}:{off}" if (wc_id and off is not None) else None
                 sub_list.append({
                     "sub_frame_id": sf["sub_frame_id"],
                     "timestamp": sf["timestamp"].isoformat(),
                     "app_name": sf.get("app_name", ""),
                     "window_name": sf.get("window_name", ""),
-                    "image_path": image_path,
+                    "image_path": _resolve_sub_frame_image_path(sf),
                 })
             ts = frame.get("timestamp")
             ts_str = ts.isoformat() if isinstance(ts, datetime) else str(ts)
@@ -2113,7 +2275,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "gui_backend_server:app",
         host="0.0.0.0",
-        port=8080,
+        port=18080,
         reload=False,
     )
 

@@ -132,6 +132,8 @@ class Config:
     
     # OCR configuration (enabled by default)
     ENABLE_OCR = os.environ.get("ENABLE_OCR", "true").lower() == "true"
+    # OCR engine type: "auto" (platform-native), "apple_vision", "windows_ocr", "pytesseract", "dummy"
+    OCR_ENGINE_TYPE = os.environ.get("OCR_ENGINE_TYPE", "auto")
     
     # Frame difference filtering during query (enabled by default)
     # If enabled: only feed images with frame difference > 0.006 to VLM

@@ -29,7 +29,7 @@ let pythonProcess = null;
 let isDownloading = false;
 let isLoadingModel = false;
 let isStartingUp = true;
-const BACKEND_PORT = 8080;
+const BACKEND_PORT = 18080;
 electron.app.commandLine.appendSwitch("disable-features", [
   "SafeBrowsing",
   "Translate",
@@ -140,8 +140,7 @@ function checkBackendHealth() {
             console.log("Health check response:", json);
           }
           resolve2(isOk);
-        } catch (e) {
-          console.error("Failed to parse health check response:", data, e);
+        } catch {
           resolve2(false);
         }
       });

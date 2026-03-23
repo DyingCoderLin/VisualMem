@@ -15,7 +15,7 @@ let pythonProcess: ChildProcess | null = null
 let isDownloading = false
 let isLoadingModel = false  // 模型正在加载到内存
 let isStartingUp = true
-const BACKEND_PORT = 8080
+const BACKEND_PORT = 18080
 
 // 禁用 Chromium 会发起外部 HTTPS 的内置功能，避免在控制台打印 SSL handshake failed / net_error -101
 app.commandLine.appendSwitch('disable-features', [
@@ -154,8 +154,8 @@ function checkBackendHealth(): Promise<boolean> {
             console.log('Health check response:', json)
           }
           resolve(isOk)
-        } catch (e) {
-          console.error('Failed to parse health check response:', data, e)
+        } catch {
+          // During startup, empty or non-JSON responses are expected while models load
           resolve(false)
         }
       })

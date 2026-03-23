@@ -103,19 +103,33 @@ def rewrite_and_time(
     enable_time: bool,
     expand_n: int,
     api_client: Optional[ApiVLM] = None,
-) -> Tuple[List[str], List[str], Optional[Tuple[datetime, datetime]], Optional[List[str]], Optional[List[str]]]:
+) -> Tuple[
+    List[str],
+    List[str],
+    Optional[Tuple[datetime, datetime]],
+    Optional[List[str]],
+    Optional[List[str]],
+    Optional[Dict[str, Dict[str, List[str]]]],
+]:
     """
-    调用 LLM 生成扩写查询、时间范围以及相关的 app_name。
-    返回 (dense_queries, sparse_queries, time_range, related_apps, unrelated_apps)
+    调用 LLM 生成扩写查询、时间范围以及相关的 app_name / window_name。
+    返回 (dense_queries, sparse_queries, time_range, related_apps, unrelated_apps, window_filters)
+
+    window_filters 结构示例:
+    {
+        "include": {"微信": ["朋友圈", "与张三的聊天"], "Safari": ["百度搜索"]},
+        "exclude": {"微信": ["设置窗口"], "Chrome": ["扩展管理"]}
+    }
     """
     dense_queries = [query]
     sparse_queries = [query]
     time_range = None
     related_apps = None
     unrelated_apps = None
+    window_filters: Optional[Dict[str, Dict[str, List[str]]]] = None
 
     if not (enable_rewrite or enable_time):
-        return dense_queries, sparse_queries, time_range, related_apps, unrelated_apps
+        return dense_queries, sparse_queries, time_range, related_apps, unrelated_apps, window_filters
 
     prompt = _build_combined_prompt(expand_n, enable_rewrite, enable_time)
     # Use local time for reference so LLM can correctly interpret relative time (e.g., "today")
@@ -179,6 +193,36 @@ def rewrite_and_time(
                     elif unrelated_apps == "null" or unrelated_apps == None:
                         unrelated_apps = None
                 
+                # 提取 window 级别过滤
+                # 期望字段:
+                # - included_windows: [{"app_name": "...", "window_names": ["...", "..."]}, ...]
+                # - excluded_windows: 同上，表示明确不相关的窗口
+                window_filters = {"include": {}, "exclude": {}}
+                included = parsed.get("included_windows") or []
+                excluded = parsed.get("excluded_windows") or []
+
+                def _merge_window_items(target: Dict[str, List[str]], items):
+                    if not isinstance(items, list):
+                        return
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        app = item.get("app_name")
+                        wins = item.get("window_names") or []
+                        if not app or not isinstance(wins, list):
+                            continue
+                        current = target.setdefault(app, [])
+                        for w in wins:
+                            if isinstance(w, str) and w and w not in current:
+                                current.append(w)
+
+                _merge_window_items(window_filters["include"], included)
+                _merge_window_items(window_filters["exclude"], excluded)
+
+                # 如果两边都为空，就视为 None，避免到处判断空 dict
+                if not window_filters["include"] and not window_filters["exclude"]:
+                    window_filters = None
+
                 # 提取时间范围
                 if enable_time:
                     tr = parsed.get("time_range") or parsed.get("time_range_str")
@@ -236,8 +280,13 @@ def rewrite_and_time(
         logger.info(f"  • Time range: None")
     logger.info(f"  • Related apps: {related_apps}")
     logger.info(f"  • Unrelated apps: {unrelated_apps}")
+    if window_filters:
+        logger.info(f"  • Included windows (by app): {window_filters.get('include')}")
+        logger.info(f"  • Excluded windows (by app): {window_filters.get('exclude')}")
+    else:
+        logger.info(f"  • Window filters: None")
 
-    return dense_queries, sparse_queries, time_range, related_apps, unrelated_apps
+    return dense_queries, sparse_queries, time_range, related_apps, unrelated_apps, window_filters
 
 
 def _build_combined_prompt(expand_n: int, rewrite: bool, need_time: bool) -> str:
@@ -253,7 +302,22 @@ def _build_combined_prompt(expand_n: int, rewrite: bool, need_time: bool) -> str
         examples.append(COMBINED_EXAMPLES)
 
     app_list = app_name_manager.get_app_list()
+    app_window_map = app_name_manager.get_app_window_map()
     app_list_str = ", ".join(app_list) if app_list else "None"
+
+    # 构造 app + window 的展示字符串，帮助 LLM 精细到窗口级别
+    # 例如: 微信: [聊天窗口, 朋友圈]; Safari: [百度搜索, 设置]
+    if app_window_map:
+        app_window_str_parts = []
+        for app in sorted(app_window_map.keys()):
+            windows = app_window_map[app]
+            if windows:
+                app_window_str_parts.append(f"{app}: [{', '.join(windows)}]")
+            else:
+                app_window_str_parts.append(f"{app}: []")
+        app_window_str = "\\n".join(app_window_str_parts)
+    else:
+        app_window_str = "None"
 
     body = f"""
 You are part of an academic information system that processes researchers' queries about computer systems.
@@ -265,9 +329,16 @@ Fields:
 - time_range: object with "start"/"end" in ISO "YYYY-MM-DD HH:MM:SS", or "null" if you cannot infer the time range
 - related_apps: list of app names from the provided list that are LIKELY related to the query UI screenshots. If you cannot determine, return null.
 - unrelated_apps: list of app names from the provided list that are DEFINITELY NOT related to the query UI screenshots. If you cannot determine, return null.
+- included_windows: list of objects, each with:
+    - app_name: app name from the provided list
+    - window_names: list of window names under that app that are LIKELY related to the query UI screenshots.
+- excluded_windows: list of objects, same structure as included_windows, but for windows that are DEFINITELY NOT related.
 
 Available App Names:
 [{app_list_str}]
+
+Available App + Window Names:
+{app_window_str}
 
 Your Task: 
 1. Generate both dense and sparse query expansions.
@@ -275,6 +346,10 @@ Your Task:
    - If an app could POSSIBLY be related, include it in related_apps.
    - If an app is DEFINITELY NOT related, include it in unrelated_apps.
    - If unsure about any app, set the field to null.
+3. When you can infer specific windows (such as "微信::朋友圈" or "微信::搜索聊天记录"), fill them into included_windows/excluded_windows.
+   - If you only know that some apps are DEFINITELY NOT related, put them into unrelated_apps and their obviously unrelated windows into excluded_windows.
+   - If you can narrow down to certain windows of an app, add those windows into included_windows.
+
 Return only valid JSON in the specified format. No extra text.
 
 {chr(10).join(examples)}
