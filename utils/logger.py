@@ -15,6 +15,32 @@ LOG_LEVEL_MAP = {
 }
 
 
+class SafeStreamHandler(logging.StreamHandler):
+    """StreamHandler that degrades gracefully on non-UTF8 Windows consoles."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            self._write_message(msg + self.terminator)
+            self.flush()
+        except RecursionError:
+            raise
+        except Exception:
+            self.handleError(record)
+
+    def _write_message(self, message: str) -> None:
+        try:
+            self.stream.write(message)
+        except UnicodeEncodeError:
+            buffer = getattr(self.stream, "buffer", None)
+            encoding = getattr(self.stream, "encoding", None) or "utf-8"
+            if buffer is not None:
+                buffer.write(message.encode(encoding, errors="backslashreplace"))
+            else:
+                escaped = message.encode("ascii", errors="backslashreplace").decode("ascii")
+                self.stream.write(escaped)
+
+
 def get_log_level() -> int:
     """获取日志级别（从环境变量或 config）"""
     try:
@@ -46,7 +72,7 @@ def setup_logger(name: str = "visualmem", level: int = None) -> logging.Logger:
         return logger
     
     # 创建控制台处理器
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setLevel(log_level)
     
     # 创建格式化器

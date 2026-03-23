@@ -212,7 +212,12 @@ function startPythonBackend() {
       pythonProcess = child_process.spawn("python", [pythonScript], {
         cwd: rootDir,
         stdio: ["ignore", "pipe", "pipe"],
-        shell: process.platform === "win32"
+        shell: process.platform === "win32",
+        env: {
+          ...process.env,
+          PYTHONUTF8: process.env.PYTHONUTF8 || "1",
+          PYTHONIOENCODING: process.env.PYTHONIOENCODING || "utf-8"
+        }
       });
       const handleOutput = (data, isStderr) => {
         const str = data.toString();

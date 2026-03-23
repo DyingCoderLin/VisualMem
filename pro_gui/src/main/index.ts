@@ -258,7 +258,12 @@ function startPythonBackend(): Promise<void> {
       pythonProcess = spawn('python', [pythonScript], {
         cwd: rootDir,
         stdio: ['ignore', 'pipe', 'pipe'],
-        shell: process.platform === 'win32'
+        shell: process.platform === 'win32',
+        env: {
+          ...process.env,
+          PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+          PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+        }
       })
 
       // 将 stdout 和 stderr 重定向到日志文件，并检测是否在下载/加载模型
