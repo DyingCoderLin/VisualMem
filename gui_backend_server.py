@@ -154,6 +154,7 @@ sqlite_storage: Optional[SQLiteStorage] = None
 reranker: Optional[Reranker] = None
 vlm: Optional[ApiVLM] = None
 ocr_engine = None
+region_ocr_engine = None  # RegionOCREngine (UIED region detection + per-region OCR)
 
 # ============ 视频存储相关组件 ============
 temp_frame_buffer: Optional[TempFrameBuffer] = None
@@ -232,12 +233,15 @@ class BatchWriteBuffer:
             if sqlite_storage is not None:
                 for frame_data in frames_to_write:
                     try:
+                        # If OCR was already stored via store_ocr_with_regions,
+                        # pass empty ocr_text to avoid duplicate ocr_text rows.
+                        ocr_text_for_sqlite = "" if frame_data.get("_ocr_regions_stored") else frame_data.get("ocr_text", "")
                         sqlite_storage.store_frame_with_ocr(
                             frame_id=frame_data["frame_id"],
                             timestamp=frame_data["timestamp"],
                             image_path=frame_data["image_path"],
-                            ocr_text=frame_data.get("ocr_text", ""),
-                            ocr_text_json=frame_data.get("ocr_text_json", ""),
+                            ocr_text=ocr_text_for_sqlite,
+                            ocr_text_json=frame_data.get("ocr_text_json", "") if not frame_data.get("_ocr_regions_stored") else "",
                             ocr_engine=frame_data.get("ocr_engine", "pending"),
                             ocr_confidence=frame_data.get("ocr_confidence", 0.0),
                             device_name=frame_data.get("device_name", "remote-gui"),
@@ -383,45 +387,8 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
                                 window_name=None
                             )
                             
-                            # Back-fill synthetic sub_frames (full-screen apps)
-                            # with the same video_chunk reference
-                            try:
-                                subs = sqlite_storage.get_sub_frames_for_frame(frame.frame_id)
-                                video_ref = f"video_chunk:{chunk_id}:{i}"
-                                for sf in subs:
-                                    if (sf.get("window_chunk_id") or 0) == 0:
-                                        conn = sqlite_storage._get_connection()
-                                        cursor = conn.cursor()
-                                        cursor.execute(
-                                            "SELECT 1 FROM frames WHERE frame_id = ?",
-                                            (sf["sub_frame_id"],),
-                                        )
-                                        if cursor.fetchone():
-                                            cursor.execute("""
-                                                UPDATE frames
-                                                SET image_path = ?, offset_index = ?
-                                                WHERE frame_id = ?
-                                            """, (video_ref, i, sf["sub_frame_id"]))
-                                        else:
-                                            cursor.execute("""
-                                                INSERT INTO frames
-                                                (frame_id, timestamp, image_path, device_name,
-                                                 metadata, app_name, window_name, offset_index)
-                                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                            """, (
-                                                sf["sub_frame_id"],
-                                                sf["timestamp"].isoformat(),
-                                                video_ref,
-                                                f"{sf['app_name']}/{sf['window_name']}",
-                                                "{}",
-                                                sf["app_name"],
-                                                sf["window_name"],
-                                                i,
-                                            ))
-                                        conn.commit()
-                                        conn.close()
-                            except Exception as e:
-                                logger.debug(f"Back-fill synthetic sub_frame for {frame.frame_id}: {e}")
+                            # Fullscreen sub_frames are synced atomically inside
+                            # store_frame_with_video_ref() — no back-fill needed here.
                 else:
                     # 窗口视频
                     app_name = frames[0].app_name or "unknown"
@@ -638,7 +605,7 @@ def _recover_temp_frames():
 
 def _init_components():
     """Lazy-init heavy components (called on first request)."""
-    global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine
+    global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine, region_ocr_engine
 
     if encoder is None:
         logger.info(f"Loading encoder {config.EMBEDDING_MODEL} for gui_backend_server...")
@@ -666,7 +633,7 @@ def _init_components():
         vlm = ApiVLM()
         logger.info("VLM API client initialized.")
 
-    global ocr_engine
+    global ocr_engine, region_ocr_engine
     if ocr_engine is None and config.ENABLE_OCR:
         try:
             ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
@@ -675,13 +642,22 @@ def _init_components():
             logger.warning(f"Failed to init OCR engine, fallback to dummy: {e}")
             ocr_engine = create_ocr_engine("dummy")
 
+    if region_ocr_engine is None and ocr_engine is not None:
+        from core.ocr.region_detector import UIEDRegionDetector
+        from core.ocr.region_ocr_engine import RegionOCREngine
+        region_ocr_engine = RegionOCREngine(
+            ocr_engine=ocr_engine,
+            region_detector=UIEDRegionDetector(),
+        )
+        logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
+
 
 def _init_all_components():
     """
     强制初始化所有组件（用于服务器启动时预加载）。
     与 _init_components() 不同，这个函数会强制加载，不检查是否已加载。
     """
-    global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine, batch_write_buffer
+    global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine, region_ocr_engine, batch_write_buffer
     global temp_frame_buffer, ffmpeg_compressor, ffmpeg_extractor, window_diff_detector
     
     logger.info("=" * 60)
@@ -730,6 +706,14 @@ def _init_all_components():
         except Exception as e:
             logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
             ocr_engine = create_ocr_engine("dummy")
+        # Build RegionOCREngine on top of the platform OCR engine
+        from core.ocr.region_detector import UIEDRegionDetector
+        from core.ocr.region_ocr_engine import RegionOCREngine
+        region_ocr_engine = RegionOCREngine(
+            ocr_engine=ocr_engine,
+            region_detector=UIEDRegionDetector(),
+        )
+        logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
     else:
         logger.info("[6/7] OCR engine disabled (ENABLE_OCR=False)")
         ocr_engine = None
@@ -884,7 +868,7 @@ async def shutdown_event():
     logger.info("=" * 60)
     logger.info("Shutting down backend server...")
     
-    global encoder, reranker, vlm, ocr_engine, vector_storage, sqlite_storage
+    global encoder, reranker, vlm, ocr_engine, region_ocr_engine, vector_storage, sqlite_storage
     
     # 1. 先刷新视频缓冲区
     try:
@@ -917,7 +901,8 @@ async def shutdown_event():
             
         vlm = None
         ocr_engine = None
-        
+        region_ocr_engine = None
+
         # 强制垃圾回收
         import gc
         gc.collect()
@@ -1073,41 +1058,13 @@ def store_frame(req: StoreFrameRequest):
     # Compute image embedding
     embedding = encoder.encode_image(image)
 
-    # OCR (if enabled)
-    ocr_text = ""
-    ocr_json = ""
-    ocr_engine_name = "pending"
-    ocr_conf = 0.0
-    if ocr_engine is not None:
-        try:
-            result = ocr_engine.recognize(image)
-            ocr_text = result.text
-            ocr_json = result.text_json
-            ocr_engine_name = result.engine
-            ocr_conf = result.confidence
-        except Exception as e:
-            logger.warning(f"OCR failed for frame {frame_id}: {e}")
+    # Full-screen frame OCR is deferred: we collect sub_frame OCR results first,
+    # then combine them as the frame's ocr_text (labeled by app_name).
+    # This avoids mixing text from unrelated windows in a single OCR pass.
+    ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto') if ocr_engine else "pending"
 
-    # 添加到批量写入缓冲区（用于LanceDB和SQLite的OCR数据）
-    frame_data = {
-        "frame_id": frame_id,
-        "timestamp": ts,
-        "image": image,
-        "embedding": embedding,
-        "ocr_text": ocr_text,
-        "image_path": temp_image_path,  # 临时路径，后续会更新为video_chunk引用
-        "ocr_text_json": ocr_json,
-        "ocr_engine": ocr_engine_name,
-        "ocr_confidence": ocr_conf,
-        "device_name": f"monitor_{req.monitor_id}",
-        "metadata": req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
-        "app_name": None,  # frame 类型，app_name 为空
-        "window_name": None,  # frame 类型，window_name 为空
-        "focused_app_name": focused_app or None,
-        "focused_window_name": focused_win or None,
-    }
-    
-    batch_write_buffer.add_frame(frame_data)
+    # Collector for sub_frame OCR results: [(app_name, ocr_text, confidence), ...]
+    sub_frame_ocr_parts = []
 
     # ========== 3. 处理窗口截图 ==========
     
@@ -1202,7 +1159,43 @@ def store_frame(req: StoreFrameRequest):
                 
                 # 对窗口帧做 embedding
                 win_embedding = encoder.encode_image(win_image)
-                
+
+                # 对窗口帧做 region OCR
+                win_ocr_text = ""
+                win_ocr_json = ""
+                win_ocr_engine_name = "none"
+                win_ocr_conf = 0.0
+                win_ocr_regions_stored = False
+                if region_ocr_engine is not None:
+                    try:
+                        win_regions = region_ocr_engine.recognize_regions(win_image)
+                        if win_regions:
+                            win_w, win_h = win_image.size
+                            win_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
+                            sqlite_storage.store_ocr_with_regions(
+                                sub_frame_id=sub_frame_id,
+                                regions=win_regions,
+                                ocr_engine=win_ocr_engine_name,
+                                image_width=win_w,
+                                image_height=win_h,
+                            )
+                            win_ocr_text = "\n".join(
+                                r.get("text", "") for r in win_regions if r.get("text")
+                            )
+                            win_ocr_regions_stored = True
+                            total_len = sum(len(r.get("text", "")) for r in win_regions)
+                            if total_len > 0:
+                                win_ocr_conf = sum(
+                                    len(r.get("text", "")) * r.get("ocr_confidence", 0.0)
+                                    for r in win_regions
+                                ) / total_len
+                    except Exception as e:
+                        logger.warning(f"Region OCR failed for window {app_name}: {e}")
+
+                # Collect for frame-level combined OCR
+                if win_ocr_text:
+                    sub_frame_ocr_parts.append((app_name, win_ocr_text, win_ocr_conf))
+
                 # 保存到临时文件
                 win_temp_path, win_batch_ready = temp_frame_buffer.add_window_frame(
                     sub_frame_id=sub_frame_id,
@@ -1212,7 +1205,7 @@ def store_frame(req: StoreFrameRequest):
                     window_name=window_name,
                     parent_frame_id=frame_id  # 关联全屏帧ID
                 )
-                
+
                 # Immediately create sub_frame record and mapping in SQLite
                 # (the video_chunk reference will be back-filled on compression)
                 if sqlite_storage is not None:
@@ -1228,18 +1221,18 @@ def store_frame(req: StoreFrameRequest):
                         frame_id=frame_id,
                         sub_frame_id=sub_frame_id,
                     )
-                
+
                 # 将窗口帧的 embedding 也存储到 LanceDB（通过 batch_write_buffer）
                 sub_frame_data = {
                     "frame_id": sub_frame_id,  # 使用 sub_frame_id 作为 frame_id
                     "timestamp": ts,
                     "image": win_image,
                     "embedding": win_embedding,
-                    "ocr_text": "",  # 窗口帧通常不做 OCR
+                    "ocr_text": win_ocr_text,
                     "image_path": win_temp_path,
-                    "ocr_text_json": "",
-                    "ocr_engine": "none",
-                    "ocr_confidence": 0.0,
+                    "ocr_text_json": win_ocr_json,
+                    "ocr_engine": win_ocr_engine_name,
+                    "ocr_confidence": win_ocr_conf,
                     "device_name": f"{app_name}/{window_name}",
                     "metadata": {
                         "app_name": app_name,
@@ -1249,6 +1242,7 @@ def store_frame(req: StoreFrameRequest):
                     },
                     "app_name": app_name,  # sub_frame 类型，填写 app_name
                     "window_name": window_name,  # sub_frame 类型，填写 window_name
+                    "_ocr_regions_stored": win_ocr_regions_stored,
                 }
                 batch_write_buffer.add_frame(sub_frame_data)
                 
@@ -1270,6 +1264,38 @@ def store_frame(req: StoreFrameRequest):
                 safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
                 syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
 
+                # Run independent region OCR for this synthetic sub_frame
+                # (do NOT reuse full-screen OCR — it contains text from all windows)
+                syn_ocr_text = ""
+                syn_ocr_engine_name = "none"
+                syn_ocr_conf = 0.0
+                syn_ocr_regions_stored = False
+                if region_ocr_engine is not None:
+                    try:
+                        syn_regions = region_ocr_engine.recognize_regions(image)
+                        if syn_regions:
+                            syn_img_w, syn_img_h = image.size
+                            syn_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
+                            sqlite_storage.store_ocr_with_regions(
+                                sub_frame_id=syn_sub_id,
+                                regions=syn_regions,
+                                ocr_engine=syn_ocr_engine_name,
+                                image_width=syn_img_w,
+                                image_height=syn_img_h,
+                            )
+                            syn_ocr_text = "\n".join(
+                                r.get("text", "") for r in syn_regions if r.get("text")
+                            )
+                            syn_ocr_regions_stored = True
+                            total_len = sum(len(r.get("text", "")) for r in syn_regions)
+                            if total_len > 0:
+                                syn_ocr_conf = sum(
+                                    len(r.get("text", "")) * r.get("ocr_confidence", 0.0)
+                                    for r in syn_regions
+                                ) / total_len
+                    except Exception as e:
+                        logger.warning(f"Region OCR failed for synthetic sub_frame {focused_app}: {e}")
+
                 # SQLite: sub_frames record (window_chunk_id=0 marks it as synthetic)
                 if sqlite_storage is not None:
                     sqlite_storage.store_sub_frame(
@@ -1284,15 +1310,16 @@ def store_frame(req: StoreFrameRequest):
                         frame_id=frame_id,
                         sub_frame_id=syn_sub_id,
                     )
-                    # Also pre-create frames table entry (image_path updated on compression)
+                    # Pre-create frames table entry (image_path updated on compression)
+                    # Pass empty ocr_text since region OCR already wrote to ocr_text
                     sqlite_storage.store_frame_with_ocr(
                         frame_id=syn_sub_id,
                         timestamp=ts,
                         image_path=temp_image_path,
-                        ocr_text=ocr_text,
-                        ocr_text_json=ocr_json,
-                        ocr_engine=ocr_engine_name,
-                        ocr_confidence=ocr_conf,
+                        ocr_text="" if syn_ocr_regions_stored else syn_ocr_text,
+                        ocr_text_json="",
+                        ocr_engine=syn_ocr_engine_name,
+                        ocr_confidence=syn_ocr_conf,
                         device_name=f"{focused_app}/{focused_win}",
                         app_name=focused_app,
                         window_name=focused_win or focused_app,
@@ -1304,24 +1331,80 @@ def store_frame(req: StoreFrameRequest):
                     "timestamp": ts,
                     "image": image,
                     "embedding": embedding,
-                    "ocr_text": ocr_text,
+                    "ocr_text": syn_ocr_text,
                     "image_path": temp_image_path,
-                    "ocr_text_json": ocr_json,
-                    "ocr_engine": ocr_engine_name,
-                    "ocr_confidence": ocr_conf,
+                    "ocr_text_json": "",
+                    "ocr_engine": syn_ocr_engine_name,
+                    "ocr_confidence": syn_ocr_conf,
                     "device_name": f"{focused_app}/{focused_win}",
                     "metadata": {"is_fullscreen_synthetic": True, "parent_frame_id": frame_id},
                     "app_name": focused_app,
                     "window_name": focused_win or focused_app,
+                    "_ocr_regions_stored": syn_ocr_regions_stored,
                 }
                 batch_write_buffer.add_frame(syn_frame_data)
                 sub_frame_ids.append(syn_sub_id)
+
+                # Collect for frame-level combined OCR
+                if syn_ocr_text:
+                    sub_frame_ocr_parts.append((focused_app, syn_ocr_text, syn_ocr_conf))
+
                 logger.info(
                     f"Created synthetic sub_frame {syn_sub_id} for "
                     f"full-screen app {focused_app}/{focused_win}"
                 )
             except Exception as e:
                 logger.warning(f"Failed to create synthetic sub_frame for {focused_app}: {e}")
+
+    # ========== 5. 组合全屏帧 OCR：拼接所有 sub_frame 的 OCR 文本 ==========
+    combined_ocr_text = ""
+    combined_ocr_conf = 0.0
+    if sub_frame_ocr_parts:
+        sections = []
+        for app, text, conf in sub_frame_ocr_parts:
+            sections.append(f"[{app}]\n{text}")
+        combined_ocr_text = "\n\n".join(sections)
+        # Weighted avg confidence
+        total_len = sum(len(t) for _, t, _ in sub_frame_ocr_parts)
+        if total_len > 0:
+            combined_ocr_conf = sum(len(t) * c for _, t, c in sub_frame_ocr_parts) / total_len
+
+    # Store frame's combined OCR to ocr_text (for FTS search)
+    if combined_ocr_text and sqlite_storage is not None:
+        sqlite_storage.store_frame_with_ocr(
+            frame_id=frame_id,
+            timestamp=ts,
+            image_path=temp_image_path,
+            ocr_text=combined_ocr_text,
+            ocr_text_json="",
+            ocr_engine=ocr_engine_name,
+            ocr_confidence=combined_ocr_conf,
+            device_name=f"monitor_{req.monitor_id}",
+            metadata=req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
+            focused_app_name=focused_app or None,
+            focused_window_name=focused_win or None,
+        )
+
+    # Write frame to batch buffer (LanceDB + frames table via BatchWriteBuffer)
+    frame_data = {
+        "frame_id": frame_id,
+        "timestamp": ts,
+        "image": image,
+        "embedding": embedding,
+        "ocr_text": combined_ocr_text,
+        "image_path": temp_image_path,
+        "ocr_text_json": "",
+        "ocr_engine": ocr_engine_name,
+        "ocr_confidence": combined_ocr_conf,
+        "device_name": f"monitor_{req.monitor_id}",
+        "metadata": req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
+        "app_name": None,
+        "window_name": None,
+        "focused_app_name": focused_app or None,
+        "focused_window_name": focused_win or None,
+        "_ocr_regions_stored": True,  # Already stored above, skip duplicate in BatchWriteBuffer
+    }
+    batch_write_buffer.add_frame(frame_data)
 
     logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows (focused={focused_app})")
     return {"status": "ok", "frame_id": frame_id, "sub_frame_count": len(sub_frame_ids)}
@@ -1980,16 +2063,16 @@ def get_frames_count_by_date(req: GetFramesByDateRequest):
         next_day = date_obj + timedelta(days=1)
         end_time_str = next_day.strftime("%Y-%m-%d")
         
-        # 使用 COUNT 查询获取总数（只统计有 image_path 的帧）
+        # 使用 COUNT 查询获取总数（只统计主帧：frame_* 开头，有 image_path）
         conn = sqlite_storage._get_connection()
         cursor = conn.cursor()
-        
+
         cursor.execute("""
             SELECT COUNT(*) as count
             FROM frames f
             WHERE f.timestamp >= ? AND f.timestamp < ?
             AND f.image_path IS NOT NULL AND f.image_path != ''
-            AND (f.app_name IS NULL OR f.app_name = '')
+            AND f.frame_id LIKE 'frame_%'
         """, (start_time_str, end_time_str))
         
         row = cursor.fetchone()
@@ -2036,7 +2119,7 @@ def get_frames_by_date(req: GetFramesByDateRequest):
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT 
+            SELECT
                 f.frame_id,
                 f.timestamp,
                 f.image_path,
@@ -2047,7 +2130,7 @@ def get_frames_by_date(req: GetFramesByDateRequest):
             FROM frames f
             LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
             WHERE f.timestamp >= ? AND f.timestamp < ?
-            AND (f.app_name IS NULL OR f.app_name = '')
+            AND f.frame_id LIKE 'frame_%'
             ORDER BY f.timestamp ASC
             LIMIT ? OFFSET ?
         """, (start_time_str, end_time_str, limit, offset))

@@ -41,12 +41,16 @@ def _get_focused_window_macos() -> Tuple[str, str]:
         from AppKit import NSWorkspace  # type: ignore[import-untyped]
         import Quartz  # type: ignore[import-untyped]
 
-        active_app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        if not active_app:
+        # activeApplication() returns the real foreground app even when
+        # called from a background process.  frontmostApplication() would
+        # return the *calling* process's own app, which is wrong when the
+        # recorder runs as a daemon / background service.
+        active_info = NSWorkspace.sharedWorkspace().activeApplication()
+        if not active_info:
             return "", ""
 
-        app_name = str(active_app.localizedName() or "")
-        pid = active_app.processIdentifier()
+        app_name = str(active_info.get("NSApplicationName", "") or "")
+        pid = active_info.get("NSApplicationProcessIdentifier", 0)
 
         window_list = Quartz.CGWindowListCopyWindowInfo(
             Quartz.kCGWindowListOptionOnScreenOnly

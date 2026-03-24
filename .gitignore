@@ -24,3 +24,5 @@ agent-sync.md
 /graduate_design_docs/*
 /ocr_compare_output/*
 *.pt
+/cluster_output/*
+db_browser_*

@@ -295,6 +295,40 @@ class SQLiteStorage:
             ON frame_subframe_mapping(sub_frame_id)
         """)
         
+        # ocr_regions: 区域级 OCR 结果
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ocr_regions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                frame_id TEXT,
+                sub_frame_id TEXT,
+                region_index INTEGER NOT NULL,
+                bbox_x1 INTEGER NOT NULL,
+                bbox_y1 INTEGER NOT NULL,
+                bbox_x2 INTEGER NOT NULL,
+                bbox_y2 INTEGER NOT NULL,
+                text TEXT NOT NULL DEFAULT '',
+                text_json TEXT,
+                ocr_confidence REAL DEFAULT 0.0,
+                ocr_engine TEXT NOT NULL,
+                text_length INTEGER NOT NULL DEFAULT 0,
+                image_width INTEGER DEFAULT 0,
+                image_height INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (frame_id) REFERENCES frames(frame_id),
+                FOREIGN KEY (sub_frame_id) REFERENCES sub_frames(sub_frame_id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ocr_regions_frame
+            ON ocr_regions(frame_id)
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_ocr_regions_subframe
+            ON ocr_regions(sub_frame_id)
+        """)
+
         # 创建全文搜索索引（FTS5）
         try:
             cursor.execute("""
@@ -723,17 +757,18 @@ class SQLiteStorage:
             return []
     
     def get_earliest_frame(self) -> Optional[Dict]:
-        """获取最早的帧"""
+        """获取最早的主帧"""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
+
             cursor.execute("""
-                SELECT 
+                SELECT
                     f.frame_id,
                     f.timestamp,
                     f.image_path
                 FROM frames f
+                WHERE f.frame_id LIKE 'frame_%'
                 ORDER BY f.timestamp ASC
                 LIMIT 1
             """)
@@ -754,17 +789,18 @@ class SQLiteStorage:
             return None
     
     def get_latest_frame(self) -> Optional[Dict]:
-        """获取最新的帧"""
+        """获取最新的主帧"""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            
+
             cursor.execute("""
-                SELECT 
+                SELECT
                     f.frame_id,
                     f.timestamp,
                     f.image_path
                 FROM frames f
+                WHERE f.frame_id LIKE 'frame_%'
                 ORDER BY f.timestamp DESC
                 LIMIT 1
             """)
@@ -1007,8 +1043,8 @@ class SQLiteStorage:
             
             if cursor.rowcount == 0:
                 cursor.execute("""
-                    INSERT INTO frames 
-                    (frame_id, timestamp, image_path, device_name, metadata, 
+                    INSERT INTO frames
+                    (frame_id, timestamp, image_path, device_name, metadata,
                      video_chunk_id, offset_index, monitor_id, app_name, window_name,
                      focused_app_name, focused_window_name)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1026,10 +1062,24 @@ class SQLiteStorage:
                     focused_app_name,
                     focused_window_name
                 ))
-            
+
+            # Atomically sync fullscreen synthetic sub_frames that share
+            # the same image as this parent frame (sub_frame_id ends with '_fullscreen')
+            if frame_id.startswith("frame_"):
+                cursor.execute("""
+                    UPDATE frames
+                    SET image_path = ?, offset_index = ?
+                    WHERE frame_id IN (
+                        SELECT sub_frame_id FROM frame_subframe_mapping
+                        WHERE frame_id = ? AND sub_frame_id LIKE '%_fullscreen'
+                    )
+                """, (image_path, offset_index, frame_id))
+                if cursor.rowcount > 0:
+                    logger.debug(f"Synced {cursor.rowcount} fullscreen sub_frame(s) for {frame_id}")
+
             conn.commit()
             conn.close()
-            
+
             logger.debug(f"Updated frame {frame_id} with video ref (chunk={video_chunk_id}, offset={offset_index})")
             return True
             
@@ -1125,8 +1175,139 @@ class SQLiteStorage:
             logger.error(f"Failed to store sub_frame OCR: {e}")
             return False
     
+    # ========== 新增：区域级 OCR 存储方法 ==========
+
+    def store_ocr_with_regions(
+        self,
+        frame_id: str = None,
+        sub_frame_id: str = None,
+        regions: List[dict] = None,
+        ocr_engine: str = "auto",
+        image_width: int = 0,
+        image_height: int = 0,
+        focused_app_name: str = None,
+        focused_window_name: str = None,
+    ) -> bool:
+        """
+        同时写入 ocr_regions（区域明细）和 ocr_text（汇总，兼容旧检索）
+
+        Args:
+            frame_id: 帧ID（frame 级 OCR 时传入）
+            sub_frame_id: 子帧ID（window 级 OCR 时传入）
+            regions: RegionOCREngine.recognize_regions() 的返回值
+            ocr_engine: OCR 引擎名称
+            image_width: 图像宽度
+            image_height: 图像高度
+            focused_app_name: 聚焦应用名称
+            focused_window_name: 聚焦窗口名称
+
+        Steps:
+            1. 逐条 INSERT INTO ocr_regions
+            2. 拼接所有区域文本 → INSERT INTO ocr_text.text
+            3. 加权平均置信度 → ocr_text.confidence
+        """
+        if not regions:
+            return True
+
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            # 1. Insert each region
+            for r in regions:
+                bbox = r.get("bbox", [0, 0, 0, 0])
+                text = r.get("text", "")
+                cursor.execute("""
+                    INSERT INTO ocr_regions
+                    (frame_id, sub_frame_id, region_index,
+                     bbox_x1, bbox_y1, bbox_x2, bbox_y2,
+                     text, text_json, ocr_confidence, ocr_engine,
+                     text_length, image_width, image_height)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    frame_id,
+                    sub_frame_id,
+                    r.get("region_index", 0),
+                    bbox[0], bbox[1], bbox[2], bbox[3],
+                    text,
+                    r.get("text_json", ""),
+                    r.get("ocr_confidence", 0.0),
+                    ocr_engine,
+                    len(text),
+                    image_width,
+                    image_height,
+                ))
+
+            # 2. Combine all region texts for ocr_text (backward compat)
+            all_texts = [r.get("text", "") for r in regions if r.get("text")]
+            combined_text = "\n".join(all_texts)
+
+            # 3. Merge all regions' text_json words into one combined text_json
+            combined_words = []
+            for r in regions:
+                raw = r.get("text_json", "")
+                if raw:
+                    try:
+                        parsed = json.loads(raw)
+                        region_words = parsed.get("words", [])
+                        # Tag each word with its region_index and bbox
+                        ri = r.get("region_index", 0)
+                        bbox = r.get("bbox", [0, 0, 0, 0])
+                        for w in region_words:
+                            w["region_index"] = ri
+                            w["region_bbox"] = bbox
+                        combined_words.extend(region_words)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            combined_text_json = json.dumps(
+                {"words": combined_words}, ensure_ascii=False
+            ) if combined_words else ""
+
+            # 4. Weighted average confidence (by text length)
+            total_len = 0
+            weighted_conf = 0.0
+            for r in regions:
+                t = r.get("text", "")
+                c = r.get("ocr_confidence", 0.0)
+                total_len += len(t)
+                weighted_conf += len(t) * c
+            avg_confidence = weighted_conf / total_len if total_len > 0 else 0.0
+
+            # Insert into ocr_text for FTS compatibility
+            if combined_text:
+                cursor.execute("""
+                    INSERT INTO ocr_text
+                    (frame_id, sub_frame_id, text, text_json, ocr_engine,
+                     text_length, confidence, focused_app_name, focused_window_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    frame_id,
+                    sub_frame_id,
+                    combined_text,
+                    combined_text_json,
+                    ocr_engine,
+                    len(combined_text),
+                    avg_confidence,
+                    focused_app_name,
+                    focused_window_name,
+                ))
+
+            conn.commit()
+            conn.close()
+
+            id_label = frame_id or sub_frame_id or "unknown"
+            logger.debug(
+                f"Stored {len(regions)} OCR regions for {id_label} "
+                f"(combined {len(combined_text)} chars)"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to store OCR with regions: {e}")
+            return False
+
     # ========== 新增：帧与子帧映射方法 ==========
-    
+
     def add_frame_subframe_mapping(
         self,
         frame_id: str,

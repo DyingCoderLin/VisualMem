@@ -18,6 +18,35 @@ from utils.data_models import ScreenObject, WindowFrame
 
 logger = setup_logger(__name__)
 
+
+def is_solid_color_image(image: Image.Image, std_threshold: float = 5.0) -> bool:
+    """
+    Detect if an image is essentially a single solid color (black screen, white screen, etc.)
+
+    Uses the standard deviation of pixel values in grayscale.
+    A truly solid-color image has std=0; we use a small threshold to allow
+    for minor compression artifacts or noise.
+
+    Args:
+        image: PIL Image
+        std_threshold: Maximum std deviation to consider as solid color.
+                       Default 5.0 is generous enough for minor noise.
+
+    Returns:
+        True if the image is solid color (should be skipped)
+    """
+    gray = np.array(image.convert('L'), dtype=np.float64)
+    std = np.std(gray)
+    if std < std_threshold:
+        mean_val = np.mean(gray)
+        logger.info(
+            f"Solid-color image detected: std={std:.2f}, mean={mean_val:.1f} "
+            f"(threshold={std_threshold})"
+        )
+        return True
+    return False
+
+
 # Try to import skimage for SSIM, fall back to simpler methods if not available
 try:
     from skimage.metrics import structural_similarity as ssim

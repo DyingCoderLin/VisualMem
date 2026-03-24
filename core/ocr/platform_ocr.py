@@ -50,12 +50,11 @@ class AppleVisionOCR(OCREngine):
 
             ns_data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
 
-            ci_image = self._Quartz.CIImage.imageWithData_(ns_data)
-            if ci_image is None:
-                return OCRResult(text="", confidence=0.0, engine=self.engine_name)
-
-            handler = self._Vision.VNImageRequestHandler.alloc().initWithCIImage_options_(
-                ci_image, None
+            # Use initWithData (PNG bytes) directly instead of CIImage.
+            # The CIImage path triggers CVPixelBuffer creation which fails
+            # on certain image dimensions with error -6662.
+            handler = self._Vision.VNImageRequestHandler.alloc().initWithData_options_(
+                ns_data, None
             )
 
             request = self._Vision.VNRecognizeTextRequest.alloc().init()

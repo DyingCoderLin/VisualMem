@@ -86,6 +86,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
       })
       // console.log('Date range updated:', range)
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       console.error('Failed to fetch date range:', error)
     }
   }, [])

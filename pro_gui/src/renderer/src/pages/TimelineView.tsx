@@ -213,11 +213,11 @@ const TimelineView: React.FC = () => {
           const todayGroup = currentGroups.find(g => g.date === today)
           
           if (todayGroup) {
-            // 如果已存在，且有新数据，则更新总数并加载新帧
-            if (totalCount > todayGroup.loadedCount) {
-              // console.log(`[TimelineView] Incremental refresh for ${today}: ${todayGroup.loadedCount} -> ${totalCount}`)
-              setDateGroups(prev => prev.map(g => 
-                g.date === today ? { ...g, totalCount: totalCount } : g
+            // 如果已存在，且有新数据，则更新总数并加载新帧（绝不减少 totalCount）
+            const safeTotalCount = Math.max(todayGroup.totalCount, totalCount)
+            if (safeTotalCount > todayGroup.loadedCount) {
+              setDateGroups(prev => prev.map(g =>
+                g.date === today ? { ...g, totalCount: safeTotalCount } : g
               ))
               // 触发加载（使用 setTimeout 确保 state 已更新到 ref）
               setTimeout(() => {
@@ -272,21 +272,22 @@ const TimelineView: React.FC = () => {
       // 更新该日期的 totalCount，并检查是否需要自动加载新数据
       setDateGroups(prev => {
         const existingGroup = prev.find(g => g.date === date)
-        
+
         if (existingGroup) {
-          // 如果已存在，更新 totalCount
+          // 如果已存在，更新 totalCount（但绝不减少，防止失败的 API 返回 0 覆盖真实值）
+          const safeTotalCount = Math.max(existingGroup.totalCount, totalCount)
           const updatedGroups = prev.map(group => {
             if (group.date === date) {
               return {
                 ...group,
-                totalCount: totalCount
+                totalCount: safeTotalCount
               }
             }
             return group
           })
           
           // 如果有新数据未加载，自动触发加载（不再检查滚动位置，实现完全增量）
-          if (existingGroup.loadedCount < totalCount) {
+          if (existingGroup.loadedCount < safeTotalCount) {
             setTimeout(() => {
               if (loadMoreFramesForDateRef.current) {
                 loadMoreFramesForDateRef.current(date)
@@ -334,8 +335,10 @@ const TimelineView: React.FC = () => {
     // 使用 ref 获取最新状态，防止重入
     if (loadingRef.current || !hasMoreRef.current) return
 
+    // 【关键修复】立即设置 ref，防止并发调用（不能等 useEffect 同步）
+    loadingRef.current = true
     setLoading(true)
-    
+
     try {
       // 1. 确定搜索起始点
       if (!dateRange.latest_date) {
@@ -746,16 +749,21 @@ const TimelineView: React.FC = () => {
       setHasMore(true)
       hasMoreRef.current = true
       loadMoreDates()
-    } 
+    }
     // 2. 如果有了更晚的日期（比如后端刚更新），触发增量刷新
     else if (dateRange.latest_date && dateGroups.length > 0) {
       const newestLoadedDate = dateGroups[0].date
       if (dateRange.latest_date > newestLoadedDate) {
-        // console.log(`[TimelineView] New latest date detected: ${dateRange.latest_date} > ${newestLoadedDate}, triggering refresh`)
         refreshTimeline()
       }
+      // 3. 【关键修复】如果 cursorDate 还没初始化（loadMoreDates 从未执行过），
+      // 说明今天的数据是由 refreshTodayIncremental 加载的，历史数据还没开始加载。
+      // 此时需要触发 loadMoreDates 来加载历史数据。
+      else if (!cursorDateRef.current && !loadingRef.current && hasMoreRef.current) {
+        loadMoreDates()
+      }
     }
-  }, [dateRange.latest_date, loadMoreDates, dateGroups.length, refreshTimeline]) 
+  }, [dateRange.latest_date, loadMoreDates, dateGroups.length, refreshTimeline])
 
   useEffect(() => {
     const scrollHandlers: Map<string, () => void> = new Map()

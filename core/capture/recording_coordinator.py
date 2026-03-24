@@ -26,7 +26,7 @@ from utils.app_name_manager import app_name_manager
 from config import config
 
 from .window_capturer import WindowCapturer
-from ..preprocess.frame_diff import FrameDiffDetector, FrameDiffResult
+from ..preprocess.frame_diff import FrameDiffDetector, FrameDiffResult, is_solid_color_image
 from ..storage.video_chunk_writer import VideoChunkManager
 from ..storage.sqlite_storage import SQLiteStorage
 
@@ -46,6 +46,7 @@ class RecordingConfig:
     window_diff_threshold: float = 0.006
     run_ocr: bool = True
     run_embedding: bool = True
+    use_region_ocr: bool = True
     max_image_width: int = 0
     
     def __post_init__(self):
@@ -88,7 +89,8 @@ class RecordingCoordinator:
         ocr_engine: Optional[Any] = None,
         embedding_encoder: Optional[Any] = None,
         on_frame_stored: Optional[Callable[[str, dict], None]] = None,
-        on_subframe_stored: Optional[Callable[[str, dict], None]] = None
+        on_subframe_stored: Optional[Callable[[str, dict], None]] = None,
+        region_detector: Optional[Any] = None,
     ):
         """
         Args:
@@ -98,6 +100,7 @@ class RecordingCoordinator:
             embedding_encoder: Embedding encoder instance (optional)
             on_frame_stored: Callback when a frame is stored
             on_subframe_stored: Callback when a sub-frame is stored
+            region_detector: UIEDRegionDetector instance (optional, for region OCR)
         """
         self.config = config
         self.db = db or SQLiteStorage()
@@ -105,6 +108,16 @@ class RecordingCoordinator:
         self.embedding_encoder = embedding_encoder
         self.on_frame_stored = on_frame_stored
         self.on_subframe_stored = on_subframe_stored
+        self.region_detector = region_detector
+
+        # Build RegionOCREngine if region OCR is enabled
+        self.region_ocr_engine = None
+        if config.use_region_ocr and ocr_engine is not None:
+            from ..ocr.region_ocr_engine import RegionOCREngine
+            self.region_ocr_engine = RegionOCREngine(
+                ocr_engine=ocr_engine,
+                region_detector=region_detector,
+            )
         
         # Initialize components
         self.capturer = WindowCapturer(
@@ -189,39 +202,39 @@ class RecordingCoordinator:
     
     async def _run_ocr(self, image: Image.Image) -> tuple:
         """
-        Run OCR on an image
-        
+        Run OCR on an image using OCREngine.recognize() interface.
+
         Returns:
             Tuple of (text, text_json, confidence)
         """
         if not self.config.run_ocr or self.ocr_engine is None:
             return "", "", 0.0
-        
+
         try:
-            # OCR engine interface - adapt based on your implementation
-            if hasattr(self.ocr_engine, 'extract_text_async'):
-                result = await self.ocr_engine.extract_text_async(image)
-            elif hasattr(self.ocr_engine, 'extract_text'):
-                result = self.ocr_engine.extract_text(image)
-            else:
-                return "", "", 0.0
-            
-            if isinstance(result, dict):
-                return (
-                    result.get('text', ''),
-                    result.get('text_json', ''),
-                    result.get('confidence', 0.0)
-                )
-            elif isinstance(result, str):
-                return result, "", 0.0
-            
-            return "", "", 0.0
-            
+            result = self.ocr_engine.recognize(image)
+            return result.text, result.text_json, result.confidence
         except Exception as e:
             logger.error(f"OCR failed: {e}")
             self.stats.errors += 1
             return "", "", 0.0
     
+    def _run_region_ocr(self, image: Image.Image) -> List[dict]:
+        """
+        Run region-level OCR: detect regions + per-region OCR.
+        Falls back to whole-image single region when region_detector is None.
+
+        Returns:
+            List of region dicts from RegionOCREngine.recognize_regions()
+        """
+        if self.region_ocr_engine is None:
+            return []
+        try:
+            return self.region_ocr_engine.recognize_regions(image)
+        except Exception as e:
+            logger.error(f"Region OCR failed: {e}")
+            self.stats.errors += 1
+            return []
+
     async def _run_embedding(self, image: Image.Image, text: str) -> Optional[List[float]]:
         """
         Generate embedding for an image/text
@@ -274,8 +287,18 @@ class RecordingCoordinator:
         
         self.stats.frames_captured += 1
         
-        # 1. Check screen frame diff
-        screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
+        # 0. Skip solid-color full screen (e.g. monitor off, lid closed)
+        if is_solid_color_image(screen_obj.full_screen_image):
+            logger.debug("Skipping solid-color full screen image")
+            # Still process windows below (they might be valid)
+            screen_diff_result = FrameDiffResult(
+                should_store=False, diff_score=0.0,
+                histogram_diff=0.0, ssim_diff=0.0,
+                reason="Solid-color image skipped"
+            )
+        else:
+            # 1. Check screen frame diff
+            screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
         
         # 2. Track active windows and update app_name + window_name list
         current_window_keys = set()
@@ -302,7 +325,9 @@ class RecordingCoordinator:
         
         # Initialize sub_frame_ids early (may be populated by full-screen synthetic sub_frame)
         sub_frame_ids = []
-        
+        # Collector for sub_frame OCR results: [(app_name, text, confidence), ...]
+        sub_frame_ocr_parts = []
+
         # 3. Process screen if changed
         if screen_diff_result.should_store:
             frame_id = self._generate_frame_id()
@@ -323,6 +348,18 @@ class RecordingCoordinator:
                     self._get_latest_video_chunk_id()
                 )
                 
+                # If the focused app is full-screen (not among captured windows),
+                # tag this frame with its app_name so app-filtered searches find it.
+                fullscreen_app = None
+                fullscreen_win = None
+                if focused_app:
+                    focused_in_windows = any(
+                        w.app_name == focused_app for w in screen_obj.windows
+                    )
+                    if not focused_in_windows:
+                        fullscreen_app = focused_app
+                        fullscreen_win = focused_win or focused_app
+
                 # Store frame metadata
                 self.db.store_frame_with_video_ref(
                     frame_id=frame_id,
@@ -331,62 +368,61 @@ class RecordingCoordinator:
                     offset_index=offset_index,
                     monitor_id=screen_obj.monitor_id,
                     device_name=screen_obj.device_name,
+                    app_name=fullscreen_app,
+                    window_name=fullscreen_win,
                     focused_app_name=focused_app or None,
                     focused_window_name=focused_win or None,
                 )
                 
-                # OCR (optional)
-                if self.config.run_ocr and self.ocr_engine:
-                    ocr_text, ocr_json, confidence = await self._run_ocr(
-                        screen_obj.full_screen_image
-                    )
-                    if ocr_text:
-                        self.db.store_frame_with_ocr(
-                            frame_id=frame_id,
-                            timestamp=screen_obj.timestamp,
-                            image_path=f"video_chunk:{video_chunk_id}:{offset_index}",
-                            ocr_text=ocr_text,
-                            ocr_text_json=ocr_json,
-                            ocr_confidence=confidence,
-                            device_name=screen_obj.device_name,
-                            focused_app_name=focused_app or None,
-                            focused_window_name=focused_win or None,
-                        )
-                        self.stats.ocr_processed += 1
-                
+                # Full-screen OCR is deferred — combined from sub_frame OCR results later.
+
                 # If focused app is full-screen (not among captured windows),
                 # create a synthetic sub_frame referencing the same video
-                if focused_app:
-                    focused_in_windows = any(
-                        w.app_name == focused_app for w in screen_obj.windows
+                if fullscreen_app:
+                    syn_id = self._generate_sub_frame_id(focused_app)
+                    self.db.store_sub_frame(
+                        sub_frame_id=syn_id,
+                        timestamp=screen_obj.timestamp,
+                        window_chunk_id=0,
+                        offset_index=offset_index,
+                        app_name=focused_app,
+                        window_name=focused_win or focused_app,
                     )
-                    if not focused_in_windows:
-                        syn_id = self._generate_sub_frame_id(focused_app)
-                        self.db.store_sub_frame(
-                            sub_frame_id=syn_id,
-                            timestamp=screen_obj.timestamp,
-                            window_chunk_id=0,
-                            offset_index=offset_index,
-                            app_name=focused_app,
-                            window_name=focused_win or focused_app,
-                        )
-                        self.db.add_frame_subframe_mapping(frame_id, syn_id)
-                        # Create frames table entry pointing to same video chunk
-                        self.db.store_frame_with_video_ref(
-                            frame_id=syn_id,
-                            timestamp=screen_obj.timestamp,
-                            video_chunk_id=video_chunk_id,
-                            offset_index=offset_index,
-                            monitor_id=screen_obj.monitor_id,
-                            device_name=screen_obj.device_name,
-                            app_name=focused_app,
-                            window_name=focused_win or focused_app,
-                        )
-                        sub_frame_ids.append(syn_id)
-                        logger.debug(
-                            f"Created synthetic sub_frame {syn_id} for "
-                            f"full-screen app {focused_app}"
-                        )
+                    self.db.add_frame_subframe_mapping(frame_id, syn_id)
+                    self.db.store_frame_with_video_ref(
+                        frame_id=syn_id,
+                        timestamp=screen_obj.timestamp,
+                        video_chunk_id=video_chunk_id,
+                        offset_index=offset_index,
+                        monitor_id=screen_obj.monitor_id,
+                        device_name=screen_obj.device_name,
+                        app_name=focused_app,
+                        window_name=focused_win or focused_app,
+                    )
+                    # Region OCR for synthetic sub_frame
+                    if self.config.run_ocr and self.region_ocr_engine is not None:
+                        syn_regions = self._run_region_ocr(screen_obj.full_screen_image)
+                        if syn_regions:
+                            img_w, img_h = screen_obj.full_screen_image.size
+                            engine_name = getattr(self.ocr_engine, 'engine_name', 'auto')
+                            self.db.store_ocr_with_regions(
+                                sub_frame_id=syn_id,
+                                regions=syn_regions,
+                                ocr_engine=engine_name,
+                                image_width=img_w,
+                                image_height=img_h,
+                            )
+                            syn_text = "\n".join(r.get("text", "") for r in syn_regions if r.get("text"))
+                            syn_tl = sum(len(r.get("text", "")) for r in syn_regions)
+                            syn_conf = sum(len(r.get("text", "")) * r.get("ocr_confidence", 0.0) for r in syn_regions) / syn_tl if syn_tl > 0 else 0.0
+                            if syn_text:
+                                sub_frame_ocr_parts.append((focused_app, syn_text, syn_conf))
+                            self.stats.ocr_processed += 1
+                    sub_frame_ids.append(syn_id)
+                    logger.debug(
+                        f"Created synthetic sub_frame {syn_id} for "
+                        f"full-screen app {focused_app}"
+                    )
                 
                 result["frame_id"] = frame_id
                 result["frame_stored"] = True
@@ -406,7 +442,14 @@ class RecordingCoordinator:
         # 4. Process each window independently
         for window in screen_obj.windows:
             self.stats.windows_captured += 1
-            
+
+            # Skip solid-color window images
+            if is_solid_color_image(window.image):
+                logger.debug(
+                    f"Skipping solid-color window: {window.app_name}/{window.window_name}"
+                )
+                continue
+
             window_diff_result = self.frame_diff.check_window_diff(window)
             
             if window_diff_result.should_store:
@@ -439,17 +482,43 @@ class RecordingCoordinator:
                         window_name=window.window_name
                     )
                     
-                    # OCR (optional)
+                    # OCR (optional) — prefer region OCR, fallback to whole-image
+                    win_ocr_text = ""
+                    win_ocr_conf = 0.0
                     if self.config.run_ocr and self.ocr_engine:
-                        ocr_text, ocr_json, confidence = await self._run_ocr(window.image)
-                        if ocr_text:
-                            self.db.store_sub_frame_ocr(
-                                sub_frame_id=sub_frame_id,
-                                ocr_text=ocr_text,
-                                ocr_text_json=ocr_json,
-                                ocr_confidence=confidence,
-                            )
-                            self.stats.ocr_processed += 1
+                        if self.region_ocr_engine is not None:
+                            regions = self._run_region_ocr(window.image)
+                            if regions:
+                                img_w, img_h = window.image.size
+                                engine_name = getattr(self.ocr_engine, 'engine_name', 'auto')
+                                self.db.store_ocr_with_regions(
+                                    sub_frame_id=sub_frame_id,
+                                    regions=regions,
+                                    ocr_engine=engine_name,
+                                    image_width=img_w,
+                                    image_height=img_h,
+                                )
+                                win_ocr_text = "\n".join(r.get("text", "") for r in regions if r.get("text"))
+                                tl = sum(len(r.get("text", "")) for r in regions)
+                                if tl > 0:
+                                    win_ocr_conf = sum(len(r.get("text", "")) * r.get("ocr_confidence", 0.0) for r in regions) / tl
+                                self.stats.ocr_processed += 1
+                        else:
+                            ocr_text, ocr_json, confidence = await self._run_ocr(window.image)
+                            if ocr_text:
+                                self.db.store_sub_frame_ocr(
+                                    sub_frame_id=sub_frame_id,
+                                    ocr_text=ocr_text,
+                                    ocr_text_json=ocr_json,
+                                    ocr_confidence=confidence,
+                                )
+                                win_ocr_text = ocr_text
+                                win_ocr_conf = confidence
+                                self.stats.ocr_processed += 1
+
+                    # Collect for frame-level combined OCR
+                    if win_ocr_text:
+                        sub_frame_ocr_parts.append((window.app_name, win_ocr_text, win_ocr_conf))
                     
                     sub_frame_ids.append(sub_frame_id)
                     self.stats.windows_stored += 1
@@ -469,16 +538,33 @@ class RecordingCoordinator:
                     )
         
         # 5. Create frame-subframe mappings
-        # Use the current frame_id, or fall back to the most recently stored
-        # frame_id so that sub_frames captured when the screen is unchanged
-        # still get linked to a parent frame.
         mapping_frame_id = result["frame_id"] or self._last_stored_frame_id
         if mapping_frame_id and sub_frame_ids:
             self.db.add_frame_subframe_mappings_batch(mapping_frame_id, sub_frame_ids)
-        
+
+        # 6. Combine sub_frame OCR texts as the frame's ocr_text
+        if result.get("frame_stored") and sub_frame_ocr_parts:
+            sections = [f"[{app}]\n{text}" for app, text, _ in sub_frame_ocr_parts]
+            combined_text = "\n\n".join(sections)
+            total_len = sum(len(t) for _, t, _ in sub_frame_ocr_parts)
+            combined_conf = sum(len(t) * c for _, t, c in sub_frame_ocr_parts) / total_len if total_len > 0 else 0.0
+            engine_name = getattr(self.ocr_engine, 'engine_name', 'auto') if self.ocr_engine else "unknown"
+            self.db.store_frame_with_ocr(
+                frame_id=result["frame_id"],
+                timestamp=screen_obj.timestamp,
+                image_path="",
+                ocr_text=combined_text,
+                ocr_text_json="",
+                ocr_engine=engine_name,
+                ocr_confidence=combined_conf,
+                device_name=screen_obj.device_name,
+                focused_app_name=focused_app or None,
+                focused_window_name=focused_win or None,
+            )
+
         result["sub_frame_ids"] = sub_frame_ids
         result["sub_frames_stored"] = len(sub_frame_ids)
-        
+
         return result
     
     def _get_latest_video_chunk_id(self) -> int:

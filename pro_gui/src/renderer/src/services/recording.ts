@@ -328,36 +328,44 @@ class RecordingService {
       const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
       
       // 并行获取今天的图片 count 和 stats
+      let countFailed = false
+      let statsFailed = false
       const [countResult, statsResult] = await Promise.all([
         apiClient.getFramesCountByDate(today).catch(err => {
+          countFailed = true
           console.error('Failed to get today\'s frame count:', err)
           return { date: today, total_count: 0 }
         }),
         apiClient.getStats().catch(err => {
+          statsFailed = true
           console.error('Failed to get stats:', err)
           return null
         })
       ])
-      
-      console.log(`Refreshed data after 10 frames: today's count=${countResult.total_count}, stats=`, statsResult)
-      
+
+      console.log(`Refreshed data after 10 frames: today's count=${countFailed ? 'FAILED' : countResult.total_count}, stats=`, statsFailed ? 'FAILED' : statsResult)
+
       // 触发全局刷新事件，通知 SystemStatus 和 TimelineView 更新
       if (typeof window !== 'undefined') {
-        // 事件1：通知 SystemStatus 更新 stats
-        window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
-          detail: {
-            todayCount: countResult.total_count,
-            stats: statsResult
-          }
-        }))
-        
-        // 事件2：通知 TimelineView 只更新今天的 totalCount（轻量级，不加载实际数据）
-        window.dispatchEvent(new CustomEvent('recording-timeline-refresh', {
-          detail: {
-            date: today,
-            totalCount: countResult.total_count  // 只传递总数量
-          }
-        }))
+        // 事件1：通知 SystemStatus 更新 stats（仅在成功时）
+        if (!statsFailed && statsResult) {
+          window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
+            detail: {
+              todayCount: countResult.total_count,
+              stats: statsResult
+            }
+          }))
+        }
+
+        // 事件2：通知 TimelineView 只更新今天的 totalCount（仅在 count API 成功时，防止用 0 覆盖真实值）
+        if (!countFailed) {
+          window.dispatchEvent(new CustomEvent('recording-timeline-refresh', {
+            detail: {
+              date: today,
+              totalCount: countResult.total_count  // 只传递总数量
+            }
+          }))
+        }
       }
     } catch (error) {
       console.error('Error refreshing data:', error)
