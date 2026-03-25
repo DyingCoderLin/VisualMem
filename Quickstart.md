@@ -4,11 +4,11 @@ This guide will walk you through the installation and setup of VisualMem.
 
 > [!TIP]
 > **Just want to record, not search?**
-> 
+>
 > If you only want to keep a record of your computer usage (recording feature) for now and don't need to perform searches.
-> 
-> You can **disable** `ENABLE_RERANK` and **skip** `Step 2(Start VLM Service)` and directly launch VisualMem. 
-> 
+>
+> You can **disable** `ENABLE_RERANK` and **skip** `Step 2(Start VLM Service)` and directly launch VisualMem.
+>
 > The system will still automatically handle screenshots, OCR, and vector indexing for future usage.
 
 ## 📋 Prerequisites
@@ -17,19 +17,21 @@ This guide will walk you through the installation and setup of VisualMem.
 - **Node.js**: v20.x or higher (Tested with v23.9.0)
 - **npm**: 10.x or higher (Tested with 10.9.2)
 - **VLM Service**: An OpenAI-compatible multimodal LLM service (e.g., vLLM, Ollama, or OpenAI API).
-- **Hardware**: 
-    - **GPU**: Minimum **4GB VRAM** for local inference (CLIP/OCR). 8GB+ recommended for reranker enabled.
-    - **OS**: macOS (Apple Silicon) or Linux.
+- **Hardware**:
+  - **GPU**: Minimum **4GB VRAM** for local inference (CLIP/OCR). 8GB+ recommended for reranker enabled.
+  - **OS**: macOS (Apple Silicon) or Linux.
 
 ## 🛠️ Step 1: Backend Configuration
 
 ### 1. Clone the Repository
+
 ```bash
 git clone https://github.com/DyingCoderLin/VisualMem.git
 cd VisualMem
 ```
 
 ### 2. Create and Activate Virtual Environment
+
 ```bash
 conda create -y -n visualmem python==3.12
 conda activate visualmem
@@ -37,7 +39,9 @@ conda activate visualmem
 ```
 
 ### 3. Install Python Dependencies
+
 Choose the requirement file based on your OS:
+
 - **macOS**:
   ```bash
   pip install -r requirements_macos.txt
@@ -47,15 +51,48 @@ Choose the requirement file based on your OS:
   pip install -r requirements_linux_cuda.txt
   ```
 
-### 4. Configure Environment Variables
+### 4. Build `screencap_rs` for Per-Window Capture
+
+VisualMem's Pro GUI records full-screen frames from Electron, and the Python backend can additionally capture individual windows through the Rust-backed `screencap_rs` module.
+
+`screencap_rs` is installed into your active Python environment, but the Rust toolchain itself is **not** installed inside Conda. Install Rust system-wide first, then build the module while your `visualmem` environment is activated.
+
+#### Install Prerequisites
+
+- Install Rust from https://rustup.rs/
+- On Windows, if the build fails with linker or compiler errors, install **Visual Studio Build Tools** with the **Desktop development with C++** workload.
+
+#### Build and Install into the Active Environment
+
+```bash
+conda activate visualmem
+pip install -U maturin
+cd screencap_rs
+maturin develop --release
+cd ..
+```
+
+#### Verify the Installation
+
+```bash
+python -c "import screencap_rs; print(screencap_rs.get_platform())"
+```
+
+If this prints `windows`, `macos`, or `linux`, the backend can use per-window capture. Launch the GUI from the same activated shell so Electron starts the backend with the correct Python environment.
+
+### 5. Configure Environment Variables
+
 Copy the example environment file and edit it:
+
 ```bash
 cp env.example .env
 ```
-Edit the `.env` file to configure your storage and retrieval preferences. 
+
+Edit the `.env` file to configure your storage and retrieval preferences.
 
 **Rerank Configuration (Optional):**
 If you have enough VRAM (8GB+), you can enable a second-stage reranker for better accuracy:
+
 ```ini
 # Enable a second-stage reranking using a multimodal model
 ENABLE_RERANK=true
@@ -65,24 +102,30 @@ RERANK_MODEL=Qwen/Qwen3-VL-Reranker-2B
 
 ## 🧠 Step 2: Start VLM Service
 
-VisualMem requires an OpenAI-compatible VLM service to understand screenshots. 
+VisualMem requires an OpenAI-compatible VLM service to understand screenshots.
 
 ### 1. Start your VLM Server
+
 You can use any server that supports the OpenAI API format.
 
 #### Option A: Local Deployment (Recommended)
+
 You can use [vLLM](https://github.com/vllm-project/vllm) to host a model locally:
+
 ```bash
 # Example using Qwen3-VL
 vllm serve Qwen/Qwen3-VL-8B-Instruct --port 8081
 ```
 
 #### Option B: Cloud API
-You can also use commercial APIs like OpenAI GPT-5 or Claude 3.5 Sonnet. 
-*Note: Using cloud APIs can be costly due to the high volume of screenshots.*
+
+You can also use commercial APIs like OpenAI GPT-5 or Claude 3.5 Sonnet.
+_Note: Using cloud APIs can be costly due to the high volume of screenshots._
 
 ### 2. Update `.env` with VLM Details
+
 Once your VLM service is running, update the following keys in your `.env` file:
+
 ```ini
 # VLM API Configuration
 VLM_API_URI=http://<server-ip-address>:8081  # VLM service address
@@ -107,21 +150,26 @@ VisualMem uses an LLM to rewrite and expand your queries to improve search accur
 The frontend handles screen capture and UI, while automatically managing the backend service for indexing and retrieval.
 
 ### 1. Navigate to Frontend Directory
+
 ```bash
 cd pro_gui
 ```
 
 ### 2. Install Node.js Dependencies
+
 ```bash
 npm install
 ```
 
 ### 3. Start the Application
+
 For development (with hot-reload):
+
 ```bash
 npm run dev
 ```
-*Note: Use `npm run dev:no-devtools` to hide the Chrome DevTools.*
+
+_Note: Use `npm run dev:no-devtools` to hide the Chrome DevTools._
 
 The VisualMem Pro GUI will launch, and the backend service will start automatically in the background.
 
@@ -138,5 +186,5 @@ The VisualMem Pro GUI will launch, and the backend service will start automatica
 - **VLM connection failed**: Verify that `VLM_API_URI` is accessible from your machine.
 
 ---
-Back to [README.md](./README.md)
 
+Back to [README.md](./README.md)
