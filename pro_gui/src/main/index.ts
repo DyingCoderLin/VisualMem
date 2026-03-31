@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut } from 'electron'
-import { spawn, ChildProcess } from 'child_process'
+import { spawn, execSync, ChildProcess } from 'child_process'
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { existsSync, mkdirSync, createWriteStream, writeFileSync } from 'fs'
@@ -258,7 +258,7 @@ function startPythonBackend(): Promise<void> {
       pythonProcess = spawn('python', [pythonScript], {
         cwd: rootDir,
         stdio: ['ignore', 'pipe', 'pipe'],
-        shell: process.platform === 'win32',
+        shell: process.platform !== 'win32',
         env: {
           ...process.env,
           PYTHONUTF8: process.env.PYTHONUTF8 || '1',
@@ -340,27 +340,44 @@ function startPythonBackend(): Promise<void> {
 }
 
 function stopPythonBackend(): void {
-  if (pythonProcess) {
-    console.log('Stopping Python backend...')
-    // 发送 SIGTERM 信号，允许后端优雅退出（触发 shutdown 事件刷新缓冲区）
-    pythonProcess.kill('SIGTERM')
-    
-    // 3秒后如果进程还没退出，则强制杀死
-    const processToKill = pythonProcess
-    setTimeout(() => {
+  if (!pythonProcess?.pid) return
+
+  const pid = pythonProcess.pid
+  console.log(`Stopping Python backend (PID: ${pid})...`)
+
+  try {
+    if (process.platform === 'win32') {
+      // Windows: kill the whole process tree so shell/python children do not linger.
+      execSync(`taskkill /pid ${pid} /T /F`, { stdio: 'ignore' })
+    } else {
       try {
-        // 检查进程是否还在运行
-        if (processToKill && processToKill.exitCode === null) {
-          console.log('Python backend did not exit in time, force killing...')
-          processToKill.kill('SIGKILL')
-        }
+        process.kill(-pid, 'SIGTERM')
       } catch (e) {
-        // 进程可能已经退出
+        // Fall back to killing just the spawned process if no process group exists.
+        pythonProcess.kill('SIGTERM')
       }
-    }, 3000)
-    
-    pythonProcess = null
+
+      const processToKill = pythonProcess
+      setTimeout(() => {
+        try {
+          if (processToKill && processToKill.exitCode === null) {
+            console.log('Python backend did not exit in time, force killing...')
+            try {
+              process.kill(-pid, 'SIGKILL')
+            } catch (e) {
+              processToKill.kill('SIGKILL')
+            }
+          }
+        } catch (e) {
+          // Process already exited.
+        }
+      }, 3000)
+    }
+  } catch (e) {
+    console.log('Process already terminated or error during cleanup:', e)
   }
+
+  pythonProcess = null
 }
 
 app.whenReady().then(async () => {
@@ -399,4 +416,3 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   stopPythonBackend()
 })
-

@@ -212,7 +212,7 @@ function startPythonBackend() {
       pythonProcess = child_process.spawn("python", [pythonScript], {
         cwd: rootDir,
         stdio: ["ignore", "pipe", "pipe"],
-        shell: process.platform === "win32",
+        shell: process.platform !== "win32",
         env: {
           ...process.env,
           PYTHONUTF8: process.env.PYTHONUTF8 || "1",
@@ -275,21 +275,37 @@ function startPythonBackend() {
   }
 }
 function stopPythonBackend() {
-  if (pythonProcess) {
-    console.log("Stopping Python backend...");
-    pythonProcess.kill("SIGTERM");
-    const processToKill = pythonProcess;
-    setTimeout(() => {
+  if (!pythonProcess?.pid) return;
+  const pid = pythonProcess.pid;
+  console.log(`Stopping Python backend (PID: ${pid})...`);
+  try {
+    if (process.platform === "win32") {
+      child_process.execSync(`taskkill /pid ${pid} /T /F`, { stdio: "ignore" });
+    } else {
       try {
-        if (processToKill && processToKill.exitCode === null) {
-          console.log("Python backend did not exit in time, force killing...");
-          processToKill.kill("SIGKILL");
-        }
+        process.kill(-pid, "SIGTERM");
       } catch (e) {
+        pythonProcess.kill("SIGTERM");
       }
-    }, 3e3);
-    pythonProcess = null;
+      const processToKill = pythonProcess;
+      setTimeout(() => {
+        try {
+          if (processToKill && processToKill.exitCode === null) {
+            console.log("Python backend did not exit in time, force killing...");
+            try {
+              process.kill(-pid, "SIGKILL");
+            } catch (e) {
+              processToKill.kill("SIGKILL");
+            }
+          }
+        } catch (e) {
+        }
+      }, 3e3);
+    }
+  } catch (e) {
+    console.log("Process already terminated or error during cleanup:", e);
   }
+  pythonProcess = null;
 }
 electron.app.whenReady().then(async () => {
   try {
