@@ -36,6 +36,7 @@ class LanceDBStorage:
         self.db_path = db_path
         self.embedding_dim = embedding_dim
         self.image_storage_path = Path(image_storage_path)
+        self._sqlite_storage = None
         
         # 创建图片存储目录
         self.image_storage_path.mkdir(parents=True, exist_ok=True)
@@ -115,6 +116,61 @@ class LanceDBStorage:
         except Exception as e:
             logger.debug(f"Load image failed (may retry via fallback): {image_path}: {e}")
             return None
+
+    def _get_sqlite_storage(self):
+        """Lazy-load SQLite storage for resolving video-backed frames."""
+        if self._sqlite_storage is None:
+            from .sqlite_storage import SQLiteStorage
+            self._sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
+        return self._sqlite_storage
+
+    def _load_image_for_frame(self, frame_id: str, image_path: str) -> tuple[Optional[Image.Image], str]:
+        """
+        Load an image while tolerating stale temp-frame paths.
+
+        LanceDB may still contain a temp PNG path even after the authoritative
+        SQLite record has been updated to video_chunk/window_chunk storage.
+        """
+        resolved_path = image_path
+
+        if image_path.startswith("video_chunk:") or image_path.startswith("window_chunk:"):
+            sqlite_storage = self._get_sqlite_storage()
+            image = sqlite_storage.extract_frame_image(frame_id)
+            if image is not None:
+                return image, resolved_path
+
+        if os.path.exists(image_path):
+            try:
+                return Image.open(image_path), resolved_path
+            except Exception as e:
+                logger.error(f"Failed to load image from {image_path}: {e}")
+                return None, resolved_path
+
+        sqlite_storage = self._get_sqlite_storage()
+        try:
+            conn = sqlite_storage._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+            if row and row["image_path"]:
+                resolved_path = row["image_path"]
+                image = sqlite_storage.extract_frame_image(frame_id)
+                if image is not None:
+                    return image, resolved_path
+
+            sub_info = sqlite_storage.get_sub_frame_video_info(frame_id)
+            if sub_info and sub_info.get("window_chunk_id") is not None and sub_info.get("offset_index") is not None:
+                image = sqlite_storage.extract_sub_frame_image(frame_id)
+                if image is not None:
+                    resolved_path = f"window_chunk:{sub_info['window_chunk_id']}:{sub_info['offset_index']}"
+                    return image, resolved_path
+        except Exception as e:
+            logger.debug(f"Failed to resolve image path for {frame_id}: {e}")
+
+        logger.debug(f"Image path is stale or unavailable for {frame_id}: {image_path}")
+        return None, resolved_path
     
     def store_frame(
         self, 
@@ -422,13 +478,17 @@ class LanceDBStorage:
             # 解析结果
             found_frames = []
             for result in results:
+                image, resolved_path = self._load_image_for_frame(
+                    result["frame_id"],
+                    result["image_path"],
+                )
                 frame_data = {
                     "frame_id": result["frame_id"],
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
-                    "image_path": result["image_path"],
+                    "image_path": resolved_path,
                     "distance": result.get("_distance", 0),  # LanceDB的距离（越小越相似）
                     "ocr_text": result.get("ocr_text", ""),
-                    "image": self._load_image(result["image_path"]),
+                    "image": image,
                     "metadata": result.get("metadata", {}),
                     "app_name": result.get("app_name", ""),  # 应用名称
                     "window_name": result.get("window_name", ""),  # 窗口名称
@@ -613,13 +673,17 @@ class LanceDBStorage:
             
             found_frames = []
             for result in results:
+                image, resolved_path = self._load_image_for_frame(
+                    result["frame_id"],
+                    result["image_path"],
+                )
                 frame_data = {
                     "frame_id": result["frame_id"],
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
-                    "image_path": result["image_path"],
+                    "image_path": resolved_path,
                     "ocr_text": result.get("ocr_text", ""),
                     "distance": result.get("_distance", 0),
-                    "image": self._load_image(result["image_path"]),
+                    "image": image,
                     "app_name": result.get("app_name", ""),  # 应用名称
                     "window_name": result.get("window_name", ""),  # 窗口名称
                 }

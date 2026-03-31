@@ -11,6 +11,7 @@ Uses H.265/HEVC for efficient compression.
 """
 import os
 import io
+import shutil
 import subprocess
 import tempfile
 from typing import Optional, List, Tuple
@@ -21,56 +22,57 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
-def find_ffmpeg_path() -> Optional[str]:
-    """Find FFmpeg executable path"""
+def _find_executable(name: str, common_paths: List[str]) -> Optional[str]:
+    """Find an executable in a cross-platform way."""
+    path = shutil.which(name)
+    if path:
+        return path
+
+    lookup_cmd = "where" if os.name == "nt" else "which"
     try:
         result = subprocess.run(
-            ["which", "ffmpeg"],
+            [lookup_cmd, name],
             capture_output=True,
             text=True
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            first_match = result.stdout.strip().splitlines()[0].strip()
+            if first_match:
+                return first_match
     except Exception:
         pass
-    
-    # Try common paths
+
+    for path in common_paths:
+        if os.path.exists(path):
+            return path
+
+    return None
+
+
+def find_ffmpeg_path() -> Optional[str]:
+    """Find FFmpeg executable path"""
     common_paths = [
         "/usr/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/opt/homebrew/bin/ffmpeg",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
     ]
-    for path in common_paths:
-        if os.path.exists(path):
-            return path
-    
-    return None
+    return _find_executable("ffmpeg", common_paths)
 
 
 def find_ffprobe_path() -> Optional[str]:
     """Find FFprobe executable path"""
-    try:
-        result = subprocess.run(
-            ["which", "ffprobe"],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            return result.stdout.strip()
-    except Exception:
-        pass
-    
-    # Try common paths
     common_paths = [
         "/usr/bin/ffprobe",
         "/usr/local/bin/ffprobe",
         "/opt/homebrew/bin/ffprobe",
+        r"C:\ProgramData\chocolatey\bin\ffprobe.exe",
+        r"C:\ffmpeg\bin\ffprobe.exe",
+        r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
     ]
-    for path in common_paths:
-        if os.path.exists(path):
-            return path
-    
-    return None
+    return _find_executable("ffprobe", common_paths)
 
 
 # Cache paths
