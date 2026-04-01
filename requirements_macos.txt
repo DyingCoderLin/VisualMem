@@ -70,3 +70,6 @@ tzlocal==5.3.1
 urllib3==2.5.0
 uvicorn==0.38.0
 wheel==0.45.1
+qwen-vl-utils==0.0.14
+scikit-image==0.26.0
+
