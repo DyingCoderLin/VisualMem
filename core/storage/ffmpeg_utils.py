@@ -171,7 +171,7 @@ class FFmpegFrameCompressor:
                 logger.error(f"FFmpeg compression failed: {stderr[-500:]}")
                 return False
             
-            logger.info(f"Compressed {len(input_files)} frames to {output_path}")
+            logger.debug(f"Compressed {len(input_files)} frames to {output_path}")
             return True
             
         except subprocess.TimeoutExpired:

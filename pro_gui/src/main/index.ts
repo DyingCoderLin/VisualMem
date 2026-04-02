@@ -250,7 +250,7 @@ function startPythonBackend(): Promise<void> {
       }
       
       const logFile = join(logDir, 'backend_server.log')
-      const logStream = createWriteStream(logFile, { flags: 'a' })
+      const logStream = createWriteStream(logFile, { flags: 'w' })
       
       console.log('Starting Python backend...')
       console.log(`Backend logs are being redirected to: ${logFile}`)

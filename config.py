@@ -154,6 +154,28 @@ class Config:
     CAPTURE_INTERVAL_SECONDS = int(os.environ.get("CAPTURE_INTERVAL_SECONDS", "3"))
     
     # ============================================
+    # Activity Clustering
+    # ============================================
+    # Enable activity clustering and timeline generation (requires extra compute + VLM for labeling)
+    ENABLE_CLUSTERING = os.environ.get("ENABLE_CLUSTERING", "false").lower() == "true"
+    CLUSTER_SIMILARITY_THRESHOLD = float(os.environ.get("CLUSTER_SIMILARITY_THRESHOLD", "0.82"))
+    CLUSTER_STRONG_ASSIGNMENT_THRESHOLD = float(os.environ.get("CLUSTER_STRONG_ASSIGNMENT_THRESHOLD", "0.90"))
+    CLUSTER_CANDIDATE_SIMILARITY_THRESHOLD = float(os.environ.get("CLUSTER_CANDIDATE_SIMILARITY_THRESHOLD", "0.78"))
+    # Deprecated: recalculation is now only triggered by per-app unclassified counts.
+    # Keep this env var for backward compatibility with existing .env files.
+    CLUSTER_RECALC_INTERVAL_HOURS = float(os.environ.get("CLUSTER_RECALC_INTERVAL_HOURS", "24"))
+    CLUSTER_UNCLASSIFIED_TRIGGER = int(os.environ.get("CLUSTER_UNCLASSIFIED_TRIGGER", "50"))
+    CLUSTER_CANDIDATE_PROMOTION_COUNT = int(os.environ.get("CLUSTER_CANDIDATE_PROMOTION_COUNT", "3"))
+    CLUSTER_CENTROID_EMA_ALPHA = float(os.environ.get("CLUSTER_CENTROID_EMA_ALPHA", "0.05"))
+    CLUSTER_FREEZE_WINDOW_MINUTES = int(os.environ.get("CLUSTER_FREEZE_WINDOW_MINUTES", "30"))
+    # Pending pool: similarity threshold to match an in-flight VLM leader
+    CLUSTER_PENDING_SIMILARITY_THRESHOLD = float(os.environ.get("CLUSTER_PENDING_SIMILARITY_THRESHOLD", "0.80"))
+    # Pending pool: TTL in seconds for pending entries before auto-expiry
+    CLUSTER_PENDING_TTL_SECONDS = int(os.environ.get("CLUSTER_PENDING_TTL_SECONDS", "1800"))
+    # VLM URL for cluster labeling (empty = skip VLM, use fallback labels)
+    CLUSTER_VLM_URL = os.environ.get("CLUSTER_VLM_URL", "")
+
+    # ============================================
     # Logging Configuration
     # ============================================
     # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL

@@ -162,8 +162,12 @@ ffmpeg_compressor: Optional[FFmpegFrameCompressor] = None
 ffmpeg_extractor: Optional[FFmpegFrameExtractor] = None
 
 # 帧差检测（窗口级别去重）
-from core.preprocess.frame_diff import FrameDiffDetector
+from core.preprocess.frame_diff import FrameDiffDetector, is_solid_color_image
 window_diff_detector: Optional[FrameDiffDetector] = None
+
+# Activity clustering
+from core.activity.cluster_manager import ClusterManager
+cluster_manager: Optional[ClusterManager] = None
 
 # 视频压缩配置
 VIDEO_BATCH_SIZE = 60  # 每60帧压缩一次
@@ -203,7 +207,7 @@ class BatchWriteBuffer:
             self.buffer.append(frame_data)
             should_flush = len(self.buffer) >= self.batch_size
             if should_flush:
-                logger.info(f"缓冲区达到批次大小 {self.batch_size}，触发批量写入")
+                logger.debug(f"缓冲区达到批次大小 {self.batch_size}，触发批量写入")
         if should_flush:
             self._flush_buffer()
     
@@ -220,12 +224,12 @@ class BatchWriteBuffer:
             return
         
         try:
-            logger.info(f"批量写入 {len(frames_to_write)} 帧到 LanceDB...")
+            logger.debug(f"批量写入 {len(frames_to_write)} 帧到 LanceDB...")
             # 批量写入到 LanceDB
             if vector_storage is not None:
                 success = vector_storage.store_frames_batch(frames_to_write)
                 if success:
-                    logger.info(f"✓ 成功批量写入 {len(frames_to_write)} 帧")
+                    logger.debug(f"✓ 成功批量写入 {len(frames_to_write)} 帧")
                 else:
                     logger.error(f"✗ 批量写入失败")
             
@@ -265,7 +269,7 @@ class BatchWriteBuffer:
                 should_flush = elapsed >= self.flush_interval and len(self.buffer) > 0
             
             if should_flush:
-                logger.info(f"达到刷新间隔 {self.flush_interval} 秒，触发批量写入")
+                logger.debug(f"达到刷新间隔 {self.flush_interval} 秒，触发批量写入")
                 self._flush_buffer()
     
     def start(self):
@@ -318,6 +322,48 @@ def _resolve_sub_frame_image_path(sf: dict) -> Optional[str]:
     return None
 
 
+def _log_non_committed_cluster_result(app_name: str, sub_frame_id: str):
+    """
+    Log online clustering results for frames that did not directly land in an
+    existing committed cluster. This is intentionally INFO-level so it shows up
+    in backend_server.log during real runs.
+    """
+    if sqlite_storage is None:
+        return
+    try:
+        conn = sqlite_storage._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT activity_cluster_id, activity_label, provisional_label, cluster_status
+            FROM sub_frames
+            WHERE sub_frame_id = ?
+            """,
+            (sub_frame_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return
+
+        status = row["cluster_status"] or "pending"
+        label = row["provisional_label"] or row["activity_label"]
+        cluster_id = row["activity_cluster_id"]
+
+        if status == "candidate":
+            logger.debug(
+                f"Activity clustering candidate for app='{app_name}': "
+                f"frame={sub_frame_id}, cluster_id={cluster_id}, label='{label}'"
+            )
+        elif status == "pending":
+            logger.debug(
+                f"Activity clustering pending for app='{app_name}': "
+                f"frame={sub_frame_id}, no committed match and no provisional label"
+            )
+    except Exception as e:
+        logger.debug(f"Failed to log cluster result for {sub_frame_id}: {e}")
+
+
 def _on_video_batch_ready(batch_type: str, identifier: str, frames: List[FrameInfo]):
     """
     当视频批次准备好压缩时的回调函数
@@ -359,7 +405,7 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
         success = ffmpeg_compressor.compress_from_files(input_files, str(output_path))
         
         if success:
-            logger.info(f"Video compression successful: {output_path}")
+            logger.debug(f"Video compression successful: {output_path}")
             
             # 插入视频chunk记录到数据库
             if sqlite_storage is not None:
@@ -557,11 +603,7 @@ def _recover_temp_frames():
             else:
                 # 文件丢失，清理僵尸路径
                 cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["frame_id"],))
-        
-        for monitor_id, frames in fs_groups.items():
-            logger.info(f"Recovering {len(frames)} leftover full_screen temp_frames for monitor_{monitor_id}...")
-            _compress_video_batch("full_screen", f"monitor_{monitor_id}", frames)
-            
+
         # 2. 恢复窗口截图
         cursor.execute("""
             SELECT s.sub_frame_id, s.timestamp, f.image_path, s.app_name, s.window_name
@@ -592,13 +634,19 @@ def _recover_temp_frames():
                 ))
             else:
                 cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["sub_frame_id"],))
-                
+
+        # Commit zombie-path cleanups before compression. _compress_video_batch opens new
+        # SQLite connections; an open uncommitted transaction on this conn would lock them.
+        conn.commit()
+        conn.close()
+
+        for monitor_id, frames in fs_groups.items():
+            logger.info(f"Recovering {len(frames)} leftover full_screen temp_frames for monitor_{monitor_id}...")
+            _compress_video_batch("full_screen", f"monitor_{monitor_id}", frames)
+
         for key, frames in win_groups.items():
             logger.info(f"Recovering {len(frames)} leftover window temp_frames for {key}...")
             _compress_video_batch("window", key, frames)
-            
-        conn.commit()
-        conn.close()
     except Exception as e:
         logger.error(f"Error recovering temp frames: {e}")
 
@@ -766,7 +814,20 @@ def _init_all_components():
     # 12. Recover leftover temp frames from previous abnormal exit
     logger.info("[12/12] Recovering leftover temp frames...")
     _recover_temp_frames()
-    
+
+    # 13. Initialize activity cluster manager
+    global cluster_manager
+    if config.ENABLE_CLUSTERING:
+        logger.info("[13/13] Initializing activity cluster manager...")
+        try:
+            cluster_manager = ClusterManager(db_path=config.OCR_DB_PATH)
+        except Exception as e:
+            logger.warning(f"Failed to init ClusterManager (will retry later): {e}")
+            cluster_manager = None
+    else:
+        logger.info("[13/13] Activity clustering disabled (ENABLE_CLUSTERING=False)")
+        cluster_manager = None
+
     logger.info("=" * 60)
     logger.info("All backend components initialized successfully!")
     logger.info("=" * 60)
@@ -807,6 +868,7 @@ class QueryRagWithTimeRequest(BaseModel):
     ocr_mode: bool = False            # Legacy, kept for compatibility
     enable_hybrid: Optional[bool] = None
     enable_rerank: Optional[bool] = None
+    activity_label: Optional[str] = None  # Filter by activity cluster label
 
 
 class QueryRagWithTimeResponse(BaseModel):
@@ -835,6 +897,22 @@ class DateFrameCountResponse(BaseModel):
 class DateRangeResponse(BaseModel):
     earliest_date: Optional[str]  # YYYY-MM-DD，最早的照片日期
     latest_date: Optional[str]    # YYYY-MM-DD，最新的照片日期
+
+
+class ActivityClusterDebugAppStatus(BaseModel):
+    app_name: str
+    pending_unclassified: int
+    candidate_frames: int
+    committed_cluster_count: int
+    threshold: int
+    needs_recalc: bool
+
+
+class ActivityClusterDebugResponse(BaseModel):
+    threshold: int
+    recalc_running: bool
+    apps_needing_recalc: List[str]
+    apps: List[ActivityClusterDebugAppStatus]
 
 
 # ============ Startup Event ============
@@ -921,6 +999,18 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"Error during model release: {e}")
     
+    # 4. 输出聚类统计
+    if cluster_manager is not None:
+        try:
+            stats = cluster_manager.get_assignment_stats()
+            logger.info("-" * 40)
+            logger.info("Activity clustering session stats:")
+            logger.info(f"  Total frames assigned : {stats['total_frames']}")
+            logger.info(f"  VLM called (far from centroid): {stats['vlm_called_frames']}")
+            logger.info(f"  VLM call ratio        : {stats['vlm_call_ratio']:.2%}")
+        except Exception as e:
+            logger.error(f"Error collecting cluster stats: {e}")
+
     logger.info("Backend server shutdown complete.")
     logger.info("=" * 60)
 
@@ -991,6 +1081,19 @@ def get_stats():
             logger.warning(f"Failed to get SQLite storage stats: {e}")
     
     return stats
+
+
+@app.get("/api/activity_clusters/debug", response_model=ActivityClusterDebugResponse)
+def get_activity_cluster_debug(app_name: Optional[str] = Query(default=None)):
+    """Debug endpoint for persistent activity clustering trigger state."""
+    if cluster_manager is None:
+        raise HTTPException(status_code=503, detail="Cluster manager is not initialized")
+
+    try:
+        return cluster_manager.get_debug_status(app_name=app_name)
+    except Exception as e:
+        logger.error(f"Failed to get activity cluster debug status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/store_frame")
@@ -1152,7 +1255,14 @@ def store_frame(req: StoreFrameRequest):
                             f"(diff={diff_result.diff_score:.4f})"
                         )
                         continue
-                
+
+                # Skip solid-color / black-screen window images
+                if is_solid_color_image(win_image):
+                    logger.debug(
+                        f"Skipping solid-color window: {app_name}/{window_name}"
+                    )
+                    continue
+
                 # 生成 sub_frame_id
                 safe_app = app_name.replace(" ", "_").replace("/", "_")[:20]
                 sub_frame_id = f"subframe_{safe_app}_{base_frame_id}_{i}"
@@ -1245,9 +1355,27 @@ def store_frame(req: StoreFrameRequest):
                     "_ocr_regions_stored": win_ocr_regions_stored,
                 }
                 batch_write_buffer.add_frame(sub_frame_data)
-                
+
+                # Activity cluster assignment (real-time)
+                if cluster_manager is not None:
+                    try:
+                        activity_label = cluster_manager.assign_frame(
+                            app_name=app_name,
+                            frame_id=sub_frame_id,
+                            embedding=win_embedding,
+                            image=win_image,
+                            ocr_text=win_ocr_text,
+                            timestamp=ts.isoformat(),
+                            window_name=window_name,
+                        )
+                        if activity_label:
+                            logger.debug(f"Assigned {sub_frame_id} -> '{activity_label}'")
+                        _log_non_committed_cluster_result(app_name, sub_frame_id)
+                    except Exception as e:
+                        logger.debug(f"Cluster assign failed for {sub_frame_id}: {e}")
+
                 sub_frame_ids.append(sub_frame_id)
-                
+
                 # 如果窗口批次就绪，触发压缩
                 if win_batch_ready:
                     _check_and_compress_batches()
@@ -1343,13 +1471,31 @@ def store_frame(req: StoreFrameRequest):
                     "_ocr_regions_stored": syn_ocr_regions_stored,
                 }
                 batch_write_buffer.add_frame(syn_frame_data)
+
+                if cluster_manager is not None:
+                    try:
+                        activity_label = cluster_manager.assign_frame(
+                            app_name=focused_app,
+                            frame_id=syn_sub_id,
+                            embedding=embedding,
+                            image=image,
+                            ocr_text=syn_ocr_text,
+                            timestamp=ts.isoformat(),
+                            window_name=focused_win or "",
+                        )
+                        if activity_label:
+                            logger.debug(f"Assigned {syn_sub_id} -> '{activity_label}'")
+                        _log_non_committed_cluster_result(focused_app, syn_sub_id)
+                    except Exception as e:
+                        logger.debug(f"Cluster assign failed for {syn_sub_id}: {e}")
+
                 sub_frame_ids.append(syn_sub_id)
 
                 # Collect for frame-level combined OCR
                 if syn_ocr_text:
                     sub_frame_ocr_parts.append((focused_app, syn_ocr_text, syn_ocr_conf))
 
-                logger.info(
+                logger.debug(
                     f"Created synthetic sub_frame {syn_sub_id} for "
                     f"full-screen app {focused_app}/{focused_win}"
                 )
@@ -1407,6 +1553,16 @@ def store_frame(req: StoreFrameRequest):
     batch_write_buffer.add_frame(frame_data)
 
     logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows (focused={focused_app})")
+
+    # Check if cluster recalculation is needed (runs in background thread)
+    if cluster_manager is not None and cluster_manager.should_recalculate():
+        if vector_storage is not None and vector_storage.table is not None:
+            threading.Thread(
+                target=cluster_manager.recalculate,
+                args=(vector_storage.table,),
+                daemon=True,
+            ).start()
+
     return {"status": "ok", "frame_id": frame_id, "sub_frame_count": len(sub_frame_ids)}
 
 
@@ -1604,6 +1760,23 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
         f"RAG dense 原始 {len(dense_results)} 条, sparse 原始 {len(sparse_results)} 条, "
         f"去重后 {len(frames)} 张"
     )
+
+    # Activity label post-filter
+    if req.activity_label and sqlite_storage is not None:
+        try:
+            conn_al = sqlite_storage._get_connection()
+            cursor_al = conn_al.cursor()
+            cursor_al.execute(
+                "SELECT sub_frame_id FROM sub_frames WHERE activity_label LIKE ?",
+                (f"%{req.activity_label}%",),
+            )
+            matching_ids = {r["sub_frame_id"] for r in cursor_al.fetchall()}
+            conn_al.close()
+            before = len(frames)
+            frames = [f for f in frames if f.get("frame_id") in matching_ids]
+            logger.info(f"activity_label filter '{req.activity_label}': {before} -> {len(frames)}")
+        except Exception as e:
+            logger.warning(f"activity_label filter failed: {e}")
 
     if not frames:
         return QueryRagWithTimeResponse(answer="在指定时间范围内未找到相关的屏幕记录。", frames=[])
@@ -2258,7 +2431,18 @@ def stop_recording_api():
     if batch_write_buffer is not None:
         logger.info("刷新批量写入缓冲区...")
         batch_write_buffer._flush_buffer()
-    
+
+    # 3. 输出本次录制的聚类统计并重置计数器
+    if cluster_manager is not None:
+        stats = cluster_manager.get_assignment_stats()
+        total = stats["total_frames"]
+        vlm = stats["vlm_called_frames"]
+        ratio = stats["vlm_call_ratio"]
+        logger.info(
+            f"Recording cluster stats: {vlm}/{total} frames needed VLM labeling ({ratio:.1%})"
+        )
+        cluster_manager.reset_assignment_stats()
+
     return {"status": "success", "message": "All buffers flushed"}
 
 
@@ -2352,14 +2536,120 @@ def get_video_buffer_stats():
     return temp_frame_buffer.get_stats()
 
 
+def _check_clustering_health() -> tuple:
+    """
+    Check if activity clustering tables exist and timeline data is in sync with frames.
+    Returns (is_healthy: bool, issue: str).
+    Only relevant when ENABLE_CLUSTERING=True.
+    """
+    import sqlite3
+    import os
+
+    db_path = config.OCR_DB_PATH
+    if not os.path.exists(db_path):
+        return True, ""  # Fresh install, nothing to check
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Check if required tables exist
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('activity_clusters', 'activity_sessions')"
+        )
+        existing = {row[0] for row in cursor.fetchall()}
+        missing = {"activity_clusters", "activity_sessions"} - existing
+        if missing:
+            conn.close()
+            return False, f"Missing clustering tables: {', '.join(sorted(missing))}"
+
+        # Check if sub_frames has the activity_cluster_id column
+        cursor.execute("PRAGMA table_info(sub_frames)")
+        sf_cols = {row[1] for row in cursor.fetchall()}
+        if "activity_cluster_id" not in sf_cols:
+            conn.close()
+            return False, "sub_frames table is missing activity_cluster_id column"
+
+        # Check if there are any frames to worry about
+        cursor.execute("SELECT COUNT(*) FROM sub_frames")
+        total_frames = cursor.fetchone()[0]
+        if total_frames == 0:
+            conn.close()
+            return True, ""
+
+        # Check if timeline is empty while frames exist
+        cursor.execute("SELECT MAX(end_time) FROM activity_sessions")
+        latest_session = cursor.fetchone()[0]
+        if not latest_session:
+            conn.close()
+            return False, f"Timeline is empty but {total_frames} frames exist"
+
+        # Check how many frames are uncovered after the last session
+        cursor.execute(
+            "SELECT COUNT(*) FROM sub_frames WHERE timestamp > ? AND activity_cluster_id IS NULL",
+            (latest_session,),
+        )
+        uncovered = cursor.fetchone()[0]
+        conn.close()
+
+        if uncovered > 200:
+            return False, (
+                f"{uncovered} frames are not covered by the timeline "
+                f"(latest session ended at {latest_session})"
+            )
+
+        return True, ""
+    except Exception as e:
+        return True, f"(health check skipped: {e})"
+
+
+def _prompt_clustering_warning(issue: str) -> bool:
+    """
+    Print a warning about clustering health and ask the user whether to force-start.
+    Returns True if the server should start, False if it should abort.
+    """
+    border = "=" * 68
+    print(f"\n{border}")
+    print("  WARNING: Activity clustering data issue detected")
+    print(border)
+    print(f"  Issue : {issue}")
+    print()
+    print("  To fix this, run the 3-phase timeline sync script:")
+    print("    python scripts/backfill_activity_clusters.py --phases all")
+    print()
+    print("  Options:")
+    print("    Press Enter or type 'y'  →  abort startup and run the script first")
+    print("    Type 'n' + Enter         →  force-start anyway (timeline may be stale)")
+    print(border)
+    try:
+        answer = input("  Your choice [y/n, default: y]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        # Non-interactive environment — default to force-start to avoid blocking the server
+        print("\n  (Non-interactive mode detected, force-starting...)")
+        return True
+    if answer == "n":
+        print("  Force-starting without timeline sync...")
+        return True
+    print("  Startup aborted. Please run the sync script and restart.\n")
+    return False
+
+
 if __name__ == "__main__":
     import uvicorn
+
+    if config.ENABLE_CLUSTERING:
+        is_healthy, issue = _check_clustering_health()
+        if not is_healthy:
+            should_start = _prompt_clustering_warning(issue)
+            if not should_start:
+                import sys
+                sys.exit(0)
 
     uvicorn.run(
         "gui_backend_server:app",
         host="0.0.0.0",
         port=18080,
         reload=False,
+        access_log=False,
     )
-
-

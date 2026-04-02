@@ -26,3 +26,8 @@ agent-sync.md
 *.pt
 /cluster_output/*
 db_browser_*
+/.claude/*
+CLAUDE.md
+claude_features.md
+/docs/data_platform_api_design.md
+/docs/clustering_feature.md

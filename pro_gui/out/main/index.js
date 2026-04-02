@@ -205,7 +205,7 @@ function startPythonBackend() {
         fs.mkdirSync(logDir, { recursive: true });
       }
       const logFile = path.join(logDir, "backend_server.log");
-      const logStream = fs.createWriteStream(logFile, { flags: "a" });
+      const logStream = fs.createWriteStream(logFile, { flags: "w" });
       console.log("Starting Python backend...");
       console.log(`Backend logs are being redirected to: ${logFile}`);
       pythonProcess = child_process.spawn("python", [pythonScript], {

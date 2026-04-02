@@ -158,6 +158,26 @@ class RecordingService {
   }
 
   /**
+   * Check if a frame is solid-color (black screen, white screen, etc.)
+   * Uses the standard deviation of grayscale pixel values from the low-res diff image.
+   */
+  private isSolidColorFrame(diffData: ImageData): boolean {
+    const data = diffData.data
+    const pixelCount = diffData.width * diffData.height
+    let sum = 0
+    let sumSq = 0
+    for (let i = 0; i < data.length; i += 4) {
+      // Convert to grayscale: 0.299*R + 0.587*G + 0.114*B
+      const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+      sum += gray
+      sumSq += gray * gray
+    }
+    const mean = sum / pixelCount
+    const std = Math.sqrt(sumSq / pixelCount - mean * mean)
+    return std < 5.0
+  }
+
+  /**
    * 使用 Electron desktopCapturer API 和 WebRTC 截屏
    */
   private async captureScreen(): Promise<{ base64Data: string; diffData: ImageData; index: number; width: number; height: number }[]> {
@@ -448,6 +468,11 @@ class RecordingService {
 
         // 如果 base64Data 为空，说明帧差过滤未通过，跳过发送
         if (!base64Data) {
+          continue
+        }
+
+        // Skip solid-color / black-screen frames (std of grayscale pixels < 5)
+        if (this.isSolidColorFrame(diffData)) {
           continue
         }
 

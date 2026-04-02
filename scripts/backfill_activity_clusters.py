@@ -12,6 +12,7 @@ Usage:
     python scripts/backfill_activity_clusters.py --phase label --vlm-url http://localhost:8088
     python scripts/backfill_activity_clusters.py --phase timeline
     python scripts/backfill_activity_clusters.py --phase all --vlm-url http://localhost:8088
+    python scripts/backfill_activity_clusters.py --phase all --mode full --vlm-url http://localhost:8088
 """
 import argparse
 import base64
@@ -62,6 +63,9 @@ def ensure_tables(db_path: str):
             centroid BLOB,
             frame_count INTEGER DEFAULT 0,
             representative_frame_ids TEXT,
+            cluster_status TEXT NOT NULL DEFAULT 'committed',
+            committed_at TEXT,
+            last_frame_timestamp TEXT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
@@ -76,6 +80,7 @@ def ensure_tables(db_path: str):
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
             frame_count INTEGER DEFAULT 0,
+            session_status TEXT NOT NULL DEFAULT 'committed',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (cluster_id) REFERENCES activity_clusters(id)
         )
@@ -100,10 +105,35 @@ def ensure_tables(db_path: str):
     for col_name, col_type in [
         ("activity_cluster_id", "INTEGER"),
         ("activity_label", "TEXT"),
+        ("provisional_label", "TEXT"),
+        ("cluster_status", "TEXT"),
+        ("frozen_at", "TEXT"),
+        ("cluster_updated_at", "TEXT"),
     ]:
         if col_name not in existing:
             cursor.execute(f"ALTER TABLE sub_frames ADD COLUMN {col_name} {col_type}")
             logger.info(f"Added column sub_frames.{col_name}")
+
+    cursor.execute("PRAGMA table_info(activity_clusters)")
+    existing_cluster_cols = {row[1] for row in cursor.fetchall()}
+    for col_name, col_type in [
+        ("cluster_status", "TEXT"),
+        ("committed_at", "TEXT"),
+        ("last_frame_timestamp", "TEXT"),
+    ]:
+        if col_name not in existing_cluster_cols:
+            cursor.execute(f"ALTER TABLE activity_clusters ADD COLUMN {col_name} {col_type}")
+            logger.info(f"Added column activity_clusters.{col_name}")
+
+    cursor.execute("PRAGMA table_info(activity_sessions)")
+    existing_session_cols = {row[1] for row in cursor.fetchall()}
+    if "session_status" not in existing_session_cols:
+        cursor.execute("ALTER TABLE activity_sessions ADD COLUMN session_status TEXT")
+        logger.info("Added column activity_sessions.session_status")
+    cursor.execute(
+        "UPDATE activity_sessions SET session_status = 'committed' "
+        "WHERE session_status IS NULL OR session_status = ''"
+    )
 
     conn.commit()
     conn.close()
@@ -132,6 +162,137 @@ def load_sub_frames_from_lancedb() -> "pd.DataFrame":
     sub_df = df[df["frame_id"].str.startswith("subframe_")].copy()
     logger.info(f"Loaded {len(sub_df)} sub_frames from LanceDB ({config.LANCEDB_PATH})")
     return sub_df
+
+
+def load_json_dict(path: Path) -> Dict:
+    """Load a JSON object from disk, returning {} on missing/invalid files."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_json_dict(path: Path, data: Dict):
+    """Persist a JSON object atomically."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_pending_unclustered_subframes(conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
+    """Return sub_frame rows that still need clustering."""
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT sub_frame_id, app_name, timestamp
+        FROM sub_frames
+        WHERE activity_cluster_id IS NULL
+          AND app_name IS NOT NULL
+          AND app_name != ''
+        ORDER BY app_name, timestamp
+        """
+    )
+    return {row["sub_frame_id"]: row for row in cursor.fetchall()}
+
+
+def load_existing_clusters(conn: sqlite3.Connection) -> Dict[str, List[dict]]:
+    """Load existing DB clusters grouped by app."""
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, app_name, label, centroid, frame_count, representative_frame_ids
+        FROM activity_clusters
+        WHERE centroid IS NOT NULL
+        ORDER BY app_name, id
+        """
+    )
+    grouped: Dict[str, List[dict]] = {}
+    for row in cursor.fetchall():
+        grouped.setdefault(row["app_name"], []).append({
+            "id": row["id"],
+            "app_name": row["app_name"],
+            "label": row["label"],
+            "centroid": np.frombuffer(row["centroid"], dtype=np.float32).copy(),
+            "frame_count": row["frame_count"] or 0,
+            "representative_frame_ids": json.loads(row["representative_frame_ids"] or "[]"),
+        })
+    return grouped
+
+
+def recompute_centroids_for_apps(
+    conn: sqlite3.Connection,
+    embeddings_map: Dict[str, np.ndarray],
+    app_names: List[str],
+):
+    """Recompute exact mean centroids for the given apps."""
+    if not app_names:
+        return
+
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    placeholders = ",".join("?" for _ in app_names)
+    cursor.execute(
+        f"SELECT id FROM activity_clusters WHERE app_name IN ({placeholders})",
+        app_names,
+    )
+    cluster_ids = [row["id"] for row in cursor.fetchall()]
+    updated = 0
+
+    for cluster_id in cluster_ids:
+        cursor.execute(
+            "SELECT sub_frame_id FROM sub_frames WHERE activity_cluster_id = ?",
+            (cluster_id,),
+        )
+        frame_ids = [row["sub_frame_id"] for row in cursor.fetchall()]
+        vectors = [embeddings_map[fid] for fid in frame_ids if fid in embeddings_map]
+        if not vectors:
+            continue
+        centroid = np.mean(vectors, axis=0).astype(np.float32)
+        cursor.execute(
+            """
+            UPDATE activity_clusters
+            SET centroid = ?, frame_count = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (centroid.tobytes(), len(vectors), datetime.now().isoformat(), cluster_id),
+        )
+        updated += 1
+
+    logger.info(f"Recomputed {updated} centroids for apps: {app_names}")
+
+
+def merge_discover_summary(
+    summary_path: Path,
+    new_summary_by_app: Dict[str, Dict],
+):
+    """Merge new discover output into the per-app summary JSON."""
+    existing = load_json_dict(summary_path)
+
+    for app_name, app_summary in new_summary_by_app.items():
+        current = existing.get(app_name, {
+            "total_frames": 0,
+            "cluster_count": 0,
+            "clusters": [],
+            "incremental_runs": [],
+        })
+        current.setdefault("clusters", [])
+        current.setdefault("incremental_runs", [])
+
+        current["clusters"].extend(app_summary.get("clusters", []))
+        current["cluster_count"] = int(current.get("cluster_count", 0)) + int(app_summary.get("cluster_count", 0))
+        current["total_frames"] = int(current.get("total_frames", 0)) + int(app_summary.get("total_frames", 0))
+        current["incremental_runs"].append({
+            "timestamp": datetime.now().isoformat(),
+            "new_cluster_count": app_summary.get("cluster_count", 0),
+            "new_frame_count": app_summary.get("total_frames", 0),
+        })
+        existing[app_name] = current
+
+    save_json_dict(summary_path, existing)
 
 
 def extract_and_save_image(
@@ -239,27 +400,49 @@ def phase_discover(args):
 
     sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH)
     ensure_tables(config.OCR_DB_PATH)
-
-    # Always clean previous discover results for a fresh run
-    import shutil
-    logger.info("Clearing previous cluster data...")
     conn = sqlite3.connect(config.OCR_DB_PATH)
-    conn.execute("DELETE FROM activity_sessions")
-    conn.execute("DELETE FROM activity_clusters")
-    conn.execute("UPDATE sub_frames SET activity_cluster_id = NULL, activity_label = NULL")
-    conn.commit()
-    conn.close()
 
     output_dir = Path(CLUSTER_OUTPUT_DIR)
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-        logger.info(f"Cleared {output_dir}")
+    preview_dir = output_dir / "preview"
+
+    if args.mode == "full":
+        import shutil
+
+        logger.info("Clearing previous cluster data...")
+        conn.execute("DELETE FROM activity_sessions")
+        conn.execute("DELETE FROM activity_clusters")
+        conn.execute(
+            "UPDATE sub_frames SET activity_cluster_id = NULL, activity_label = NULL, "
+            "provisional_label = NULL, cluster_status = 'pending', frozen_at = NULL, cluster_updated_at = NULL"
+        )
+        conn.commit()
+
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+            logger.info(f"Cleared {output_dir}")
+    else:
+        pending_rows = get_pending_unclustered_subframes(conn)
+        if not pending_rows:
+            print("No pending unclustered sub_frames found. Discover phase skipped.")
+            conn.close()
+            return
+        logger.info(f"Incremental discover: {len(pending_rows)} pending sub_frames")
 
     # Load sub_frames from LanceDB
-    sub_df = load_sub_frames_from_lancedb()
-    if sub_df.empty:
+    all_sub_df = load_sub_frames_from_lancedb()
+    if all_sub_df.empty:
         logger.warning("No sub_frames found in LanceDB.")
+        conn.close()
         return
+
+    sub_df = all_sub_df
+    if args.mode == "incremental":
+        pending_ids = set(pending_rows.keys())
+        sub_df = sub_df[sub_df["frame_id"].isin(pending_ids)].copy()
+        if sub_df.empty:
+            print("No pending unclustered sub_frames were found in LanceDB. Discover phase skipped.")
+            conn.close()
+            return
 
     # Build embedding map, filtering out solid-color frames
     embeddings_map: Dict[str, np.ndarray] = {}
@@ -274,38 +457,81 @@ def phase_discover(args):
     if skipped_solid:
         logger.info(f"Skipped {skipped_solid} frames with near-zero embedding norm")
 
-    # Group by app_name, process in timestamp order
-    manager = ActivityClusterManager(threshold=args.threshold)
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    existing_clusters = load_existing_clusters(conn)
+    summary_data = {}  # per-app JSON export for newly created clusters only
+    affected_apps = set()
 
+    print("\n=== Clustering Summary ===")
     grouped = sub_df.groupby("app_name")
-    for app_name, group in grouped:
+    for app_name, group in sorted(grouped, key=lambda x: x[0]):
         if not app_name or app_name == "":
             continue
+
         sorted_group = group.sort_values("timestamp")
+        existing = existing_clusters.get(app_name, [])
+        new_clusters: List[dict] = []
+        assigned_existing = 0
+
         for _, row in sorted_group.iterrows():
             fid = row["frame_id"]
             if fid not in embeddings_map:
-                continue  # was filtered as solid-color
-            manager.process_frame(app_name, fid, embeddings_map[fid])
+                continue
 
-    # Save clusters to SQLite and generate preview images
-    output_dir = Path(CLUSTER_OUTPUT_DIR)
-    preview_dir = output_dir / "preview"
-    preview_dir.mkdir(parents=True, exist_ok=True)
+            emb = embeddings_map[fid]
+            best_sim = -1.0
+            best_target = None
 
-    conn = sqlite3.connect(config.OCR_DB_PATH)
-    cursor = conn.cursor()
+            for cluster in existing:
+                sim = cosine_similarity(emb, cluster["centroid"])
+                if sim > best_sim:
+                    best_sim = sim
+                    best_target = cluster
 
-    summary_data = {}  # for JSON export
+            for cluster in new_clusters:
+                sim = cosine_similarity(emb, cluster["centroid"])
+                if sim > best_sim:
+                    best_sim = sim
+                    best_target = cluster
 
-    print("\n=== Clustering Summary ===")
-    for app_name, clusters in sorted(manager.app_clusters.items()):
-        total_frames = sum(c["count"] for c in clusters)
-        print(f"\nApp: {app_name} ({total_frames} frames)")
+            if best_sim >= args.threshold and best_target is not None:
+                if "id" in best_target:
+                    cursor.execute(
+                        "UPDATE sub_frames SET activity_cluster_id = ?, activity_label = ? WHERE sub_frame_id = ?",
+                        (best_target["id"], best_target["label"], fid),
+                    )
+                    assigned_existing += 1
+                else:
+                    best_target["frame_ids"].append(fid)
+                    n = len(best_target["frame_ids"])
+                    best_target["count"] = n
+                    best_target["centroid"] = (
+                        best_target["centroid"] * (n - 1) + emb
+                    ) / n
+                affected_apps.add(app_name)
+            else:
+                new_clusters.append({
+                    "centroid": emb.copy(),
+                    "count": 1,
+                    "frame_ids": [fid],
+                })
+                affected_apps.add(app_name)
+
+        total_frames = assigned_existing + sum(len(c["frame_ids"]) for c in new_clusters)
+        new_cluster_frame_count = sum(len(c["frame_ids"]) for c in new_clusters)
+        print(f"\nApp: {app_name} ({total_frames} new/pending frames)")
+        if assigned_existing:
+            print(f"  Assigned to existing clusters: {assigned_existing}")
+
         app_summary = []
-
-        valid_idx = 0
-        for cluster in clusters:
+        existing_count = len(existing)
+        valid_idx = existing_count
+        for cluster in new_clusters:
+            # Flush previous writes before preview extraction, otherwise
+            # extract_sub_frame_image() may hit SQLite "database is locked".
+            conn.commit()
             ranked_fids = rank_frames_by_centroid(cluster, embeddings_map)
             if not ranked_fids:
                 continue
@@ -348,16 +574,35 @@ def phase_discover(args):
                 valid_rep_ids.append(fid)
 
             cursor.execute("""
-                INSERT INTO activity_clusters (app_name, label, centroid, frame_count, representative_frame_ids)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO activity_clusters
+                (app_name, label, centroid, frame_count, representative_frame_ids,
+                 cluster_status, committed_at, last_frame_timestamp)
+                VALUES (?, ?, ?, ?, ?, 'committed', ?, ?)
             """, (
                 app_name,
                 label,
                 centroid_blob,
                 cluster["count"],
                 json.dumps(valid_rep_ids),
+                datetime.now().isoformat(),
+                None,
             ))
             cluster_id = cursor.lastrowid
+            for fid in cluster["frame_ids"]:
+                cursor.execute(
+                    """
+                    UPDATE sub_frames
+                    SET activity_cluster_id = ?,
+                        activity_label = ?,
+                        provisional_label = ?,
+                        cluster_status = 'committed',
+                        cluster_updated_at = ?,
+                        frozen_at = COALESCE(frozen_at, ?)
+                    WHERE sub_frame_id = ?
+                    """,
+                    (cluster_id, label, label, datetime.now().isoformat(), datetime.now().isoformat(), fid),
+                )
+            conn.commit()
 
             print(f"  Cluster {valid_idx}: \"{label}\" ({cluster['count']} frames) [db_id={cluster_id}]")
             for sp in saved_samples:
@@ -371,19 +616,33 @@ def phase_discover(args):
                 "preview_images": saved_samples,
             })
 
-        summary_data[app_name] = {
-            "total_frames": total_frames,
-            "cluster_count": len(app_summary),
-            "clusters": app_summary,
-        }
+        if app_summary:
+            summary_data[app_name] = {
+                "total_frames": new_cluster_frame_count,
+                "cluster_count": len(app_summary),
+                "clusters": app_summary,
+            }
+
+    recompute_embeddings_map: Dict[str, np.ndarray] = {}
+    if affected_apps:
+        recompute_df = all_sub_df[all_sub_df["app_name"].isin(affected_apps)].copy()
+        for _, row in recompute_df.iterrows():
+            vec = np.array(row["vector"], dtype=np.float32)
+            if np.linalg.norm(vec) < 1e-6:
+                continue
+            recompute_embeddings_map[row["frame_id"]] = vec
+
+    recompute_centroids_for_apps(conn, recompute_embeddings_map, sorted(affected_apps))
 
     conn.commit()
     conn.close()
 
     # Write JSON summary
     summary_path = output_dir / "discover_summary.json"
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary_data, f, ensure_ascii=False, indent=2)
+    if args.mode == "full":
+        save_json_dict(summary_path, summary_data)
+    else:
+        merge_discover_summary(summary_path, summary_data)
 
     print(f"\nPreview images saved to: {preview_dir}")
     print(f"Summary JSON saved to: {summary_path}")
@@ -605,27 +864,29 @@ def phase_label(args):
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    # Reset all labels back to pending so we re-label everything from scratch
-    cursor.execute("""
-        UPDATE activity_clusters
-        SET label = app_name || '_activity_' || id
-        WHERE label NOT LIKE '%_activity_%'
-    """)
-    reset_count = cursor.rowcount
-    if reset_count > 0:
-        conn.commit()
-        logger.info(f"Reset {reset_count} previously labeled clusters back to pending")
+    if args.mode == "full":
+        cursor.execute("""
+            UPDATE activity_clusters
+            SET label = app_name || '_activity_' || id
+            WHERE label NOT LIKE '%_activity_%'
+        """)
+        reset_count = cursor.rowcount
+        if reset_count > 0:
+            conn.commit()
+            logger.info(f"Reset {reset_count} previously labeled clusters back to pending")
 
-    # Load all clusters (now all pending)
+    # Incremental mode only labels fallback clusters.
     cursor.execute("""
         SELECT id, app_name, label, representative_frame_ids
         FROM activity_clusters
+        WHERE label LIKE '%_activity_%'
         ORDER BY app_name, id
     """)
     clusters = [dict(r) for r in cursor.fetchall()]
 
     if not clusters:
-        print("No clusters found. Run --phase discover first.")
+        print("No pending clusters found for labeling.")
+        conn.close()
         return
 
     # Group by app
@@ -635,19 +896,25 @@ def phase_label(args):
         app = c["app_name"]
         app_cluster_map.setdefault(app, []).append(c)
 
+    cursor.execute(
+        """
+        SELECT DISTINCT app_name, label
+        FROM activity_clusters
+        WHERE label NOT LIKE '%_activity_%'
+        ORDER BY app_name, label
+        """
+    )
+    for row in cursor.fetchall():
+        app_labels.setdefault(row["app_name"], []).append(row["label"])
+
     # Label results file — written after each cluster for crash recovery
     output_dir = Path(CLUSTER_OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     label_results_path = output_dir / "label_results.json"
-    label_results = {}
-    if label_results_path.exists():
-        try:
-            label_results = json.loads(label_results_path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
+    label_results = load_json_dict(label_results_path)
 
     def _save_label_results():
-        label_results_path.write_text(json.dumps(label_results, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_json_dict(label_results_path, label_results)
 
     print("\n=== VLM Label Generation ===")
     for app_name in sorted(app_cluster_map.keys()):
@@ -695,8 +962,8 @@ def phase_label(args):
                     target_id = target_row["id"]
                     # Update all references from this cluster to target
                     cursor.execute(
-                        "UPDATE sub_frames SET activity_cluster_id = ? WHERE activity_cluster_id = ?",
-                        (target_id, cluster["id"]),
+                        "UPDATE sub_frames SET activity_cluster_id = ?, activity_label = ? WHERE activity_cluster_id = ?",
+                        (target_id, matched_label, cluster["id"]),
                     )
                     # Merge frame count
                     cursor.execute("SELECT frame_count FROM activity_clusters WHERE id = ?", (target_id,))
@@ -716,6 +983,10 @@ def phase_label(args):
                         "UPDATE activity_clusters SET label = ?, updated_at = ? WHERE id = ?",
                         (matched_label, datetime.now().isoformat(), cluster["id"]),
                     )
+                    cursor.execute(
+                        "UPDATE sub_frames SET activity_label = ? WHERE activity_cluster_id = ?",
+                        (matched_label, cluster["id"]),
+                    )
                     print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{matched_label}\"")
             else:
                 # New label
@@ -723,19 +994,24 @@ def phase_label(args):
                     "UPDATE activity_clusters SET label = ?, updated_at = ? WHERE id = ?",
                     (label, datetime.now().isoformat(), cluster["id"]),
                 )
+                cursor.execute(
+                    "UPDATE sub_frames SET activity_label = ? WHERE activity_cluster_id = ?",
+                    (label, cluster["id"]),
+                )
                 existing.append(label)
                 app_labels[app_name] = existing
                 print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{label}\" [NEW]")
 
             conn.commit()
 
-            # Persist label result to JSON immediately
+            # Persist label result to JSON immediately, appending within the app section.
             label_results.setdefault(app_name, [])
-            label_results[app_name].append({
-                "cluster_id": cluster["id"],
-                "old_label": cluster["label"],
-                "new_label": label,
-            })
+            if not any(item.get("cluster_id") == cluster["id"] for item in label_results[app_name]):
+                label_results[app_name].append({
+                    "cluster_id": cluster["id"],
+                    "old_label": cluster["label"],
+                    "new_label": label,
+                })
             _save_label_results()
 
             time.sleep(0.5)  # Rate limit
@@ -751,106 +1027,173 @@ def phase_label(args):
 
 def phase_timeline(args):
     """Phase C: build activity sessions from clustered sub_frames."""
-    import pandas as pd
-
-    sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH)
     ensure_tables(config.OCR_DB_PATH)
 
-    # Load sub_frames from LanceDB with embeddings
-    sub_df = load_sub_frames_from_lancedb()
-    if sub_df.empty:
-        logger.warning("No sub_frames found in LanceDB.")
-        return
-
-    # Load clusters from SQLite
     conn = sqlite3.connect(config.OCR_DB_PATH)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
-    cursor.execute("SELECT id, app_name, label, centroid, frame_count FROM activity_clusters ORDER BY app_name, id")
-    cluster_rows = cursor.fetchall()
+    # Remove stale sessions that point to deleted / non-committed clusters.
+    cursor.execute("""
+        DELETE FROM activity_sessions
+        WHERE cluster_id IN (
+            SELECT s.cluster_id
+            FROM activity_sessions s
+            LEFT JOIN activity_clusters c ON s.cluster_id = c.id
+            WHERE c.id IS NULL OR COALESCE(c.cluster_status, 'committed') != 'committed'
+        )
+    """)
+    stale_deleted = cursor.rowcount
+    if stale_deleted > 0:
+        conn.commit()
+        logger.info(f"Deleted {stale_deleted} stale activity_sessions referencing missing/non-committed clusters")
 
-    if not cluster_rows:
-        print("No clusters found. Run --phase discover first.")
+    if args.mode == "full":
+        cursor.execute("DELETE FROM activity_sessions")
+        conn.commit()
+
+    print("\n=== Activity Timeline ===")
+    total_sessions = 0
+    apps_processed = 0
+
+    cursor.execute(
+        """
+        SELECT DISTINCT app_name
+        FROM sub_frames
+        WHERE activity_cluster_id IS NOT NULL
+          AND cluster_status = 'committed'
+          AND app_name IS NOT NULL
+          AND app_name != ''
+        ORDER BY app_name
+        """
+    )
+    app_names = [row["app_name"] for row in cursor.fetchall()]
+
+    if not app_names:
+        print("No clustered sub_frames found. Run --phase discover first.")
         conn.close()
         return
 
-    # Build cluster lookup: {app_name: [(cluster_id, label, centroid_vec), ...]}
-    app_cluster_info: Dict[str, List[Tuple[int, str, np.ndarray]]] = {}
-    for row in cluster_rows:
-        app = row["app_name"]
-        centroid = np.frombuffer(row["centroid"], dtype=np.float32)
-        app_cluster_info.setdefault(app, []).append((row["id"], row["label"], centroid))
+    for app_name in app_names:
+        rebuild_from = None
 
-    # Clear existing sessions
-    cursor.execute("DELETE FROM activity_sessions")
+        if args.mode == "incremental":
+            cursor.execute(
+                """
+                SELECT start_time, end_time
+                FROM activity_sessions
+                WHERE app_name = ?
+                ORDER BY end_time DESC, id DESC
+                LIMIT 1
+                """,
+                (app_name,),
+            )
+            last_session = cursor.fetchone()
+            if last_session is None:
+                cursor.execute(
+                    """
+                    SELECT MIN(timestamp) AS min_ts
+                    FROM sub_frames
+                    WHERE app_name = ?
+                      AND activity_cluster_id IS NOT NULL
+                      AND cluster_status = 'committed'
+                    """,
+                    (app_name,),
+                )
+                row = cursor.fetchone()
+                rebuild_from = row["min_ts"] if row and row["min_ts"] else None
+            else:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM sub_frames
+                    WHERE app_name = ?
+                      AND activity_cluster_id IS NOT NULL
+                      AND cluster_status = 'committed'
+                      AND timestamp > ?
+                    """,
+                    (app_name, last_session["end_time"]),
+                )
+                has_new = cursor.fetchone()["cnt"] > 0
+                if has_new:
+                    rebuild_from = last_session["start_time"]
+        else:
+            cursor.execute(
+                """
+                SELECT MIN(timestamp) AS min_ts
+                FROM sub_frames
+                WHERE app_name = ?
+                  AND activity_cluster_id IS NOT NULL
+                  AND cluster_status = 'committed'
+                """,
+                (app_name,),
+            )
+            row = cursor.fetchone()
+            rebuild_from = row["min_ts"] if row and row["min_ts"] else None
 
-    # Process per app
-    print("\n=== Activity Timeline ===")
-    total_sessions = 0
-
-    grouped = sub_df.groupby("app_name")
-    for app_name, group in sorted(grouped, key=lambda x: x[0]):
-        if not app_name or app_name == "" or app_name not in app_cluster_info:
+        if not rebuild_from:
             continue
 
-        clusters_info = app_cluster_info[app_name]
-        sorted_group = group.sort_values("timestamp")
+        cursor.execute(
+            "DELETE FROM activity_sessions WHERE app_name = ? AND start_time >= ?",
+            (app_name, rebuild_from),
+        )
+
+        cursor.execute(
+            """
+            SELECT sub_frame_id, timestamp, activity_cluster_id, activity_label
+            FROM sub_frames
+            WHERE app_name = ?
+              AND activity_cluster_id IS NOT NULL
+              AND cluster_status = 'committed'
+              AND timestamp >= ?
+            ORDER BY timestamp, sub_frame_id
+            """,
+            (app_name, rebuild_from),
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            continue
 
         current_cluster_id = None
         current_label = None
         session_start = None
         session_frames = 0
         sessions = []
+        previous_ts = None
 
-        for _, row in sorted_group.iterrows():
-            vec = np.array(row["vector"], dtype=np.float32)
+        for row in rows:
             ts = row["timestamp"]
-            frame_id = row["frame_id"]
+            cluster_id = row["activity_cluster_id"]
+            label = row["activity_label"]
 
-            # Find nearest cluster
-            best_sim = -1.0
-            best_cluster_id = clusters_info[0][0]
-            best_label = clusters_info[0][1]
-            for cid, clabel, centroid in clusters_info:
-                sim = cosine_similarity(vec, centroid)
-                if sim > best_sim:
-                    best_sim = sim
-                    best_cluster_id = cid
-                    best_label = clabel
-
-            # Update sub_frame
-            cursor.execute(
-                "UPDATE sub_frames SET activity_cluster_id = ?, activity_label = ? WHERE sub_frame_id = ?",
-                (best_cluster_id, best_label, frame_id),
-            )
-
-            # Session tracking
-            if best_cluster_id != current_cluster_id:
+            if cluster_id != current_cluster_id:
                 # Close previous session
                 if current_cluster_id is not None and session_start is not None:
                     sessions.append((app_name, current_cluster_id, current_label, session_start, ts, session_frames))
                 # Start new session
-                current_cluster_id = best_cluster_id
-                current_label = best_label
+                current_cluster_id = cluster_id
+                current_label = label
                 session_start = ts
                 session_frames = 1
             else:
                 session_frames += 1
+            previous_ts = ts
 
         # Close last session
-        if current_cluster_id is not None and session_start is not None:
-            last_ts = sorted_group.iloc[-1]["timestamp"]
-            sessions.append((app_name, current_cluster_id, current_label, session_start, last_ts, session_frames))
+        if current_cluster_id is not None and session_start is not None and previous_ts is not None:
+            sessions.append((app_name, current_cluster_id, current_label, session_start, previous_ts, session_frames))
 
         # Write sessions
         for app, cid, clabel, start, end, count in sessions:
             cursor.execute("""
-                INSERT INTO activity_sessions (app_name, cluster_id, label, start_time, end_time, frame_count)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO activity_sessions
+                (app_name, cluster_id, label, start_time, end_time, frame_count, session_status)
+                VALUES (?, ?, ?, ?, ?, ?, 'committed')
             """, (app, cid, clabel, start, end, count))
 
         total_sessions += len(sessions)
+        apps_processed += 1
 
         # Print timeline
         for app, cid, clabel, start, end, count in sessions:
@@ -867,7 +1210,8 @@ def phase_timeline(args):
 
     conn.commit()
     conn.close()
-    print(f"\nTotal sessions: {total_sessions}")
+    print(f"\nProcessed apps: {apps_processed}")
+    print(f"Total sessions written: {total_sessions}")
     print("Timeline built. Check activity_sessions table.")
 
 
@@ -885,6 +1229,12 @@ def main():
     )
     parser.add_argument("--vlm-url", default="", help="VLM server URL (required for label phase)")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD, help=f"Cosine similarity threshold (default: {DEFAULT_THRESHOLD})")
+    parser.add_argument(
+        "--mode",
+        choices=["incremental", "full"],
+        default="incremental",
+        help="incremental: only process newly added/unfinished data; full: rebuild clusters/labels/timeline from scratch",
+    )
     parser.add_argument("--save-discarded", action="store_true", help="Save centroid images of discarded solid-color clusters to cluster_output/discarded/")
     parser.add_argument("--verbose", action="store_true", help="Print raw VLM response for each cluster during label phase")
 

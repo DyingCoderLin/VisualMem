@@ -301,15 +301,56 @@ class ImageRetriever(MultiModalRetrieverInterface):
             logger.error(f"Failed to retrieve by time range: {e}", exc_info=True)
             return []
     
+    def filter_by_activity_label(
+        self,
+        results: List[Dict],
+        activity_label: str,
+        sqlite_db_path: str,
+    ) -> List[Dict]:
+        """Post-filter search results by activity_label from SQLite.
+
+        Args:
+            results: Search results (each has ``frame_id``).
+            activity_label: Label to match (substring match, case-insensitive).
+            sqlite_db_path: Path to the SQLite database.
+
+        Returns:
+            Filtered results.
+        """
+        if not activity_label or not results:
+            return results
+
+        import sqlite3
+
+        try:
+            conn = sqlite3.connect(sqlite_db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT sub_frame_id FROM sub_frames WHERE activity_label LIKE ?",
+                (f"%{activity_label}%",),
+            )
+            matching_ids = {row["sub_frame_id"] for row in cursor.fetchall()}
+            conn.close()
+        except Exception as e:
+            logger.warning(f"activity_label filter failed: {e}")
+            return results
+
+        filtered = [r for r in results if r.get("frame_id") in matching_ids]
+        logger.info(
+            f"activity_label filter '{activity_label}': {len(results)} -> {len(filtered)} results"
+        )
+        return filtered
+
     def get_stats(self) -> Dict:
         """
         获取检索器统计信息
-        
+
         Returns:
             统计信息字典
         """
         storage_stats = self.storage.get_stats()
-        
+
         return {
             "retriever_type": "dense_only",
             "encoder_model": self.encoder.model_name,

@@ -32,12 +32,13 @@ function AppContent() {
             </div>
           )}
           <div className="view-container">
-            {currentView === 'timeline' && (
-              <div className="timeline-view-container">
-                <TimelineView />
-              </div>
-            )}
-            {currentView === 'realtime' && <RealTimeTracing />}
+            {/* Keep heavy pages always mounted to preserve state and browser image cache */}
+            <div className="timeline-view-container" style={{ display: currentView === 'timeline' ? undefined : 'none' }}>
+              <TimelineView />
+            </div>
+            <div style={{ display: currentView === 'realtime' ? 'contents' : 'none' }}>
+              <RealTimeTracing />
+            </div>
             {currentView === 'tags' && <SmartTags />}
             {currentView === 'settings' && <Settings />}
           </div>

@@ -112,31 +112,12 @@ const RealTimeTracing: React.FC = () => {
   const [projectRoot, setProjectRoot] = useState<string | null>(null)
   const [previewImage, setPreviewImage] = useState<{ url: string; timestamp: string } | null>(null)
   
-  const { realtimeSearchResult } = useAppStore()
-
-  useEffect(() => {
-    if (window.electronAPI && window.electronAPI.getProjectRoot) {
-      window.electronAPI.getProjectRoot().then(setProjectRoot)
-    }
-
-    fetchRecentFrames()
-    const interval = setInterval(fetchRecentFrames, 30000)
-    
-    const handleRecordingRefreshed = () => {
-      fetchRecentFrames()
-    }
-    window.addEventListener('recording-data-refreshed', handleRecordingRefreshed)
-
-    return () => {
-      clearInterval(interval)
-      window.removeEventListener('recording-data-refreshed', handleRecordingRefreshed)
-    }
-  }, [])
+  const { realtimeSearchResult, currentView } = useAppStore()
 
   const fetchRecentFrames = async () => {
     try {
       const data = await apiClient.getRecentFrames(5)
-      const sortedFrames = (data.frames || []).sort((a: any, b: any) => 
+      const sortedFrames = (data.frames || []).sort((a: any, b: any) =>
         new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       )
       setFrames(sortedFrames)
@@ -158,6 +139,34 @@ const RealTimeTracing: React.FC = () => {
       return timestamp
     }
   }
+
+  // Refresh immediately when this tab becomes visible
+  useEffect(() => {
+    if (currentView === 'realtime') {
+      fetchRecentFrames()
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentView])
+
+  useEffect(() => {
+    if (window.electronAPI && window.electronAPI.getProjectRoot) {
+      window.electronAPI.getProjectRoot().then(setProjectRoot)
+    }
+
+    fetchRecentFrames()
+    const interval = setInterval(fetchRecentFrames, 30000)
+
+    const handleRecordingRefreshed = () => {
+      fetchRecentFrames()
+    }
+    window.addEventListener('recording-data-refreshed', handleRecordingRefreshed)
+
+    return () => {
+      clearInterval(interval)
+      window.removeEventListener('recording-data-refreshed', handleRecordingRefreshed)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const getImageUrl = (path?: string) => {
     if (!path) return ''

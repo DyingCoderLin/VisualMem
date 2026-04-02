@@ -82,8 +82,10 @@ class SQLiteStorage:
     
     def _get_connection(self) -> sqlite3.Connection:
         """获取数据库连接"""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=10)
         conn.row_factory = sqlite3.Row  # 使用 Row 工厂，方便字典访问
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
     
     def _migrate_tables(self, cursor: sqlite3.Cursor):
@@ -284,7 +286,12 @@ class SQLiteStorage:
             CREATE INDEX IF NOT EXISTS idx_sub_frames_app
             ON sub_frames(app_name)
         """)
-        
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sub_frames_activity_pending
+            ON sub_frames(app_name, activity_cluster_id)
+        """)
+
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_mapping_frame
             ON frame_subframe_mapping(frame_id)
@@ -328,6 +335,135 @@ class SQLiteStorage:
             CREATE INDEX IF NOT EXISTS idx_ocr_regions_subframe
             ON ocr_regions(sub_frame_id)
         """)
+
+        # ========== Activity Clustering 表 ==========
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                centroid BLOB,
+                frame_count INTEGER DEFAULT 0,
+                representative_frame_ids TEXT,
+                cluster_status TEXT NOT NULL DEFAULT 'committed',
+                committed_at TEXT,
+                last_frame_timestamp TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                cluster_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                session_status TEXT NOT NULL DEFAULT 'committed',
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                frame_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cluster_id) REFERENCES activity_clusters(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_activity_clusters_app
+            ON activity_clusters(app_name)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_activity_sessions_app
+            ON activity_sessions(app_name)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_activity_sessions_time
+            ON activity_sessions(start_time, end_time)
+        """)
+
+        # Add activity columns to sub_frames if missing
+        try:
+            cursor.execute("PRAGMA table_info(sub_frames)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_type in [
+                ("activity_cluster_id", "INTEGER"),
+                ("activity_label", "TEXT"),
+                ("provisional_label", "TEXT"),
+                ("cluster_status", "TEXT"),
+                ("frozen_at", "TEXT"),
+                ("cluster_updated_at", "TEXT"),
+            ]:
+                if col_name not in existing_cols:
+                    cursor.execute(f"ALTER TABLE sub_frames ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Added column sub_frames.{col_name}")
+        except sqlite3.OperationalError:
+            pass  # sub_frames table not yet created on first run
+
+        # Backward-compatible migration for activity_clusters columns
+        try:
+            cursor.execute("PRAGMA table_info(activity_clusters)")
+            existing_cluster_cols = {row[1] for row in cursor.fetchall()}
+            for col_name, col_type in [
+                ("cluster_status", "TEXT"),
+                ("committed_at", "TEXT"),
+                ("last_frame_timestamp", "TEXT"),
+            ]:
+                if col_name not in existing_cluster_cols:
+                    cursor.execute(f"ALTER TABLE activity_clusters ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Added column activity_clusters.{col_name}")
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("PRAGMA table_info(activity_sessions)")
+            existing_session_cols = {row[1] for row in cursor.fetchall()}
+            if "session_status" not in existing_session_cols:
+                cursor.execute("ALTER TABLE activity_sessions ADD COLUMN session_status TEXT")
+                logger.info("Added column activity_sessions.session_status")
+        except sqlite3.OperationalError:
+            pass
+
+        # Normalize defaults for older rows.
+        try:
+            cursor.execute(
+                "UPDATE activity_clusters SET cluster_status = 'committed' "
+                "WHERE cluster_status IS NULL OR cluster_status = ''"
+            )
+            cursor.execute(
+                "UPDATE activity_clusters SET committed_at = COALESCE(committed_at, created_at, updated_at) "
+                "WHERE cluster_status = 'committed' AND (committed_at IS NULL OR committed_at = '')"
+            )
+            cursor.execute(
+                "UPDATE sub_frames SET cluster_status = CASE "
+                "WHEN activity_cluster_id IS NOT NULL THEN 'committed' "
+                "WHEN provisional_label IS NOT NULL AND provisional_label != '' THEN 'candidate' "
+                "ELSE 'pending' END "
+                "WHERE cluster_status IS NULL OR cluster_status = ''"
+            )
+            cursor.execute(
+                "UPDATE activity_sessions SET session_status = 'committed' "
+                "WHERE session_status IS NULL OR session_status = ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+
+        # Indexes that depend on migrated clustering columns.
+        try:
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sub_frames_cluster_status
+                ON sub_frames(app_name, cluster_status)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_sub_frames_provisional_label
+                ON sub_frames(app_name, provisional_label)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_activity_clusters_app_status
+                ON activity_clusters(app_name, cluster_status)
+            """)
+        except sqlite3.OperationalError:
+            pass
 
         # 创建全文搜索索引（FTS5）
         try:
@@ -1444,9 +1580,8 @@ class SQLiteStorage:
             """, (sub_frame_id,))
             
             row = cursor.fetchone()
-            conn.close()
-            
             if row:
+                conn.close()
                 return {
                     "sub_frame_id": row["sub_frame_id"],
                     "window_chunk_id": row["window_chunk_id"],
@@ -1457,6 +1592,48 @@ class SQLiteStorage:
                     "window_name": row["window_name"],
                     "timestamp": datetime.fromisoformat(row["timestamp"])
                 }
+
+            # Synthetic full-screen sub_frames use window_chunk_id=0 and reuse
+            # the parent full-screen frame's video/image path via the frames table.
+            cursor.execute("""
+                SELECT frame_id, image_path, video_chunk_id, offset_index, timestamp,
+                       app_name, window_name
+                FROM frames
+                WHERE frame_id = ?
+            """, (sub_frame_id,))
+            frame_row = cursor.fetchone()
+            if not frame_row:
+                conn.close()
+                return None
+
+            image_path = frame_row["image_path"] or ""
+            if image_path.startswith("video_chunk:"):
+                parts = image_path.split(":")
+                if len(parts) == 3:
+                    chunk_id = int(parts[1])
+                    offset_index = int(parts[2])
+                    cursor.execute(
+                        "SELECT file_path, fps FROM video_chunks WHERE id = ?",
+                        (chunk_id,),
+                    )
+                    video_row = cursor.fetchone()
+                    conn.close()
+                    if video_row:
+                        return {
+                            "sub_frame_id": sub_frame_id,
+                            "window_chunk_id": 0,
+                            "video_chunk_id": chunk_id,
+                            "offset_index": offset_index,
+                            "file_path": video_row["file_path"],
+                            "fps": video_row["fps"],
+                            "app_name": frame_row["app_name"],
+                            "window_name": frame_row["window_name"],
+                            "timestamp": datetime.fromisoformat(frame_row["timestamp"]),
+                            "image_path": image_path,
+                            "is_fullscreen_synthetic": True,
+                        }
+
+            conn.close()
             return None
             
         except Exception as e:
@@ -1518,6 +1695,7 @@ class SQLiteStorage:
         从 MP4 视频中提取指定子帧的图像。
 
         先查询子帧的 window_chunk 信息，然后调用 FFmpeg 提取。
+        对 synthetic full-screen sub_frame，会自动 fallback 到 frames 表。
         """
         try:
             info = self.get_sub_frame_video_info(sub_frame_id)
@@ -1529,7 +1707,9 @@ class SQLiteStorage:
                     info["offset_index"],
                     info.get("fps", 1.0),
                 )
-            return None
+            # Synthetic sub_frames may only be resolvable through their
+            # mirrored frames-table entry / image_path.
+            return self.extract_frame_image(sub_frame_id)
         except Exception as e:
             logger.error(f"Failed to extract sub_frame image for {sub_frame_id}: {e}")
             return None
