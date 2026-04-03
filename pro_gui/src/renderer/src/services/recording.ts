@@ -26,6 +26,11 @@ class RecordingService {
   private statusListeners: ((status: boolean) => void)[] = []
   private pendingRequests: Set<AbortController> = new Set() // 跟踪正在进行的请求
 
+  // 发送队列：截屏照常进行，发送排队执行，避免 HTTP 连接堆积
+  private sendQueue: Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number }> = []
+  private isSending: boolean = false
+  private readonly maxQueueSize: number = 20  // 队列超过此大小时丢弃最旧的帧
+
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
 
@@ -439,7 +444,7 @@ class RecordingService {
     try {
       // 截屏（可能包含多个屏幕）
       const captureResults = await this.captureScreen()
-      
+
       // 再次检查录制状态（可能在截屏过程中停止了）
       if (!this.isRecording || captureResults.length === 0) {
         return
@@ -447,7 +452,7 @@ class RecordingService {
 
       const now = new Date()
       const timestamp = now.toISOString()
-      
+
       // 生成时间戳格式的 frame_id 前缀：YYYYMMDD_HHMMSS_
       const year = now.getFullYear()
       const month = String(now.getMonth() + 1).padStart(2, '0')
@@ -481,11 +486,8 @@ class RecordingService {
         const microSeconds = String(index).padStart(6, '0')
         const frameId = `${frameIdPrefix}${microSeconds}`
 
-        // 发送到后端（异步，不阻塞）
-        // index 作为 monitor_id 发送
-        this.sendFrameToBackendDirectly(base64Data, frameId, timestamp, width, height, index).catch(err => {
-          console.error(`Error sending frame for screen ${index}:`, err)
-        })
+        // 加入发送队列（截屏不等发送，发送逐个排队避免 HTTP 堆积）
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index)
       }
     } catch (error) {
       // 如果已经停止录制，忽略错误
@@ -493,6 +495,46 @@ class RecordingService {
         return
       }
       console.error('Error in capture loop:', error)
+    }
+  }
+
+  /**
+   * 将帧加入发送队列。截屏不受影响，发送逐个执行避免 HTTP 连接堆积。
+   */
+  private enqueueFrame(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number): void {
+    // 队列满时丢弃最旧的帧（保留最新的截屏）
+    if (this.sendQueue.length >= this.maxQueueSize) {
+      const dropped = this.sendQueue.shift()
+      console.warn(`[RecordingService] Send queue full (${this.maxQueueSize}), dropped oldest frame ${dropped?.frameId}`)
+    }
+    this.sendQueue.push({ base64Data, frameId, timestamp, width, height, monitorId })
+    // 启动队列处理（如果没在运行）
+    this.processSendQueue()
+  }
+
+  /**
+   * 逐个发送队列中的帧，一次只有一个 HTTP 请求在飞。
+   * 这样浏览器的 6 个连接中只有 1 个被 store_frame 占用，
+   * 剩余 5 个可以服务 getStats/getFramesByDate 等轻量请求。
+   */
+  private async processSendQueue(): Promise<void> {
+    if (this.isSending) return  // 已经在处理中
+    this.isSending = true
+
+    try {
+      while (this.sendQueue.length > 0 && this.isRecording) {
+        const frame = this.sendQueue.shift()!
+        try {
+          await this.sendFrameToBackendDirectly(
+            frame.base64Data, frame.frameId, frame.timestamp,
+            frame.width, frame.height, frame.monitorId
+          )
+        } catch (err) {
+          console.error(`Error sending frame ${frame.frameId}:`, err)
+        }
+      }
+    } finally {
+      this.isSending = false
     }
   }
 
@@ -557,6 +599,7 @@ class RecordingService {
 
     // 重置状态
     this.lastImageDataArray = []
+    this.sendQueue = []
     console.log('Recording stopped')
 
     // 通知后端刷新缓冲区

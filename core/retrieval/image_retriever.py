@@ -307,12 +307,12 @@ class ImageRetriever(MultiModalRetrieverInterface):
         activity_label: str,
         sqlite_db_path: str,
     ) -> List[Dict]:
-        """Post-filter search results by activity_label from SQLite.
+        """Post-filter search results by activity_label from activity DB.
 
         Args:
             results: Search results (each has ``frame_id``).
             activity_label: Label to match (substring match, case-insensitive).
-            sqlite_db_path: Path to the SQLite database.
+            sqlite_db_path: Path to the activity database (ACTIVITY_DB_PATH).
 
         Returns:
             Filtered results.
@@ -327,7 +327,7 @@ class ImageRetriever(MultiModalRetrieverInterface):
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT sub_frame_id FROM sub_frames WHERE activity_label LIKE ?",
+                "SELECT sub_frame_id FROM activity_assignments WHERE activity_label LIKE ?",
                 (f"%{activity_label}%",),
             )
             matching_ids = {row["sub_frame_id"] for row in cursor.fetchall()}

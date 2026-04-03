@@ -22,7 +22,7 @@ import sys
 import time
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -37,6 +37,12 @@ from utils.logger import setup_logger
 
 logger = setup_logger("backfill_activity_clusters")
 
+
+def _utcnow() -> str:
+    """Current UTC time as naive ISO string, matching frames/sub_frames format."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -50,12 +56,30 @@ REPRESENTATIVE_SAMPLE_COUNT = 3
 # Database Schema
 # ===========================================================================
 
-def ensure_tables(db_path: str):
-    """Create activity_clusters, activity_sessions tables and add columns to sub_frames."""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
+def ensure_tables(db_path: str, activity_db_path: str = None):
+    """Create activity tables in the activity DB and ensure main DB compatibility."""
+    activity_db_path = activity_db_path or config.ACTIVITY_DB_PATH
 
-    cursor.execute("""
+    # Ensure activity tables in activity DB
+    act_conn = sqlite3.connect(activity_db_path)
+    act_cursor = act_conn.cursor()
+
+    act_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_assignments (
+            sub_frame_id TEXT PRIMARY KEY,
+            app_name TEXT NOT NULL,
+            timestamp TEXT,
+            activity_cluster_id INTEGER,
+            activity_label TEXT,
+            provisional_label TEXT,
+            cluster_status TEXT,
+            frozen_at TEXT,
+            cluster_updated_at TEXT,
+            pending_group_id INTEGER
+        )
+    """)
+
+    act_cursor.execute("""
         CREATE TABLE IF NOT EXISTS activity_clusters (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT NOT NULL,
@@ -71,7 +95,7 @@ def ensure_tables(db_path: str):
         )
     """)
 
-    cursor.execute("""
+    act_cursor.execute("""
         CREATE TABLE IF NOT EXISTS activity_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             app_name TEXT NOT NULL,
@@ -86,57 +110,40 @@ def ensure_tables(db_path: str):
         )
     """)
 
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_activity_clusters_app
-        ON activity_clusters(app_name)
+    act_cursor.execute("""
+        CREATE TABLE IF NOT EXISTS pending_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_name TEXT NOT NULL,
+            leader_frame_id TEXT NOT NULL,
+            centroid BLOB NOT NULL,
+            member_count INTEGER DEFAULT 1,
+            resolved_label TEXT,
+            resolved_cluster_id INTEGER,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_activity_sessions_app
-        ON activity_sessions(app_name)
-    """)
-    cursor.execute("""
-        CREATE INDEX IF NOT EXISTS idx_activity_sessions_time
-        ON activity_sessions(start_time, end_time)
-    """)
 
-    # Add columns to sub_frames if missing
-    cursor.execute("PRAGMA table_info(sub_frames)")
-    existing = {row[1] for row in cursor.fetchall()}
-    for col_name, col_type in [
-        ("activity_cluster_id", "INTEGER"),
-        ("activity_label", "TEXT"),
-        ("provisional_label", "TEXT"),
-        ("cluster_status", "TEXT"),
-        ("frozen_at", "TEXT"),
-        ("cluster_updated_at", "TEXT"),
-    ]:
-        if col_name not in existing:
-            cursor.execute(f"ALTER TABLE sub_frames ADD COLUMN {col_name} {col_type}")
-            logger.info(f"Added column sub_frames.{col_name}")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_cluster_status ON activity_assignments(app_name, cluster_status)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_label ON activity_assignments(activity_label)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_cluster_id ON activity_assignments(activity_cluster_id)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_clusters_app ON activity_clusters(app_name)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_clusters_app_status ON activity_clusters(app_name, cluster_status)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_sessions_app ON activity_sessions(app_name)")
+    act_cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_sessions_time ON activity_sessions(start_time, end_time)")
 
-    cursor.execute("PRAGMA table_info(activity_clusters)")
-    existing_cluster_cols = {row[1] for row in cursor.fetchall()}
-    for col_name, col_type in [
-        ("cluster_status", "TEXT"),
-        ("committed_at", "TEXT"),
-        ("last_frame_timestamp", "TEXT"),
-    ]:
-        if col_name not in existing_cluster_cols:
-            cursor.execute(f"ALTER TABLE activity_clusters ADD COLUMN {col_name} {col_type}")
-            logger.info(f"Added column activity_clusters.{col_name}")
+    act_conn.commit()
+    act_conn.close()
 
-    cursor.execute("PRAGMA table_info(activity_sessions)")
-    existing_session_cols = {row[1] for row in cursor.fetchall()}
-    if "session_status" not in existing_session_cols:
-        cursor.execute("ALTER TABLE activity_sessions ADD COLUMN session_status TEXT")
-        logger.info("Added column activity_sessions.session_status")
-    cursor.execute(
-        "UPDATE activity_sessions SET session_status = 'committed' "
-        "WHERE session_status IS NULL OR session_status = ''"
-    )
 
-    conn.commit()
-    conn.close()
+def get_activity_connection(activity_db_path: str = None) -> sqlite3.Connection:
+    """Get a connection to the activity DB."""
+    path = activity_db_path or config.ACTIVITY_DB_PATH
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
 
 
 # ===========================================================================
@@ -181,24 +188,40 @@ def save_json_dict(path: Path, data: Dict):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def get_pending_unclustered_subframes(conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
-    """Return sub_frame rows that still need clustering."""
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute(
+def get_pending_unclustered_subframes(main_conn: sqlite3.Connection, act_conn: sqlite3.Connection) -> Dict[str, sqlite3.Row]:
+    """Return sub_frame rows that still need clustering.
+
+    Reads from main DB for sub_frame metadata, cross-references activity DB
+    to find frames not yet assigned.
+    """
+    main_conn.row_factory = sqlite3.Row
+    act_conn.row_factory = sqlite3.Row
+    main_cursor = main_conn.cursor()
+    act_cursor = act_conn.cursor()
+
+    # Get all sub_frames from main DB
+    main_cursor.execute(
         """
         SELECT sub_frame_id, app_name, timestamp
         FROM sub_frames
-        WHERE activity_cluster_id IS NULL
-          AND app_name IS NOT NULL
-          AND app_name != ''
+        WHERE app_name IS NOT NULL AND app_name != ''
         ORDER BY app_name, timestamp
         """
     )
-    return {row["sub_frame_id"]: row for row in cursor.fetchall()}
+    all_frames = {row["sub_frame_id"]: row for row in main_cursor.fetchall()}
+
+    # Get already-assigned frame IDs from activity DB
+    act_cursor.execute(
+        "SELECT sub_frame_id FROM activity_assignments WHERE activity_cluster_id IS NOT NULL"
+    )
+    assigned_ids = {row["sub_frame_id"] for row in act_cursor.fetchall()}
+
+    # Return unassigned frames
+    return {fid: row for fid, row in all_frames.items() if fid not in assigned_ids}
 
 
 def load_existing_clusters(conn: sqlite3.Connection) -> Dict[str, List[dict]]:
+    """Load existing clusters from activity DB grouped by app."""
     """Load existing DB clusters grouped by app."""
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -244,7 +267,7 @@ def recompute_centroids_for_apps(
 
     for cluster_id in cluster_ids:
         cursor.execute(
-            "SELECT sub_frame_id FROM sub_frames WHERE activity_cluster_id = ?",
+            "SELECT sub_frame_id FROM activity_assignments WHERE activity_cluster_id = ?",
             (cluster_id,),
         )
         frame_ids = [row["sub_frame_id"] for row in cursor.fetchall()]
@@ -258,7 +281,7 @@ def recompute_centroids_for_apps(
             SET centroid = ?, frame_count = ?, updated_at = ?
             WHERE id = ?
             """,
-            (centroid.tobytes(), len(vectors), datetime.now().isoformat(), cluster_id),
+            (centroid.tobytes(), len(vectors), _utcnow(), cluster_id),
         )
         updated += 1
 
@@ -286,7 +309,7 @@ def merge_discover_summary(
         current["cluster_count"] = int(current.get("cluster_count", 0)) + int(app_summary.get("cluster_count", 0))
         current["total_frames"] = int(current.get("total_frames", 0)) + int(app_summary.get("total_frames", 0))
         current["incremental_runs"].append({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _utcnow(),
             "new_cluster_count": app_summary.get("cluster_count", 0),
             "new_frame_count": app_summary.get("total_frames", 0),
         })
@@ -398,9 +421,10 @@ def phase_discover(args):
     """Phase A: discover clusters from LanceDB embeddings."""
     import pandas as pd
 
-    sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH)
-    ensure_tables(config.OCR_DB_PATH)
-    conn = sqlite3.connect(config.OCR_DB_PATH)
+    sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH, activity_db_path=config.ACTIVITY_DB_PATH)
+    ensure_tables(config.OCR_DB_PATH, config.ACTIVITY_DB_PATH)
+    conn = sqlite3.connect(config.OCR_DB_PATH)  # main DB for reading sub_frame metadata
+    act_conn = get_activity_connection()  # activity DB for cluster writes
 
     output_dir = Path(CLUSTER_OUTPUT_DIR)
     preview_dir = output_dir / "preview"
@@ -409,22 +433,21 @@ def phase_discover(args):
         import shutil
 
         logger.info("Clearing previous cluster data...")
-        conn.execute("DELETE FROM activity_sessions")
-        conn.execute("DELETE FROM activity_clusters")
-        conn.execute(
-            "UPDATE sub_frames SET activity_cluster_id = NULL, activity_label = NULL, "
-            "provisional_label = NULL, cluster_status = 'pending', frozen_at = NULL, cluster_updated_at = NULL"
-        )
-        conn.commit()
+        act_conn.execute("DELETE FROM activity_sessions")
+        act_conn.execute("DELETE FROM activity_clusters")
+        act_conn.execute("DELETE FROM activity_assignments")
+        act_conn.execute("DELETE FROM pending_groups")
+        act_conn.commit()
 
         if output_dir.exists():
             shutil.rmtree(output_dir)
             logger.info(f"Cleared {output_dir}")
     else:
-        pending_rows = get_pending_unclustered_subframes(conn)
+        pending_rows = get_pending_unclustered_subframes(conn, act_conn)
         if not pending_rows:
             print("No pending unclustered sub_frames found. Discover phase skipped.")
             conn.close()
+            act_conn.close()
             return
         logger.info(f"Incremental discover: {len(pending_rows)} pending sub_frames")
 
@@ -433,6 +456,7 @@ def phase_discover(args):
     if all_sub_df.empty:
         logger.warning("No sub_frames found in LanceDB.")
         conn.close()
+        act_conn.close()
         return
 
     sub_df = all_sub_df
@@ -442,6 +466,7 @@ def phase_discover(args):
         if sub_df.empty:
             print("No pending unclustered sub_frames were found in LanceDB. Discover phase skipped.")
             conn.close()
+            act_conn.close()
             return
 
     # Build embedding map, filtering out solid-color frames
@@ -458,9 +483,9 @@ def phase_discover(args):
         logger.info(f"Skipped {skipped_solid} frames with near-zero embedding norm")
 
     preview_dir.mkdir(parents=True, exist_ok=True)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    existing_clusters = load_existing_clusters(conn)
+    act_conn.row_factory = sqlite3.Row
+    cursor = act_conn.cursor()
+    existing_clusters = load_existing_clusters(act_conn)
     summary_data = {}  # per-app JSON export for newly created clusters only
     affected_apps = set()
 
@@ -499,8 +524,17 @@ def phase_discover(args):
             if best_sim >= args.threshold and best_target is not None:
                 if "id" in best_target:
                     cursor.execute(
-                        "UPDATE sub_frames SET activity_cluster_id = ?, activity_label = ? WHERE sub_frame_id = ?",
-                        (best_target["id"], best_target["label"], fid),
+                        """INSERT INTO activity_assignments
+                        (sub_frame_id, app_name, timestamp, activity_cluster_id, activity_label,
+                         cluster_status, cluster_updated_at)
+                        VALUES (?, ?, ?, ?, ?, 'committed', ?)
+                        ON CONFLICT(sub_frame_id) DO UPDATE SET
+                            activity_cluster_id = excluded.activity_cluster_id,
+                            activity_label = excluded.activity_label,
+                            cluster_status = excluded.cluster_status,
+                            cluster_updated_at = excluded.cluster_updated_at""",
+                        (fid, app_name, row.get("timestamp"), best_target["id"],
+                         best_target["label"], _utcnow()),
                     )
                     assigned_existing += 1
                 else:
@@ -529,9 +563,8 @@ def phase_discover(args):
         existing_count = len(existing)
         valid_idx = existing_count
         for cluster in new_clusters:
-            # Flush previous writes before preview extraction, otherwise
-            # extract_sub_frame_image() may hit SQLite "database is locked".
-            conn.commit()
+            # Flush previous writes before preview extraction
+            act_conn.commit()
             ranked_fids = rank_frames_by_centroid(cluster, embeddings_map)
             if not ranked_fids:
                 continue
@@ -584,25 +617,32 @@ def phase_discover(args):
                 centroid_blob,
                 cluster["count"],
                 json.dumps(valid_rep_ids),
-                datetime.now().isoformat(),
+                _utcnow(),
                 None,
             ))
             cluster_id = cursor.lastrowid
+            now_iso = _utcnow()
             for fid in cluster["frame_ids"]:
+                # Get timestamp from LanceDB data
+                fid_rows = sub_df[sub_df["frame_id"] == fid]
+                fid_ts = fid_rows.iloc[0]["timestamp"] if not fid_rows.empty else None
                 cursor.execute(
                     """
-                    UPDATE sub_frames
-                    SET activity_cluster_id = ?,
-                        activity_label = ?,
-                        provisional_label = ?,
-                        cluster_status = 'committed',
-                        cluster_updated_at = ?,
-                        frozen_at = COALESCE(frozen_at, ?)
-                    WHERE sub_frame_id = ?
+                    INSERT INTO activity_assignments
+                    (sub_frame_id, app_name, timestamp, activity_cluster_id, activity_label,
+                     provisional_label, cluster_status, cluster_updated_at, frozen_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'committed', ?, ?)
+                    ON CONFLICT(sub_frame_id) DO UPDATE SET
+                        activity_cluster_id = excluded.activity_cluster_id,
+                        activity_label = excluded.activity_label,
+                        provisional_label = excluded.provisional_label,
+                        cluster_status = excluded.cluster_status,
+                        cluster_updated_at = excluded.cluster_updated_at,
+                        frozen_at = COALESCE(activity_assignments.frozen_at, excluded.frozen_at)
                     """,
-                    (cluster_id, label, label, datetime.now().isoformat(), datetime.now().isoformat(), fid),
+                    (fid, app_name, fid_ts, cluster_id, label, label, now_iso, now_iso),
                 )
-            conn.commit()
+            act_conn.commit()
 
             print(f"  Cluster {valid_idx}: \"{label}\" ({cluster['count']} frames) [db_id={cluster_id}]")
             for sp in saved_samples:
@@ -632,9 +672,10 @@ def phase_discover(args):
                 continue
             recompute_embeddings_map[row["frame_id"]] = vec
 
-    recompute_centroids_for_apps(conn, recompute_embeddings_map, sorted(affected_apps))
+    recompute_centroids_for_apps(act_conn, recompute_embeddings_map, sorted(affected_apps))
 
-    conn.commit()
+    act_conn.commit()
+    act_conn.close()
     conn.close()
 
     # Write JSON summary
@@ -663,7 +704,7 @@ def _log_vlm_verbose(app_name: str, raw: str, parsed_label: str):
         "app_name": app_name,
         "raw_response": raw,
         "parsed_label": parsed_label,
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": _utcnow(),
     })
     Path(_verbose_log_path).parent.mkdir(parents=True, exist_ok=True)
     with open(_verbose_log_path, "w", encoding="utf-8") as f:
@@ -859,10 +900,9 @@ def phase_label(args):
         print("Error: --vlm-url is required for phase label")
         sys.exit(1)
 
-    sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH)
-    conn = sqlite3.connect(config.OCR_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH, activity_db_path=config.ACTIVITY_DB_PATH)
+    act_conn = get_activity_connection()
+    cursor = act_conn.cursor()
 
     if args.mode == "full":
         cursor.execute("""
@@ -872,7 +912,7 @@ def phase_label(args):
         """)
         reset_count = cursor.rowcount
         if reset_count > 0:
-            conn.commit()
+            act_conn.commit()
             logger.info(f"Reset {reset_count} previously labeled clusters back to pending")
 
     # Incremental mode only labels fallback clusters.
@@ -886,7 +926,7 @@ def phase_label(args):
 
     if not clusters:
         print("No pending clusters found for labeling.")
-        conn.close()
+        act_conn.close()
         return
 
     # Group by app
@@ -962,7 +1002,7 @@ def phase_label(args):
                     target_id = target_row["id"]
                     # Update all references from this cluster to target
                     cursor.execute(
-                        "UPDATE sub_frames SET activity_cluster_id = ?, activity_label = ? WHERE activity_cluster_id = ?",
+                        "UPDATE activity_assignments SET activity_cluster_id = ?, activity_label = ? WHERE activity_cluster_id = ?",
                         (target_id, matched_label, cluster["id"]),
                     )
                     # Merge frame count
@@ -972,7 +1012,7 @@ def phase_label(args):
                     src_count = cursor.fetchone()["frame_count"]
                     cursor.execute(
                         "UPDATE activity_clusters SET frame_count = ?, updated_at = ? WHERE id = ?",
-                        (target_count + src_count, datetime.now().isoformat(), target_id),
+                        (target_count + src_count, _utcnow(), target_id),
                     )
                     # Delete merged cluster
                     cursor.execute("DELETE FROM activity_clusters WHERE id = ?", (cluster["id"],))
@@ -981,10 +1021,10 @@ def phase_label(args):
                     # First cluster with this label — just update
                     cursor.execute(
                         "UPDATE activity_clusters SET label = ?, updated_at = ? WHERE id = ?",
-                        (matched_label, datetime.now().isoformat(), cluster["id"]),
+                        (matched_label, _utcnow(), cluster["id"]),
                     )
                     cursor.execute(
-                        "UPDATE sub_frames SET activity_label = ? WHERE activity_cluster_id = ?",
+                        "UPDATE activity_assignments SET activity_label = ? WHERE activity_cluster_id = ?",
                         (matched_label, cluster["id"]),
                     )
                     print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{matched_label}\"")
@@ -992,17 +1032,17 @@ def phase_label(args):
                 # New label
                 cursor.execute(
                     "UPDATE activity_clusters SET label = ?, updated_at = ? WHERE id = ?",
-                    (label, datetime.now().isoformat(), cluster["id"]),
+                    (label, _utcnow(), cluster["id"]),
                 )
                 cursor.execute(
-                    "UPDATE sub_frames SET activity_label = ? WHERE activity_cluster_id = ?",
+                    "UPDATE activity_assignments SET activity_label = ? WHERE activity_cluster_id = ?",
                     (label, cluster["id"]),
                 )
                 existing.append(label)
                 app_labels[app_name] = existing
                 print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{label}\" [NEW]")
 
-            conn.commit()
+            act_conn.commit()
 
             # Persist label result to JSON immediately, appending within the app section.
             label_results.setdefault(app_name, [])
@@ -1016,7 +1056,7 @@ def phase_label(args):
 
             time.sleep(0.5)  # Rate limit
 
-    conn.close()
+    act_conn.close()
     print(f"\nLabel results saved to: {label_results_path}")
     print("Labeling complete. Review labels, then run --phase timeline")
 
@@ -1026,12 +1066,11 @@ def phase_label(args):
 # ===========================================================================
 
 def phase_timeline(args):
-    """Phase C: build activity sessions from clustered sub_frames."""
-    ensure_tables(config.OCR_DB_PATH)
+    """Phase C: build activity sessions from clustered frames in activity DB."""
+    ensure_tables(config.OCR_DB_PATH, config.ACTIVITY_DB_PATH)
 
-    conn = sqlite3.connect(config.OCR_DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    act_conn = get_activity_connection()
+    cursor = act_conn.cursor()
 
     # Remove stale sessions that point to deleted / non-committed clusters.
     cursor.execute("""
@@ -1045,12 +1084,12 @@ def phase_timeline(args):
     """)
     stale_deleted = cursor.rowcount
     if stale_deleted > 0:
-        conn.commit()
+        act_conn.commit()
         logger.info(f"Deleted {stale_deleted} stale activity_sessions referencing missing/non-committed clusters")
 
     if args.mode == "full":
         cursor.execute("DELETE FROM activity_sessions")
-        conn.commit()
+        act_conn.commit()
 
     print("\n=== Activity Timeline ===")
     total_sessions = 0
@@ -1059,7 +1098,7 @@ def phase_timeline(args):
     cursor.execute(
         """
         SELECT DISTINCT app_name
-        FROM sub_frames
+        FROM activity_assignments
         WHERE activity_cluster_id IS NOT NULL
           AND cluster_status = 'committed'
           AND app_name IS NOT NULL
@@ -1070,8 +1109,8 @@ def phase_timeline(args):
     app_names = [row["app_name"] for row in cursor.fetchall()]
 
     if not app_names:
-        print("No clustered sub_frames found. Run --phase discover first.")
-        conn.close()
+        print("No clustered frames found. Run --phase discover first.")
+        act_conn.close()
         return
 
     for app_name in app_names:
@@ -1093,7 +1132,7 @@ def phase_timeline(args):
                 cursor.execute(
                     """
                     SELECT MIN(timestamp) AS min_ts
-                    FROM sub_frames
+                    FROM activity_assignments
                     WHERE app_name = ?
                       AND activity_cluster_id IS NOT NULL
                       AND cluster_status = 'committed'
@@ -1106,7 +1145,7 @@ def phase_timeline(args):
                 cursor.execute(
                     """
                     SELECT COUNT(*) AS cnt
-                    FROM sub_frames
+                    FROM activity_assignments
                     WHERE app_name = ?
                       AND activity_cluster_id IS NOT NULL
                       AND cluster_status = 'committed'
@@ -1121,7 +1160,7 @@ def phase_timeline(args):
             cursor.execute(
                 """
                 SELECT MIN(timestamp) AS min_ts
-                FROM sub_frames
+                FROM activity_assignments
                 WHERE app_name = ?
                   AND activity_cluster_id IS NOT NULL
                   AND cluster_status = 'committed'
@@ -1142,7 +1181,7 @@ def phase_timeline(args):
         cursor.execute(
             """
             SELECT sub_frame_id, timestamp, activity_cluster_id, activity_label
-            FROM sub_frames
+            FROM activity_assignments
             WHERE app_name = ?
               AND activity_cluster_id IS NOT NULL
               AND cluster_status = 'committed'
@@ -1208,11 +1247,11 @@ def phase_timeline(args):
                 end_str = str(end)[11:16]
             print(f"  [{start_str} - {end_str}] {app}: {clabel} ({count} frames)")
 
-    conn.commit()
-    conn.close()
+    act_conn.commit()
+    act_conn.close()
     print(f"\nProcessed apps: {apps_processed}")
     print(f"Total sessions written: {total_sessions}")
-    print("Timeline built. Check activity_sessions table.")
+    print("Timeline built. Check activity_sessions table in activity DB.")
 
 
 # ===========================================================================
@@ -1241,7 +1280,7 @@ def main():
     args = parser.parse_args()
 
     # Ensure tables exist
-    ensure_tables(config.OCR_DB_PATH)
+    ensure_tables(config.OCR_DB_PATH, config.ACTIVITY_DB_PATH)
 
     if args.phase == "discover" or args.phase == "all":
         phase_discover(args)

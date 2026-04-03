@@ -112,6 +112,8 @@ def find_dead_entries(db_path: str, since: str | None = None):
 
     # ------------------------------------------------------------------
     # 2. Frames with direct image_path (no video chunk) where file missing
+    #    Skip virtual refs like "window_chunk:X:Y" / "video_chunk:X:Y"
+    #    — those are backed by chunk MP4s, not filesystem paths.
     # ------------------------------------------------------------------
     cur.execute(
         f"SELECT frame_id, image_path FROM frames "
@@ -119,7 +121,13 @@ def find_dead_entries(db_path: str, since: str | None = None):
         since_args,
     )
     for row in cur.fetchall():
-        if row["image_path"] and not os.path.exists(row["image_path"]):
+        path = row["image_path"]
+        if not path:
+            continue
+        # Virtual chunk references are valid — skip them
+        if path.startswith("window_chunk:") or path.startswith("video_chunk:"):
+            continue
+        if not os.path.exists(path):
             dead_frame_ids.add(row["frame_id"])
 
     # ------------------------------------------------------------------

@@ -49,6 +49,11 @@ class Config:
         "OCR_DB_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_ocr.db"),
     )
+    # Activity clustering database (separate DB to avoid write lock contention with capture pipeline)
+    ACTIVITY_DB_PATH = os.environ.get(
+        "ACTIVITY_DB_PATH",
+        os.path.join(STORAGE_ROOT, "visualmem_activity.db"),
+    )
     # Text index LanceDB path (can be automatically redirected by BENCHMARK_NAME)
     TEXT_LANCEDB_PATH = os.environ.get(
         "TEXT_LANCEDB_PATH",
@@ -199,6 +204,10 @@ class Config:
         OCR_DB_PATH = os.environ.get(
             "OCR_DB_PATH",
             os.path.join(_benchmark_dir, "ocr.db"),
+        )
+        ACTIVITY_DB_PATH = os.environ.get(
+            "ACTIVITY_DB_PATH",
+            os.path.join(_benchmark_dir, "activity.db"),
         )
         TEXT_LANCEDB_PATH = os.environ.get(
             "TEXT_LANCEDB_PATH",

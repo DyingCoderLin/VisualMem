@@ -9,6 +9,13 @@ Online flow:
     enough support.
   - Historical timeline stability is preserved by freezing older committed
     assignments instead of routinely reclustering the full app history.
+
+Database split:
+  - All activity data (activity_assignments, activity_clusters, activity_sessions,
+    pending_groups) lives in a separate activity DB to avoid write lock contention
+    with the main capture pipeline.
+  - The main DB (frames, sub_frames, ocr_text) is only accessed read-only by
+    this module (for OCR text lookup and image extraction during recalculate).
 """
 
 import json
@@ -16,7 +23,7 @@ import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -25,6 +32,11 @@ from config import config
 from utils.logger import setup_logger
 
 logger = setup_logger("activity.cluster_manager")
+
+
+def _utcnow() -> str:
+    """Current UTC time as naive ISO string, matching frames/sub_frames format."""
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')
 
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -44,12 +56,16 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 
 @dataclass
 class PendingEntry:
-    """A 'leader' frame awaiting VLM label, plus followers that matched it."""
+    """A 'leader' frame awaiting VLM label, plus followers that matched it.
+    Now backed by a persistent pending_groups row in the activity DB."""
+    group_id: int                          # pending_groups.id (DB-persisted)
     leader_frame_id: str
     app_name: str
     embedding: np.ndarray
-    label: Optional[str] = None          # filled once VLM returns
-    candidate_id: Optional[int] = None   # filled once candidate cluster created
+    label: Optional[str] = None            # filled once VLM returns
+    candidate_id: Optional[int] = None     # filled once candidate cluster created
+    # In-memory follower tracking for the current session only.
+    # DB followers are resolved via pending_group_id in activity_assignments.
     follower_ids: List[str] = field(default_factory=list)
     follower_embeddings: List[np.ndarray] = field(default_factory=list)
     follower_timestamps: List[Optional[str]] = field(default_factory=list)
@@ -58,10 +74,15 @@ class PendingEntry:
 
 
 class ClusterManager:
-    """Manage committed/candidate activity clusters for online assignment."""
+    """Manage committed/candidate activity clusters for online assignment.
 
-    def __init__(self, db_path: str, threshold: float = None):
-        self.db_path = db_path
+    Uses a separate activity DB for all writes to avoid lock contention with
+    the capture pipeline writing to the main DB.
+    """
+
+    def __init__(self, activity_db_path: str = None, main_db_path: str = None, threshold: float = None):
+        self.activity_db_path = activity_db_path or config.ACTIVITY_DB_PATH
+        self.main_db_path = main_db_path or config.OCR_DB_PATH
         self.threshold = threshold or config.CLUSTER_SIMILARITY_THRESHOLD
         self.strong_assignment_threshold = config.CLUSTER_STRONG_ASSIGNMENT_THRESHOLD
         self.candidate_threshold = config.CLUSTER_CANDIDATE_SIMILARITY_THRESHOLD
@@ -73,6 +94,7 @@ class ClusterManager:
         # {app_name: [(cluster_id, label, centroid_vec), ...]} committed only
         self._cache: Dict[str, List[Tuple[int, str, np.ndarray]]] = {}
         self._lock = threading.Lock()
+        self._recalc_lock = threading.Lock()
         self._recalc_running = False
         # Assignment statistics
         self._total_frames: int = 0
@@ -84,21 +106,38 @@ class ClusterManager:
         self._vlm_circuit_open_until: float = 0.0  # monotonic time
         self._vlm_circuit_max_failures: int = 3
         self._vlm_circuit_cooldown: float = 60.0  # seconds
+        # Rate-limit recalculate to avoid hot loops
+        self._last_recalc_time: float = 0.0  # monotonic time
+        self._recalc_min_interval: float = 10.0  # seconds between recalcs (normal)
+        self._recalc_min_interval_circuit_open: float = 60.0  # seconds when VLM circuit is open
         self._load_centroids()
+        self._rebuild_pending_pool_from_db()
 
     # ------------------------------------------------------------------
-    # Cache management
+    # Connection helpers
     # ------------------------------------------------------------------
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10)
+        """Connect to the activity DB (for all writes)."""
+        conn = sqlite3.connect(self.activity_db_path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
+    def _connect_main_readonly(self) -> sqlite3.Connection:
+        """Connect to the main DB (read-only, for OCR text / image extraction)."""
+        conn = sqlite3.connect(f"file:{self.main_db_path}?mode=ro", uri=True, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    # ------------------------------------------------------------------
+    # Cache management
+    # ------------------------------------------------------------------
+
     def _load_centroids(self):
-        """Load committed cluster centroids from SQLite into memory."""
+        """Load committed cluster centroids from activity DB into memory."""
         cache: Dict[str, List[Tuple[int, str, np.ndarray]]] = {}
         try:
             conn = self._connect()
@@ -149,6 +188,43 @@ class ClusterManager:
                     self._cache[app] = new_entries[app]
                 else:
                     self._cache.pop(app, None)
+
+    # ------------------------------------------------------------------
+    # Pending pool persistence
+    # ------------------------------------------------------------------
+
+    def _rebuild_pending_pool_from_db(self):
+        """Rebuild in-memory pending pool from persistent pending_groups table."""
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, app_name, leader_frame_id, centroid, resolved_label, resolved_cluster_id "
+                "FROM pending_groups WHERE resolved_label IS NULL"
+            )
+            pool: Dict[str, List[PendingEntry]] = {}
+            count = 0
+            for row in cursor.fetchall():
+                centroid_blob = row["centroid"]
+                if not centroid_blob:
+                    continue
+                entry = PendingEntry(
+                    group_id=row["id"],
+                    leader_frame_id=row["leader_frame_id"],
+                    app_name=row["app_name"],
+                    embedding=_normalize(np.frombuffer(centroid_blob, dtype=np.float32).copy()),
+                    label=row["resolved_label"],
+                    candidate_id=row["resolved_cluster_id"],
+                )
+                pool.setdefault(row["app_name"], []).append(entry)
+                count += 1
+            conn.close()
+            with self._lock:
+                self._pending_pool = pool
+            if count > 0:
+                logger.info(f"Rebuilt pending pool from DB: {count} unresolved groups")
+        except Exception as e:
+            logger.warning(f"Failed to rebuild pending pool: {e}")
 
     # ------------------------------------------------------------------
     # Label helpers
@@ -212,42 +288,78 @@ class ClusterManager:
         self._vlm_call_succeeded()
         return fuzzy_match_label(label, existing_labels) or label
 
+    def _label_unknown_frame_with_labels(
+        self,
+        app_name: str,
+        image,
+        ocr_text: str,
+        existing_labels: List[str],
+    ) -> Optional[str]:
+        """Like _label_unknown_frame but takes pre-fetched labels (no DB needed)."""
+        from core.activity.vlm_labeler import call_vlm, fuzzy_match_label
+
+        vlm_url = config.CLUSTER_VLM_URL
+        if not vlm_url or image is None:
+            return None
+        if self._is_vlm_circuit_open():
+            return None
+
+        label = call_vlm(vlm_url, app_name, image, existing_labels, ocr_text)
+        if not label:
+            self._vlm_call_failed()
+            return None
+        self._vlm_call_succeeded()
+        return fuzzy_match_label(label, existing_labels) or label
+
     # ------------------------------------------------------------------
-    # Cluster updates
+    # Activity assignment (writes to activity_assignments in activity DB)
     # ------------------------------------------------------------------
 
     def _assign_sub_frame(
         self,
         conn: sqlite3.Connection,
         frame_id: str,
+        app_name: str,
+        timestamp: Optional[str],
         cluster_id: Optional[int],
         activity_label: Optional[str],
         provisional_label: Optional[str],
         cluster_status: str,
         cluster_updated_at: Optional[str] = None,
+        pending_group_id: Optional[int] = None,
     ):
         cursor = conn.cursor()
         cursor.execute(
             """
-            UPDATE sub_frames
-            SET activity_cluster_id = ?,
-                activity_label = ?,
-                provisional_label = ?,
-                cluster_status = ?,
-                cluster_updated_at = ?,
+            INSERT INTO activity_assignments
+            (sub_frame_id, app_name, timestamp, activity_cluster_id, activity_label,
+             provisional_label, cluster_status, cluster_updated_at, pending_group_id,
+             frozen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            ON CONFLICT(sub_frame_id) DO UPDATE SET
+                activity_cluster_id = excluded.activity_cluster_id,
+                activity_label = excluded.activity_label,
+                provisional_label = excluded.provisional_label,
+                cluster_status = excluded.cluster_status,
+                cluster_updated_at = excluded.cluster_updated_at,
+                pending_group_id = excluded.pending_group_id,
                 frozen_at = CASE
-                    WHEN cluster_status = 'committed' AND (frozen_at IS NULL OR frozen_at = '') THEN NULL
-                    ELSE frozen_at
+                    WHEN excluded.cluster_status = 'committed'
+                         AND (activity_assignments.frozen_at IS NULL OR activity_assignments.frozen_at = '')
+                    THEN NULL
+                    ELSE activity_assignments.frozen_at
                 END
-            WHERE sub_frame_id = ?
             """,
             (
+                frame_id,
+                app_name,
+                timestamp,
                 cluster_id,
                 activity_label,
                 provisional_label,
                 cluster_status,
-                cluster_updated_at or datetime.now().isoformat(),
-                frame_id,
+                cluster_updated_at or _utcnow(),
+                pending_group_id,
             ),
         )
 
@@ -269,8 +381,8 @@ class ClusterManager:
             """,
             (
                 updated.astype(np.float32).tobytes(),
-                datetime.now().isoformat(),
-                timestamp or datetime.now().isoformat(),
+                _utcnow(),
+                timestamp or _utcnow(),
                 cluster_id,
             ),
         )
@@ -333,7 +445,7 @@ class ClusterManager:
         app_name: str,
         embedding: np.ndarray,
     ) -> Tuple[float, Optional[int], Optional[str]]:
-        """Find the best matching candidate cluster by embedding similarity alone (no label match required)."""
+        """Find the best matching candidate cluster by embedding similarity alone."""
         cursor = conn.cursor()
         cursor.execute(
             """
@@ -355,8 +467,13 @@ class ClusterManager:
                 best_label = row["label"]
         return best_sim, best_id, best_label
 
+    # ------------------------------------------------------------------
+    # Pending group management (persistent)
+    # ------------------------------------------------------------------
+
     def _find_or_create_pending_leader(
         self,
+        conn: sqlite3.Connection,
         app_name: str,
         frame_id: str,
         embedding: np.ndarray,
@@ -366,7 +483,6 @@ class ClusterManager:
         Returns (entry, is_new_leader):
             - (existing_entry, False) if a similar leader was found
             - (new_entry, True) if this frame becomes a new leader
-            - (None, False) if pending pool is not applicable
         """
         with self._lock:
             now = time.monotonic()
@@ -382,16 +498,76 @@ class ClusterManager:
                     best_entry = entry
             if best_sim >= self.pending_sim_threshold and best_entry is not None:
                 return best_entry, False
-            # No match — atomically create a new leader
-            new_entry = PendingEntry(
-                leader_frame_id=frame_id,
-                app_name=app_name,
-                embedding=embedding,
-            )
-            self._pending_pool.setdefault(app_name, []).append(new_entry)
-            return new_entry, True
 
-    def _resolve_pending_followers(
+        # Also check DB pending_groups (for groups from previous sessions)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, leader_frame_id, centroid FROM pending_groups "
+                "WHERE app_name = ? AND resolved_label IS NULL",
+                (app_name,),
+            )
+            for row in cursor.fetchall():
+                centroid_blob = row["centroid"]
+                if not centroid_blob:
+                    continue
+                centroid = _normalize(np.frombuffer(centroid_blob, dtype=np.float32).copy())
+                sim = _cosine_similarity(embedding, centroid)
+                if sim >= self.pending_sim_threshold and sim > best_sim:
+                    best_sim = sim
+                    # Wrap as PendingEntry and add to in-memory pool
+                    best_entry = PendingEntry(
+                        group_id=row["id"],
+                        leader_frame_id=row["leader_frame_id"],
+                        app_name=app_name,
+                        embedding=centroid,
+                    )
+                    with self._lock:
+                        self._pending_pool.setdefault(app_name, []).append(best_entry)
+            if best_entry is not None and best_sim >= self.pending_sim_threshold:
+                return best_entry, False
+        except Exception as e:
+            logger.debug(f"DB pending group lookup failed: {e}")
+
+        # No match — create a new leader with persistent group
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO pending_groups (app_name, leader_frame_id, centroid, member_count, created_at, updated_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            """,
+            (app_name, frame_id, _normalize(embedding).tobytes(),
+             _utcnow(), _utcnow()),
+        )
+        group_id = cursor.lastrowid
+
+        new_entry = PendingEntry(
+            group_id=group_id,
+            leader_frame_id=frame_id,
+            app_name=app_name,
+            embedding=embedding,
+        )
+        with self._lock:
+            self._pending_pool.setdefault(app_name, []).append(new_entry)
+        return new_entry, True
+
+    def _add_follower_to_group(self, conn: sqlite3.Connection, group_id: int, embedding: np.ndarray):
+        """Update pending_groups: increment member_count and EMA centroid."""
+        cursor = conn.cursor()
+        cursor.execute("SELECT centroid, member_count FROM pending_groups WHERE id = ?", (group_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        old_centroid = np.frombuffer(row["centroid"], dtype=np.float32).copy()
+        # EMA with small alpha to keep centroid stable
+        alpha = 0.02
+        new_centroid = _normalize((1.0 - alpha) * old_centroid + alpha * _normalize(embedding))
+        cursor.execute(
+            "UPDATE pending_groups SET centroid = ?, member_count = member_count + 1, updated_at = ? WHERE id = ?",
+            (new_centroid.tobytes(), _utcnow(), group_id),
+        )
+
+    def _resolve_pending_group(
         self,
         conn: sqlite3.Connection,
         entry: PendingEntry,
@@ -399,38 +575,67 @@ class ClusterManager:
         candidate_id: int,
         timestamp: Optional[str],
     ):
-        """Assign all followers of a resolved leader to the same candidate cluster."""
+        """Resolve a pending group: assign label to leader and all DB followers."""
         entry.label = label
         entry.candidate_id = candidate_id
+
+        # Mark group as resolved in DB
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE pending_groups SET resolved_label = ?, resolved_cluster_id = ?, updated_at = ? WHERE id = ?",
+            (label, candidate_id, _utcnow(), entry.group_id),
+        )
+
+        # Resolve all DB followers (frames with pending_group_id pointing to this group)
+        cursor.execute(
+            "SELECT sub_frame_id, timestamp FROM activity_assignments "
+            "WHERE pending_group_id = ? AND cluster_status = 'pending'",
+            (entry.group_id,),
+        )
+        db_followers = cursor.fetchall()
+        if db_followers:
+            logger.info(
+                f"Pending group resolving: leader={entry.leader_frame_id} app={entry.app_name} "
+                f"label='{label}' -> {len(db_followers)} DB followers"
+            )
+        for frow in db_followers:
+            fid = frow["sub_frame_id"]
+            fts = frow["timestamp"]
+            cursor.execute(
+                """
+                UPDATE activity_assignments
+                SET activity_cluster_id = ?, activity_label = ?, provisional_label = ?,
+                    cluster_status = 'candidate', cluster_updated_at = ?, pending_group_id = NULL
+                WHERE sub_frame_id = ?
+                """,
+                (candidate_id, label, label, fts or _utcnow(), fid),
+            )
+            self._upsert_activity_session(
+                conn, app_name=entry.app_name, cluster_id=candidate_id,
+                label=label, session_status="candidate", timestamp=fts,
+            )
+
+        # Also resolve in-memory followers
         if entry.follower_ids:
             logger.info(
-                f"Pending pool resolving: leader={entry.leader_frame_id} app={entry.app_name} "
-                f"label='{label}' -> {len(entry.follower_ids)} followers"
+                f"Pending group resolving: leader={entry.leader_frame_id} app={entry.app_name} "
+                f"label='{label}' -> {len(entry.follower_ids)} in-memory followers"
             )
         for fid, femb, fts, fwin in zip(
-            entry.follower_ids,
-            entry.follower_embeddings,
-            entry.follower_timestamps,
-            entry.follower_window_names,
+            entry.follower_ids, entry.follower_embeddings,
+            entry.follower_timestamps, entry.follower_window_names,
         ):
             self._assign_sub_frame(
-                conn,
-                frame_id=fid,
-                cluster_id=candidate_id,
-                activity_label=label,
-                provisional_label=label,
-                cluster_status="candidate",
+                conn, frame_id=fid, app_name=entry.app_name, timestamp=fts,
+                cluster_id=candidate_id, activity_label=label,
+                provisional_label=label, cluster_status="candidate",
                 cluster_updated_at=fts,
             )
             self._upsert_activity_session(
-                conn,
-                app_name=entry.app_name,
-                cluster_id=candidate_id,
-                label=label,
-                session_status="candidate",
-                timestamp=fts,
+                conn, app_name=entry.app_name, cluster_id=candidate_id,
+                label=label, session_status="candidate", timestamp=fts,
             )
-            logger.debug(f"Pending follower {fid} assigned to cluster {candidate_id} label='{label}'")
+
         self._refresh_cluster_metadata(conn, candidate_id)
         self._maybe_promote_candidate_cluster(conn, candidate_id)
 
@@ -468,9 +673,9 @@ class ClusterManager:
                 _normalize(embedding).tobytes(),
                 0,
                 json.dumps([frame_id]),
-                timestamp or datetime.now().isoformat(),
-                datetime.now().isoformat(),
-                datetime.now().isoformat(),
+                timestamp or _utcnow(),
+                _utcnow(),
+                _utcnow(),
             ),
         )
         return cursor.lastrowid
@@ -480,7 +685,7 @@ class ClusterManager:
         cursor.execute(
             """
             SELECT sub_frame_id, cluster_updated_at
-            FROM sub_frames
+            FROM activity_assignments
             WHERE activity_cluster_id = ?
             ORDER BY cluster_updated_at DESC, timestamp DESC
             """,
@@ -499,7 +704,7 @@ class ClusterManager:
                 len(frame_ids),
                 json.dumps(frame_ids[:3]),
                 last_ts,
-                datetime.now().isoformat(),
+                _utcnow(),
                 cluster_id,
             ),
         )
@@ -515,7 +720,7 @@ class ClusterManager:
     ):
         if not app_name or cluster_id is None or not label:
             return
-        timestamp = timestamp or datetime.now().isoformat()
+        timestamp = timestamp or _utcnow()
 
         cursor = conn.cursor()
         cursor.execute(
@@ -580,14 +785,14 @@ class ClusterManager:
         if not row:
             return
         cursor.execute(
-            "SELECT COUNT(*) AS cnt FROM sub_frames WHERE activity_cluster_id = ?",
+            "SELECT COUNT(*) AS cnt FROM activity_assignments WHERE activity_cluster_id = ?",
             (cluster_id,),
         )
         count = cursor.fetchone()["cnt"]
         if count < self.candidate_promotion_count:
             return
 
-        now = datetime.now().isoformat()
+        now = _utcnow()
         cursor.execute(
             """
             UPDATE activity_clusters
@@ -601,7 +806,7 @@ class ClusterManager:
         )
         cursor.execute(
             """
-            UPDATE sub_frames
+            UPDATE activity_assignments
             SET cluster_status = 'committed',
                 activity_label = COALESCE(activity_label, provisional_label),
                 provisional_label = COALESCE(provisional_label, activity_label),
@@ -614,18 +819,18 @@ class ClusterManager:
         logger.info(f"Promoted candidate cluster {cluster_id} ({row['app_name']}/{row['label']}) to committed")
 
     def _freeze_old_committed_frames(self, conn: sqlite3.Connection, app_name: str):
-        freeze_before = (datetime.now() - self.freeze_window).isoformat()
+        freeze_before = (datetime.now(timezone.utc).replace(tzinfo=None) - self.freeze_window).isoformat()
         cursor = conn.cursor()
         cursor.execute(
             """
-            UPDATE sub_frames
+            UPDATE activity_assignments
             SET frozen_at = COALESCE(frozen_at, ?)
             WHERE app_name = ?
               AND cluster_status = 'committed'
               AND timestamp <= ?
               AND (frozen_at IS NULL OR frozen_at = '')
             """,
-            (datetime.now().isoformat(), app_name, freeze_before),
+            (_utcnow(), app_name, freeze_before),
         )
 
     def _load_embeddings_for_apps(
@@ -679,21 +884,14 @@ class ClusterManager:
 
             if best_sim >= self.threshold and best_cluster_id is not None and best_label is not None:
                 self._assign_sub_frame(
-                    conn,
-                    frame_id=frame_id,
-                    cluster_id=best_cluster_id,
-                    activity_label=best_label,
-                    provisional_label=best_label,
-                    cluster_status="committed",
+                    conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                    cluster_id=best_cluster_id, activity_label=best_label,
+                    provisional_label=best_label, cluster_status="committed",
                     cluster_updated_at=timestamp,
                 )
                 self._upsert_activity_session(
-                    conn,
-                    app_name=app_name,
-                    cluster_id=best_cluster_id,
-                    label=best_label,
-                    session_status="committed",
-                    timestamp=timestamp,
+                    conn, app_name=app_name, cluster_id=best_cluster_id,
+                    label=best_label, session_status="committed", timestamp=timestamp,
                 )
                 if best_centroid is not None and best_sim >= self.strong_assignment_threshold:
                     self._update_centroid_ema(conn, best_cluster_id, best_centroid, embedding, timestamp)
@@ -702,7 +900,7 @@ class ClusterManager:
                 conn.close()
                 return best_label
 
-            # --- Layer 2: candidate clusters (DB, similarity-only, no label match required) ---
+            # --- Layer 2: candidate clusters (DB, similarity-only) ---
             cand_sim, cand_id, cand_label = self._find_any_candidate_by_similarity(conn, app_name, embedding)
             if cand_sim >= self.candidate_threshold and cand_id is not None and cand_label is not None:
                 logger.info(
@@ -710,17 +908,13 @@ class ClusterManager:
                     f"cluster={cand_id} sim={cand_sim:.3f} label='{cand_label}'"
                 )
                 self._assign_sub_frame(
-                    conn,
-                    frame_id=frame_id,
-                    cluster_id=cand_id,
-                    activity_label=cand_label,
-                    provisional_label=cand_label,
-                    cluster_status="candidate",
+                    conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                    cluster_id=cand_id, activity_label=cand_label,
+                    provisional_label=cand_label, cluster_status="candidate",
                     cluster_updated_at=timestamp,
                 )
                 self._refresh_cluster_metadata(conn, cand_id)
                 self._maybe_promote_candidate_cluster(conn, cand_id)
-                # Re-read status in case promotion happened
                 cursor = conn.cursor()
                 cursor.execute(
                     "SELECT cluster_status, label FROM activity_clusters WHERE id = ?",
@@ -730,12 +924,8 @@ class ClusterManager:
                 session_status = cluster_row["cluster_status"] if cluster_row else "candidate"
                 session_label = cluster_row["label"] if cluster_row and cluster_row["label"] else cand_label
                 self._upsert_activity_session(
-                    conn,
-                    app_name=app_name,
-                    cluster_id=cand_id,
-                    label=session_label,
-                    session_status=session_status,
-                    timestamp=timestamp,
+                    conn, app_name=app_name, cluster_id=cand_id,
+                    label=session_label, session_status=session_status, timestamp=timestamp,
                 )
                 self._freeze_old_committed_frames(conn, app_name)
                 conn.commit()
@@ -743,13 +933,12 @@ class ClusterManager:
                 self._load_centroids_for_apps({app_name})
                 return cand_label
 
-            # --- Layer 3+4: pending pool (atomic find-or-create) + VLM ---
+            # --- Layer 3+4: pending pool (persistent) + VLM ---
             pending_entry, is_new_leader = self._find_or_create_pending_leader(
-                app_name, frame_id, embedding,
+                conn, app_name, frame_id, embedding,
             )
 
             if not is_new_leader and pending_entry is not None:
-                # Matched an existing leader
                 if pending_entry.label is not None and pending_entry.candidate_id is not None:
                     # Leader already resolved — use its label directly
                     logger.info(
@@ -757,23 +946,16 @@ class ClusterManager:
                         f"frame={frame_id} -> label='{pending_entry.label}'"
                     )
                     self._assign_sub_frame(
-                        conn,
-                        frame_id=frame_id,
-                        cluster_id=pending_entry.candidate_id,
-                        activity_label=pending_entry.label,
-                        provisional_label=pending_entry.label,
-                        cluster_status="candidate",
+                        conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                        cluster_id=pending_entry.candidate_id, activity_label=pending_entry.label,
+                        provisional_label=pending_entry.label, cluster_status="candidate",
                         cluster_updated_at=timestamp,
                     )
                     self._refresh_cluster_metadata(conn, pending_entry.candidate_id)
                     self._maybe_promote_candidate_cluster(conn, pending_entry.candidate_id)
                     self._upsert_activity_session(
-                        conn,
-                        app_name=app_name,
-                        cluster_id=pending_entry.candidate_id,
-                        label=pending_entry.label,
-                        session_status="candidate",
-                        timestamp=timestamp,
+                        conn, app_name=app_name, cluster_id=pending_entry.candidate_id,
+                        label=pending_entry.label, session_status="candidate", timestamp=timestamp,
                     )
                     conn.commit()
                     conn.close()
@@ -790,22 +972,34 @@ class ClusterManager:
                         pending_entry.follower_embeddings.append(embedding)
                         pending_entry.follower_timestamps.append(timestamp)
                         pending_entry.follower_window_names.append(window_name)
-                    # Mark as pending in DB so it can be resolved later
+                    # Mark as pending in activity DB with group link
                     self._assign_sub_frame(
-                        conn,
-                        frame_id=frame_id,
-                        cluster_id=None,
-                        activity_label=None,
-                        provisional_label=None,
-                        cluster_status="pending",
-                        cluster_updated_at=timestamp,
+                        conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                        cluster_id=None, activity_label=None,
+                        provisional_label=None, cluster_status="pending",
+                        cluster_updated_at=timestamp, pending_group_id=pending_entry.group_id,
                     )
+                    self._add_follower_to_group(conn, pending_entry.group_id, embedding)
                     conn.commit()
                     conn.close()
                     return None
 
-            # This frame is a new leader — call VLM
-            leader_entry = pending_entry  # was just created by _find_or_create_pending_leader
+            # This frame is a new leader — call VLM (or defer if circuit is open)
+            leader_entry = pending_entry
+            # Mark leader as pending in DB with group link
+            self._assign_sub_frame(
+                conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                cluster_id=None, activity_label=None,
+                provisional_label=None, cluster_status="pending",
+                cluster_updated_at=timestamp, pending_group_id=leader_entry.group_id,
+            )
+
+            # If VLM circuit is open, just persist as pending — recalculate will handle it later
+            if self._is_vlm_circuit_open():
+                conn.commit()
+                conn.close()
+                return None
+
             with self._lock:
                 self._vlm_called_frames += 1
 
@@ -814,16 +1008,7 @@ class ClusterManager:
             if provisional_label:
                 logger.info(f"VLM label result: app={app_name}{_win} -> \"{provisional_label}\"")
             if not provisional_label:
-                # VLM failed — mark leader and keep followers pending
-                self._assign_sub_frame(
-                    conn,
-                    frame_id=frame_id,
-                    cluster_id=None,
-                    activity_label=None,
-                    provisional_label=None,
-                    cluster_status="pending",
-                    cluster_updated_at=timestamp,
-                )
+                # VLM failed — frame stays pending in its group
                 conn.commit()
                 conn.close()
                 return None
@@ -835,22 +1020,15 @@ class ClusterManager:
 
             # Assign leader frame
             self._assign_sub_frame(
-                conn,
-                frame_id=frame_id,
-                cluster_id=candidate_id,
-                activity_label=provisional_label,
-                provisional_label=provisional_label,
-                cluster_status="candidate",
-                cluster_updated_at=timestamp,
+                conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
+                cluster_id=candidate_id, activity_label=provisional_label,
+                provisional_label=provisional_label, cluster_status="candidate",
+                cluster_updated_at=timestamp, pending_group_id=None,
             )
 
-            # Resolve all followers waiting on this leader
-            leader_entry.label = provisional_label
-            leader_entry.candidate_id = candidate_id
-            self._resolve_pending_followers(conn, leader_entry, provisional_label, candidate_id, timestamp)
+            # Resolve all followers in the group
+            self._resolve_pending_group(conn, leader_entry, provisional_label, candidate_id, timestamp)
 
-            self._refresh_cluster_metadata(conn, candidate_id)
-            self._maybe_promote_candidate_cluster(conn, candidate_id)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT cluster_status, label FROM activity_clusters WHERE id = ?",
@@ -860,19 +1038,14 @@ class ClusterManager:
             session_status = cluster_row["cluster_status"] if cluster_row else "candidate"
             session_label = cluster_row["label"] if cluster_row and cluster_row["label"] else provisional_label
             self._upsert_activity_session(
-                conn,
-                app_name=app_name,
-                cluster_id=candidate_id,
-                label=session_label,
-                session_status=session_status,
-                timestamp=timestamp,
+                conn, app_name=app_name, cluster_id=candidate_id,
+                label=session_label, session_status=session_status, timestamp=timestamp,
             )
             self._freeze_old_committed_frames(conn, app_name)
             conn.commit()
             conn.close()
 
             self._load_centroids_for_apps({app_name})
-            # Periodic cleanup of expired pending entries
             self._cleanup_pending_pool()
             return provisional_label
         except Exception as e:
@@ -891,7 +1064,7 @@ class ClusterManager:
             cursor.execute(
                 """
                 SELECT app_name, cluster_status, COUNT(*) AS pending_count
-                FROM sub_frames
+                FROM activity_assignments
                 WHERE app_name IS NOT NULL AND app_name != ''
                   AND cluster_status IN ('pending', 'candidate')
                 GROUP BY app_name, cluster_status
@@ -905,6 +1078,41 @@ class ClusterManager:
             logger.warning(f"Failed to load non-committed counts: {e}")
         return counts
 
+    def _get_pending_group_counts(self) -> Dict[str, int]:
+        """Return number of unresolved pending groups per app."""
+        counts: Dict[str, int] = {}
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT app_name, COUNT(*) AS cnt FROM pending_groups "
+                "WHERE resolved_label IS NULL GROUP BY app_name"
+            )
+            for row in cursor.fetchall():
+                counts[row["app_name"]] = row["cnt"]
+            conn.close()
+        except Exception:
+            pass
+        return counts
+
+    def _has_ungrouped_pending_frames(self, apps: Set[str]) -> bool:
+        """Check if there are pending frames not yet assigned to a group."""
+        try:
+            conn = self._connect()
+            cursor = conn.cursor()
+            placeholders = ",".join("?" for _ in apps)
+            cursor.execute(
+                f"SELECT COUNT(*) AS cnt FROM activity_assignments "
+                f"WHERE cluster_status = 'pending' AND pending_group_id IS NULL "
+                f"AND app_name IN ({placeholders})",
+                list(apps),
+            )
+            count = cursor.fetchone()["cnt"]
+            conn.close()
+            return count > 0
+        except Exception:
+            return False
+
     def get_apps_needing_recalc(self) -> Set[str]:
         trigger = config.CLUSTER_UNCLASSIFIED_TRIGGER
         counts = self._get_non_committed_counts_from_db()
@@ -915,6 +1123,7 @@ class ClusterManager:
 
     def get_debug_status(self, app_name: Optional[str] = None) -> Dict:
         counts = self._get_non_committed_counts_from_db()
+        group_counts = self._get_pending_group_counts()
         trigger = config.CLUSTER_UNCLASSIFIED_TRIGGER
 
         with self._lock:
@@ -927,9 +1136,12 @@ class ClusterManager:
         apps = []
         for name in sorted(app_names):
             per_status = counts.get(name, {"pending": 0, "candidate": 0})
+            pending_groups = group_counts.get(name, 0)
             apps.append({
                 "app_name": name,
                 "pending_unclassified": per_status.get("pending", 0),
+                "pending_groups": pending_groups,
+                "vlm_calls_needed": pending_groups,
                 "candidate_frames": per_status.get("candidate", 0),
                 "committed_cluster_count": committed_cache_counts.get(name, 0),
                 "threshold": trigger,
@@ -964,14 +1176,34 @@ class ClusterManager:
             self._vlm_called_frames = 0
 
     def should_recalculate(self) -> bool:
-        if self._recalc_running:
+        # Use lock to prevent concurrent recalculate
+        if not self._recalc_lock.acquire(blocking=False):
             return False
-        return bool(self.get_apps_needing_recalc())
+        try:
+            if self._recalc_running:
+                return False
+            # Rate-limit: enforce minimum interval between recalculate runs
+            now = time.monotonic()
+            circuit_open = self._is_vlm_circuit_open()
+            min_interval = self._recalc_min_interval_circuit_open if circuit_open else self._recalc_min_interval
+            if now - self._last_recalc_time < min_interval:
+                return False
+            apps = self.get_apps_needing_recalc()
+            if not apps:
+                return False
+            if circuit_open:
+                # Only recalc if there are truly ungrouped pending frames to group
+                return self._has_ungrouped_pending_frames(apps)
+            return True
+        finally:
+            self._recalc_lock.release()
 
     def recalculate(self, lancedb_table):
-        if self._recalc_running:
-            return
-        self._recalc_running = True
+        with self._recalc_lock:
+            if self._recalc_running:
+                return
+            self._recalc_running = True
+            self._last_recalc_time = time.monotonic()
         try:
             target_apps = self.get_apps_needing_recalc()
             if not target_apps:
@@ -980,102 +1212,265 @@ class ClusterManager:
         except Exception as e:
             logger.error(f"Cluster recalculation failed: {e}", exc_info=True)
         finally:
-            self._recalc_running = False
+            with self._recalc_lock:
+                self._recalc_running = False
 
     def _do_recalculate(self, lancedb_table, target_apps: Set[str]):
         conn = self._connect()
         cursor = conn.cursor()
-        sqlite_db = None
         affected_apps: Set[str] = set()
-        embeddings_map = self._load_embeddings_for_apps(lancedb_table, target_apps)
 
-        try:
-            # 1. Try to provisionally label pending frames that previously had no image/VLM result.
-            cursor.execute(
-                f"""
-                SELECT sub_frame_id, app_name
-                FROM sub_frames
-                WHERE cluster_status = 'pending'
-                  AND app_name IN ({",".join("?" for _ in target_apps)})
-                ORDER BY timestamp
-                """,
-                list(target_apps),
-            )
-            pending_rows = cursor.fetchall()
-            if pending_rows:
-                from core.storage.sqlite_storage import SQLiteStorage
-                sqlite_db = SQLiteStorage(db_path=self.db_path)
-                logger.info(
-                    f"Recalculate: {len(pending_rows)} pending frames to process "
-                    f"for apps {sorted(target_apps)}"
-                )
+        # --- Phase 0: Expire stale pending frames ---
+        pending_ttl_iso = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=self.pending_ttl)).isoformat()
+        cursor.execute(
+            f"""
+            UPDATE activity_assignments
+            SET cluster_status = 'expired'
+            WHERE cluster_status = 'pending'
+              AND app_name IN ({",".join("?" for _ in target_apps)})
+              AND cluster_updated_at < ?
+            """,
+            list(target_apps) + [pending_ttl_iso],
+        )
+        expired_count = cursor.rowcount
+        if expired_count > 0:
+            conn.commit()
+            logger.info(f"Recalculate: expired {expired_count} stale pending frames (older than {self.pending_ttl}s)")
 
-            vlm_failures_in_batch = 0
-            max_vlm_failures_in_batch = 5  # stop processing if VLM keeps failing
-
-            for row in pending_rows:
-                app_name = row["app_name"]
+        # --- Phase 0.5: Group ungrouped pending frames ---
+        cursor.execute(
+            f"""
+            SELECT sub_frame_id, app_name
+            FROM activity_assignments
+            WHERE cluster_status = 'pending' AND pending_group_id IS NULL
+              AND app_name IN ({",".join("?" for _ in target_apps)})
+            ORDER BY timestamp
+            """,
+            list(target_apps),
+        )
+        ungrouped = cursor.fetchall()
+        if ungrouped:
+            embeddings_map = self._load_embeddings_for_apps(lancedb_table, target_apps)
+            grouped_count = 0
+            new_groups_count = 0
+            for row in ungrouped:
                 frame_id = row["sub_frame_id"]
+                frame_app = row["app_name"]
                 embedding = embeddings_map.get(frame_id)
                 if embedding is None:
                     continue
-                image = sqlite_db.extract_sub_frame_image(frame_id) if sqlite_db is not None else None
-                ocr_text = ""
-                try:
-                    oc = conn.cursor()
-                    oc.execute(
-                        "SELECT text FROM ocr_text WHERE sub_frame_id = ? ORDER BY text_length DESC LIMIT 1",
-                        (frame_id,),
-                    )
-                    r = oc.fetchone()
-                    if r:
-                        ocr_text = r["text"]
-                except Exception:
-                    pass
-                # Stop batch if VLM keeps failing or circuit breaker is open
-                if vlm_failures_in_batch >= max_vlm_failures_in_batch or self._is_vlm_circuit_open():
-                    logger.info(
-                        f"Recalculate: stopping early — VLM circuit open or "
-                        f"{vlm_failures_in_batch} failures in this batch"
-                    )
-                    break
 
-                provisional = self._label_unknown_frame(conn, app_name, image, ocr_text)
-                if not provisional:
-                    vlm_failures_in_batch += 1
-                    continue
-                candidate_id = self._find_matching_candidate_cluster(conn, app_name, provisional, embedding)
-                if candidate_id is None:
-                    candidate_id = self._create_candidate_cluster(conn, app_name, provisional, frame_id, embedding, None)
-                self._assign_sub_frame(
-                    conn,
-                    frame_id=frame_id,
-                    cluster_id=candidate_id,
-                    activity_label=provisional,
-                    provisional_label=provisional,
-                    cluster_status="candidate",
-                )
-                self._refresh_cluster_metadata(conn, candidate_id)
+                # Try to match existing unresolved pending group
+                matched_group_id = None
+                best_sim = -1.0
                 cursor.execute(
-                    "SELECT timestamp FROM sub_frames WHERE sub_frame_id = ?",
-                    (frame_id,),
+                    "SELECT id, centroid FROM pending_groups "
+                    "WHERE app_name = ? AND resolved_label IS NULL",
+                    (frame_app,),
+                )
+                for grow in cursor.fetchall():
+                    centroid = np.frombuffer(grow["centroid"], dtype=np.float32).copy()
+                    sim = _cosine_similarity(embedding, _normalize(centroid))
+                    if sim >= self.pending_sim_threshold and sim > best_sim:
+                        best_sim = sim
+                        matched_group_id = grow["id"]
+
+                if matched_group_id is not None:
+                    cursor.execute(
+                        "UPDATE activity_assignments SET pending_group_id = ? WHERE sub_frame_id = ?",
+                        (matched_group_id, frame_id),
+                    )
+                    self._add_follower_to_group(conn, matched_group_id, embedding)
+                    grouped_count += 1
+                else:
+                    # Create new group
+                    cursor.execute(
+                        "INSERT INTO pending_groups (app_name, leader_frame_id, centroid, member_count, created_at, updated_at) "
+                        "VALUES (?, ?, ?, 1, ?, ?)",
+                        (frame_app, frame_id, _normalize(embedding).tobytes(),
+                         _utcnow(), _utcnow()),
+                    )
+                    new_group_id = cursor.lastrowid
+                    cursor.execute(
+                        "UPDATE activity_assignments SET pending_group_id = ? WHERE sub_frame_id = ?",
+                        (new_group_id, frame_id),
+                    )
+                    new_groups_count += 1
+
+            conn.commit()
+            if grouped_count > 0 or new_groups_count > 0:
+                logger.info(
+                    f"Recalculate: grouped {grouped_count} orphan frames into existing groups, "
+                    f"created {new_groups_count} new groups"
+                )
+
+        # Early exit if VLM circuit breaker is open — grouping is done, VLM labeling deferred
+        if self._is_vlm_circuit_open():
+            # Log group-level stats instead of individual frame counts
+            cursor.execute(
+                f"SELECT COUNT(*) AS cnt FROM pending_groups WHERE resolved_label IS NULL "
+                f"AND app_name IN ({','.join('?' for _ in target_apps)})",
+                list(target_apps),
+            )
+            group_count = cursor.fetchone()["cnt"]
+            cursor.execute(
+                f"SELECT COUNT(*) AS cnt FROM activity_assignments WHERE cluster_status = 'pending' "
+                f"AND app_name IN ({','.join('?' for _ in target_apps)})",
+                list(target_apps),
+            )
+            frame_count = cursor.fetchone()["cnt"]
+            if frame_count > 0:
+                logger.info(
+                    f"Recalculate: {frame_count} pending frames in {group_count} groups "
+                    f"({group_count} VLM calls needed) — VLM circuit open, deferring"
+                )
+            conn.close()
+            return
+
+        # --- Phase 1: VLM label unresolved groups (not individual frames) ---
+        # Close the long-held connection from Phase 0/0.5 before heavy work.
+        # Each VLM call takes seconds; holding a write lock blocks assign_frame.
+        conn.close()
+
+        embeddings_map = self._load_embeddings_for_apps(lancedb_table, target_apps)
+
+        # Pre-fetch unresolved groups with a short-lived connection
+        tmp_conn = self._connect()
+        tmp_cursor = tmp_conn.cursor()
+        tmp_cursor.execute(
+            f"""
+            SELECT id, app_name, leader_frame_id
+            FROM pending_groups
+            WHERE resolved_label IS NULL
+              AND app_name IN ({",".join("?" for _ in target_apps)})
+            ORDER BY created_at
+            """,
+            list(target_apps),
+        )
+        unresolved_groups = [dict(row) for row in tmp_cursor.fetchall()]
+
+        # Pre-fetch existing labels per app (so VLM calls don't need DB)
+        app_existing_labels: Dict[str, List[str]] = {}
+        for app in target_apps:
+            app_existing_labels[app] = self._get_existing_labels(tmp_conn, app)
+
+        if unresolved_groups:
+            tmp_cursor.execute(
+                f"SELECT COUNT(*) AS cnt FROM activity_assignments WHERE cluster_status = 'pending' "
+                f"AND app_name IN ({','.join('?' for _ in target_apps)})",
+                list(target_apps),
+            )
+            total_pending = tmp_cursor.fetchone()["cnt"]
+            logger.info(
+                f"Recalculate: {total_pending} pending frames in {len(unresolved_groups)} groups "
+                f"to process for apps {sorted(target_apps)}"
+            )
+        tmp_conn.close()
+
+        vlm_failures_in_batch = 0
+        max_vlm_failures_in_batch = 5
+        processed_count = 0
+        sqlite_db = None
+
+        for grow in unresolved_groups:
+            if vlm_failures_in_batch >= max_vlm_failures_in_batch or self._is_vlm_circuit_open():
+                logger.info(
+                    f"Recalculate: stopping early — VLM circuit open or "
+                    f"{vlm_failures_in_batch} failures in this batch "
+                    f"(processed {processed_count}/{len(unresolved_groups)} groups)"
+                )
+                break
+
+            group_id = grow["id"]
+            group_app = grow["app_name"]
+            leader_id = grow["leader_frame_id"]
+
+            embedding = embeddings_map.get(leader_id)
+            if embedding is None:
+                continue
+
+            # Extract image from main DB (read-only)
+            if sqlite_db is None:
+                from core.storage.sqlite_storage import SQLiteStorage
+                sqlite_db = SQLiteStorage(db_path=self.main_db_path, activity_db_path=self.activity_db_path)
+            image = sqlite_db.extract_sub_frame_image(leader_id)
+
+            # Get OCR text from main DB (read-only)
+            ocr_text = ""
+            try:
+                main_conn = self._connect_main_readonly()
+                oc = main_conn.cursor()
+                oc.execute(
+                    "SELECT text FROM ocr_text WHERE sub_frame_id = ? ORDER BY text_length DESC LIMIT 1",
+                    (leader_id,),
+                )
+                r = oc.fetchone()
+                if r:
+                    ocr_text = r["text"]
+                main_conn.close()
+            except Exception:
+                pass
+
+            # --- VLM call: NO activity DB connection held here ---
+            existing_labels = app_existing_labels.get(group_app, [])
+            provisional = self._label_unknown_frame_with_labels(
+                group_app, image, ocr_text, existing_labels,
+            )
+            if not provisional:
+                vlm_failures_in_batch += 1
+                continue
+
+            # Reacquire connection for short DB writes, then release
+            conn = self._connect()
+            try:
+                candidate_id = self._find_matching_candidate_cluster(conn, group_app, provisional, embedding)
+                if candidate_id is None:
+                    candidate_id = self._create_candidate_cluster(
+                        conn, group_app, provisional, leader_id, embedding, None,
+                    )
+
+                # Assign leader
+                self._assign_sub_frame(
+                    conn, frame_id=leader_id, app_name=group_app, timestamp=None,
+                    cluster_id=candidate_id, activity_label=provisional,
+                    provisional_label=provisional, cluster_status="candidate",
+                    pending_group_id=None,
+                )
+
+                # Resolve all group members
+                leader_entry = PendingEntry(
+                    group_id=group_id, leader_frame_id=leader_id,
+                    app_name=group_app, embedding=embedding,
+                )
+                self._resolve_pending_group(conn, leader_entry, provisional, candidate_id, None)
+
+                # Get timestamp for session
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT timestamp FROM activity_assignments WHERE sub_frame_id = ?",
+                    (leader_id,),
                 )
                 ts_row = cursor.fetchone()
                 self._upsert_activity_session(
-                    conn,
-                    app_name=app_name,
-                    cluster_id=candidate_id,
-                    label=provisional,
-                    session_status="candidate",
+                    conn, app_name=group_app, cluster_id=candidate_id,
+                    label=provisional, session_status="candidate",
                     timestamp=ts_row["timestamp"] if ts_row else None,
                 )
-                affected_apps.add(app_name)
-                # Commit after each frame to release the write lock promptly.
-                # This prevents the recalculate loop (which may call VLM per frame)
-                # from holding the SQLite write lock for minutes at a time.
-                conn.commit()
+                affected_apps.add(group_app)
+                processed_count += 1
 
-            # 2. Promote candidate clusters that have gathered enough support.
+                # Update cached labels so next VLM call sees them
+                if provisional not in existing_labels:
+                    app_existing_labels.setdefault(group_app, []).append(provisional)
+
+                conn.commit()
+            finally:
+                conn.close()
+
+        # 2. Promote candidate clusters (short transaction)
+        conn = self._connect()
+        try:
+            cursor = conn.cursor()
             cursor.execute(
                 f"""
                 SELECT id, app_name
@@ -1096,3 +1491,5 @@ class ClusterManager:
             conn.close()
 
         self._load_centroids_for_apps(affected_apps or target_apps)
+        # Rebuild pending pool after recalculate
+        self._rebuild_pending_pool_from_db()

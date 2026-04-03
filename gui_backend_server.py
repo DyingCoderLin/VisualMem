@@ -117,6 +117,20 @@ def _ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _to_local(dt_or_str) -> str:
+    """UTC datetime/string → 本地时间 ISO 字符串（带时区偏移）。
+    数据库中的时间都是 UTC（naive），此函数用于 API 响应。"""
+    if dt_or_str is None:
+        return ""
+    if isinstance(dt_or_str, str):
+        if not dt_or_str:
+            return ""
+        dt_or_str = datetime.fromisoformat(dt_or_str)
+    if dt_or_str.tzinfo is None:
+        dt_or_str = dt_or_str.replace(tzinfo=timezone.utc)
+    return dt_or_str.astimezone().isoformat()
+
+
 def _parent_watchdog():
     """
     监控父进程是否还在运行。如果父进程退出，则自动退出。
@@ -205,9 +219,9 @@ class BatchWriteBuffer:
         """添加帧数据到缓冲区"""
         with self.buffer_lock:
             self.buffer.append(frame_data)
-            should_flush = len(self.buffer) >= self.batch_size
-            if should_flush:
-                logger.debug(f"缓冲区达到批次大小 {self.batch_size}，触发批量写入")
+            buf_len = len(self.buffer)
+            should_flush = buf_len >= self.batch_size
+        logger.info(f"BatchWriteBuffer: added frame {frame_data.get('frame_id', '?')}, buffer={buf_len}/{self.batch_size}")
         if should_flush:
             self._flush_buffer()
     
@@ -224,14 +238,14 @@ class BatchWriteBuffer:
             return
         
         try:
-            logger.debug(f"批量写入 {len(frames_to_write)} 帧到 LanceDB...")
+            logger.info(f"BatchWriteBuffer: flushing {len(frames_to_write)} frames to LanceDB+SQLite...")
             # 批量写入到 LanceDB
             if vector_storage is not None:
                 success = vector_storage.store_frames_batch(frames_to_write)
                 if success:
-                    logger.debug(f"✓ 成功批量写入 {len(frames_to_write)} 帧")
+                    logger.info(f"BatchWriteBuffer: ✓ LanceDB wrote {len(frames_to_write)} frames")
                 else:
-                    logger.error(f"✗ 批量写入失败")
+                    logger.error(f"BatchWriteBuffer: ✗ LanceDB batch write failed")
             
             # 批量写入到 SQLite（逐条写入，因为 SQLite 的批量写入接口可能不同）
             if sqlite_storage is not None:
@@ -269,7 +283,7 @@ class BatchWriteBuffer:
                 should_flush = elapsed >= self.flush_interval and len(self.buffer) > 0
             
             if should_flush:
-                logger.debug(f"达到刷新间隔 {self.flush_interval} 秒，触发批量写入")
+                logger.info(f"BatchWriteBuffer: periodic flush triggered ({elapsed:.0f}s elapsed, {len(self.buffer)} frames)")
                 self._flush_buffer()
     
     def start(self):
@@ -331,12 +345,12 @@ def _log_non_committed_cluster_result(app_name: str, sub_frame_id: str):
     if sqlite_storage is None:
         return
     try:
-        conn = sqlite_storage._get_connection()
+        conn = sqlite_storage._get_activity_connection()
         cursor = conn.cursor()
         cursor.execute(
             """
             SELECT activity_cluster_id, activity_label, provisional_label, cluster_status
-            FROM sub_frames
+            FROM activity_assignments
             WHERE sub_frame_id = ?
             """,
             (sub_frame_id,),
@@ -820,7 +834,10 @@ def _init_all_components():
     if config.ENABLE_CLUSTERING:
         logger.info("[13/13] Initializing activity cluster manager...")
         try:
-            cluster_manager = ClusterManager(db_path=config.OCR_DB_PATH)
+            cluster_manager = ClusterManager(
+                activity_db_path=config.ACTIVITY_DB_PATH,
+                main_db_path=config.OCR_DB_PATH,
+            )
         except Exception as e:
             logger.warning(f"Failed to init ClusterManager (will retry later): {e}")
             cluster_manager = None
@@ -1108,7 +1125,10 @@ def store_frame(req: StoreFrameRequest):
     """
     global encoder, vector_storage, sqlite_storage, batch_write_buffer
     global temp_frame_buffer
-    
+
+    _t0 = time_module.time()
+    logger.info(f"store_frame: START {req.frame_id}")
+
     # 组件检查
     assert encoder is not None
     assert vector_storage is not None
@@ -1157,9 +1177,10 @@ def store_frame(req: StoreFrameRequest):
         image.save(temp_image_path, format="JPEG", quality=config.IMAGE_QUALITY)
 
     # ========== 2. Embedding 和 OCR 处理 ==========
-    
+    logger.info(f"store_frame: {frame_id} step=embedding")
     # Compute image embedding
     embedding = encoder.encode_image(image)
+    logger.info(f"store_frame: {frame_id} step=embedding_done")
 
     # Full-screen frame OCR is deferred: we collect sub_frame OCR results first,
     # then combine them as the frame's ocr_text (labeled by app_name).
@@ -1191,10 +1212,12 @@ def store_frame(req: StoreFrameRequest):
     # 如果前端没有提供窗口信息，且启用了后端窗口捕获，使用screencap_rs
     elif ENABLE_BACKEND_WINDOW_CAPTURE and USE_SCREENCAP_RS and screencap_rs_module is not None:
         try:
+            logger.info(f"store_frame: {frame_id} step=capture_windows_start")
             captured_windows = screencap_rs_module.capture_all_windows(
                 include_minimized=False,
                 filter_system=True
             )
+            logger.info(f"store_frame: {frame_id} step=capture_windows_done count={len(captured_windows)}")
             for cw in captured_windows:
                 try:
                     # 将PNG bytes转换为PIL Image
@@ -1268,9 +1291,12 @@ def store_frame(req: StoreFrameRequest):
                 sub_frame_id = f"subframe_{safe_app}_{base_frame_id}_{i}"
                 
                 # 对窗口帧做 embedding
+                logger.info(f"store_frame: {frame_id} win={app_name} step=win_embedding")
                 win_embedding = encoder.encode_image(win_image)
+                logger.info(f"store_frame: {frame_id} win={app_name} step=win_embedding_done")
 
                 # 对窗口帧做 region OCR
+                logger.info(f"store_frame: {frame_id} win={app_name} step=win_ocr_start")
                 win_ocr_text = ""
                 win_ocr_json = ""
                 win_ocr_engine_name = "none"
@@ -1301,6 +1327,8 @@ def store_frame(req: StoreFrameRequest):
                                 ) / total_len
                     except Exception as e:
                         logger.warning(f"Region OCR failed for window {app_name}: {e}")
+
+                logger.info(f"store_frame: {frame_id} win={app_name} step=win_ocr_done len={len(win_ocr_text)}")
 
                 # Collect for frame-level combined OCR
                 if win_ocr_text:
@@ -1359,6 +1387,7 @@ def store_frame(req: StoreFrameRequest):
                 # Activity cluster assignment (real-time)
                 if cluster_manager is not None:
                     try:
+                        logger.info(f"store_frame: {frame_id} win={app_name} step=cluster_assign")
                         activity_label = cluster_manager.assign_frame(
                             app_name=app_name,
                             frame_id=sub_frame_id,
@@ -1368,6 +1397,7 @@ def store_frame(req: StoreFrameRequest):
                             timestamp=ts.isoformat(),
                             window_name=window_name,
                         )
+                        logger.info(f"store_frame: {frame_id} win={app_name} step=cluster_done label={activity_label}")
                         if activity_label:
                             logger.debug(f"Assigned {sub_frame_id} -> '{activity_label}'")
                         _log_non_committed_cluster_result(app_name, sub_frame_id)
@@ -1552,7 +1582,8 @@ def store_frame(req: StoreFrameRequest):
     }
     batch_write_buffer.add_frame(frame_data)
 
-    logger.debug(f"Stored frame {frame_id} with {len(sub_frame_ids)} windows (focused={focused_app})")
+    _elapsed = time_module.time() - _t0
+    logger.info(f"store_frame: {frame_id} done in {_elapsed:.2f}s, {len(sub_frame_ids)} windows (focused={focused_app})")
 
     # Check if cluster recalculation is needed (runs in background thread)
     if cluster_manager is not None and cluster_manager.should_recalculate():
@@ -1761,13 +1792,13 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
         f"去重后 {len(frames)} 张"
     )
 
-    # Activity label post-filter
+    # Activity label post-filter (queries activity DB, not main DB)
     if req.activity_label and sqlite_storage is not None:
         try:
-            conn_al = sqlite_storage._get_connection()
+            conn_al = sqlite_storage._get_activity_connection()
             cursor_al = conn_al.cursor()
             cursor_al.execute(
-                "SELECT sub_frame_id FROM sub_frames WHERE activity_label LIKE ?",
+                "SELECT sub_frame_id FROM activity_assignments WHERE activity_label LIKE ?",
                 (f"%{req.activity_label}%",),
             )
             matching_ids = {r["sub_frame_id"] for r in cursor_al.fetchall()}
@@ -2553,44 +2584,45 @@ def _check_clustering_health() -> tuple:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        # Check if required tables exist
-        cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('activity_clusters', 'activity_sessions')"
-        )
-        existing = {row[0] for row in cursor.fetchall()}
-        missing = {"activity_clusters", "activity_sessions"} - existing
-        if missing:
-            conn.close()
-            return False, f"Missing clustering tables: {', '.join(sorted(missing))}"
+        # Use activity DB for clustering health checks
+        act_conn = sqlite_storage._get_activity_connection()
+        act_cursor = act_conn.cursor()
 
-        # Check if sub_frames has the activity_cluster_id column
-        cursor.execute("PRAGMA table_info(sub_frames)")
-        sf_cols = {row[1] for row in cursor.fetchall()}
-        if "activity_cluster_id" not in sf_cols:
+        # Check if required tables exist in activity DB
+        act_cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('activity_clusters', 'activity_sessions', 'activity_assignments')"
+        )
+        existing = {row[0] for row in act_cursor.fetchall()}
+        missing = {"activity_clusters", "activity_sessions", "activity_assignments"} - existing
+        if missing:
+            act_conn.close()
             conn.close()
-            return False, "sub_frames table is missing activity_cluster_id column"
+            return False, f"Missing clustering tables in activity DB: {', '.join(sorted(missing))}"
 
         # Check if there are any frames to worry about
         cursor.execute("SELECT COUNT(*) FROM sub_frames")
         total_frames = cursor.fetchone()[0]
         if total_frames == 0:
+            act_conn.close()
             conn.close()
             return True, ""
 
         # Check if timeline is empty while frames exist
-        cursor.execute("SELECT MAX(end_time) FROM activity_sessions")
-        latest_session = cursor.fetchone()[0]
+        act_cursor.execute("SELECT MAX(end_time) FROM activity_sessions")
+        latest_session = act_cursor.fetchone()[0]
         if not latest_session:
+            act_conn.close()
             conn.close()
             return False, f"Timeline is empty but {total_frames} frames exist"
 
         # Check how many frames are uncovered after the last session
-        cursor.execute(
-            "SELECT COUNT(*) FROM sub_frames WHERE timestamp > ? AND activity_cluster_id IS NULL",
+        act_cursor.execute(
+            "SELECT COUNT(*) FROM activity_assignments WHERE timestamp > ? AND activity_cluster_id IS NULL",
             (latest_session,),
         )
-        uncovered = cursor.fetchone()[0]
+        uncovered = act_cursor.fetchone()[0]
+        act_conn.close()
         conn.close()
 
         if uncovered > 200:

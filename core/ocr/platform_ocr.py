@@ -36,45 +36,44 @@ class AppleVisionOCR(OCREngine):
                 "  pip install pyobjc-framework-Vision pyobjc-framework-Quartz"
             )
 
-    def recognize(self, image: Image.Image) -> OCRResult:
-        """Run Apple Vision text recognition on a PIL Image."""
+    def _run_request(self, image: Image.Image):
+        """Run Apple Vision text request and return raw observations."""
         import io
         from Foundation import NSData
 
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+
+        ns_data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
+        handler = self._Vision.VNImageRequestHandler.alloc().initWithData_options_(
+            ns_data, None
+        )
+
+        request = self._Vision.VNRecognizeTextRequest.alloc().init()
+        request.setRecognitionLevel_(
+            self._Vision.VNRequestTextRecognitionLevelAccurate
+        )
+        request.setRecognitionLanguages_(["zh-Hans", "zh-Hant", "en"])
+        request.setUsesLanguageCorrection_(True)
+
+        success = handler.performRequests_error_([request], None)
+        if not success[0]:
+            logger.warning(f"Apple Vision OCR failed: {success[1]}")
+            return []
+        return request.results() or []
+
+    def recognize(self, image: Image.Image) -> OCRResult:
+        """Run Apple Vision text recognition on a PIL Image."""
         start = time.perf_counter()
 
         try:
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-
-            ns_data = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
-
-            # Use initWithData (PNG bytes) directly instead of CIImage.
-            # The CIImage path triggers CVPixelBuffer creation which fails
-            # on certain image dimensions with error -6662.
-            handler = self._Vision.VNImageRequestHandler.alloc().initWithData_options_(
-                ns_data, None
-            )
-
-            request = self._Vision.VNRecognizeTextRequest.alloc().init()
-            request.setRecognitionLevel_(
-                self._Vision.VNRequestTextRecognitionLevelAccurate
-            )
-            request.setRecognitionLanguages_(["zh-Hans", "zh-Hant", "en"])
-            request.setUsesLanguageCorrection_(True)
-
-            success = handler.performRequests_error_([request], None)
-            if not success[0]:
-                logger.warning(f"Apple Vision OCR failed: {success[1]}")
-                return OCRResult(text="", confidence=0.0, engine=self.engine_name)
-
-            observations = request.results()
+            observations = self._run_request(image)
             texts = []
             confidences = []
             words = []
 
-            for obs in observations or []:
+            for obs in observations:
                 candidate = obs.topCandidates_(1)
                 if candidate and len(candidate) > 0:
                     text = candidate[0].string()
@@ -99,6 +98,37 @@ class AppleVisionOCR(OCREngine):
         except Exception as e:
             logger.error(f"Apple Vision OCR error: {e}")
             return OCRResult(text="", confidence=0.0, engine=self.engine_name)
+
+    def recognize_with_bboxes(self, image: Image.Image) -> list:
+        """Run OCR and return text lines with pixel bounding boxes.
+
+        Returns list of {"text", "confidence", "bbox": [x1, y1, x2, y2]}.
+        """
+        try:
+            observations = self._run_request(image)
+            img_w, img_h = image.size
+            results = []
+            for obs in observations:
+                candidate = obs.topCandidates_(1)
+                if not candidate or len(candidate) == 0:
+                    continue
+                text = candidate[0].string()
+                conf = float(candidate[0].confidence())
+                bb = obs.boundingBox()
+                # Apple Vision: normalized coords, origin at bottom-left
+                x = bb.origin.x * img_w
+                y = (1 - bb.origin.y - bb.size.height) * img_h
+                w = bb.size.width * img_w
+                h = bb.size.height * img_h
+                results.append({
+                    "text": text,
+                    "confidence": conf,
+                    "bbox": [int(x), int(y), int(x + w), int(y + h)],
+                })
+            return results
+        except Exception as e:
+            logger.error(f"Apple Vision OCR (with bboxes) error: {e}")
+            return []
 
 
 class WindowsOCR(OCREngine):

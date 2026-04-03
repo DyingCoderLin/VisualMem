@@ -63,27 +63,42 @@ class SQLiteStorage:
        - frame_id -> sub_frame_id (多对多)
     """
     
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, activity_db_path: str = None):
         """
         初始化 SQLite 存储
-        
+
         Args:
-            db_path: 数据库文件路径
+            db_path: 数据库文件路径 (main DB for frames/OCR)
+            activity_db_path: activity clustering database path (separate DB to avoid lock contention)
         """
         self.db_path = Path(db_path or config.OCR_DB_PATH)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
+        self.activity_db_path = Path(activity_db_path or config.ACTIVITY_DB_PATH)
+        self.activity_db_path.parent.mkdir(parents=True, exist_ok=True)
+
         logger.debug(f"Initializing SQLite storage at: {self.db_path}")
-        
+        logger.debug(f"Activity DB at: {self.activity_db_path}")
+
         # 创建表
         self._create_tables()
-        
+        self._ensure_activity_tables()
+        self._auto_migrate_activity_data()
+
         logger.debug("SQLite storage initialized successfully")
     
     def _get_connection(self) -> sqlite3.Connection:
-        """获取数据库连接"""
+        """获取数据库连接 (main DB)"""
         conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row  # 使用 Row 工厂，方便字典访问
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
+
+    def _get_activity_connection(self) -> sqlite3.Connection:
+        """获取 activity DB 连接 (separate DB for clustering data)"""
+        conn = sqlite3.connect(self.activity_db_path, timeout=10)
+        conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
@@ -285,11 +300,6 @@ class SQLiteStorage:
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_sub_frames_app
             ON sub_frames(app_name)
-        """)
-
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_sub_frames_activity_pending
-            ON sub_frames(app_name, activity_cluster_id)
         """)
 
         cursor.execute("""
@@ -503,9 +513,180 @@ class SQLiteStorage:
         
         conn.commit()
         conn.close()
-        
+
         logger.debug("Database tables created/verified")
-    
+
+    def _ensure_activity_tables(self):
+        """Create activity clustering tables in the separate activity DB."""
+        conn = self._get_activity_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_assignments (
+                sub_frame_id TEXT PRIMARY KEY,
+                app_name TEXT NOT NULL,
+                timestamp TEXT,
+                activity_cluster_id INTEGER,
+                activity_label TEXT,
+                provisional_label TEXT,
+                cluster_status TEXT,
+                frozen_at TEXT,
+                cluster_updated_at TEXT,
+                pending_group_id INTEGER
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                centroid BLOB,
+                frame_count INTEGER DEFAULT 0,
+                representative_frame_ids TEXT,
+                cluster_status TEXT NOT NULL DEFAULT 'committed',
+                committed_at TEXT,
+                last_frame_timestamp TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                cluster_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                session_status TEXT NOT NULL DEFAULT 'committed',
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                frame_count INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (cluster_id) REFERENCES activity_clusters(id)
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                app_name TEXT NOT NULL,
+                leader_frame_id TEXT NOT NULL,
+                centroid BLOB NOT NULL,
+                member_count INTEGER DEFAULT 1,
+                resolved_label TEXT,
+                resolved_cluster_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Indexes
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_cluster_status ON activity_assignments(app_name, cluster_status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_label ON activity_assignments(activity_label)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_cluster_id ON activity_assignments(activity_cluster_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_aa_pending_group ON activity_assignments(pending_group_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_clusters_app ON activity_clusters(app_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_clusters_app_status ON activity_clusters(app_name, cluster_status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_sessions_app ON activity_sessions(app_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_activity_sessions_time ON activity_sessions(start_time, end_time)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_groups_app ON pending_groups(app_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_groups_resolved ON pending_groups(resolved_label)")
+
+        conn.commit()
+        conn.close()
+        logger.debug("Activity DB tables created/verified")
+
+    def _auto_migrate_activity_data(self):
+        """Migrate activity data from main DB to activity DB on first run after upgrade."""
+        # Check if main DB still has activity_clusters with data and activity DB is empty
+        try:
+            main_conn = self._get_connection()
+            main_cursor = main_conn.cursor()
+            # Check if activity_clusters table exists in main DB
+            main_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='activity_clusters'")
+            if not main_cursor.fetchone():
+                main_conn.close()
+                return  # No activity tables in main DB, nothing to migrate
+
+            main_cursor.execute("SELECT COUNT(*) FROM activity_clusters")
+            main_cluster_count = main_cursor.fetchone()[0]
+            if main_cluster_count == 0:
+                main_conn.close()
+                return  # Nothing to migrate
+
+            # Check if activity DB already has data
+            act_conn = self._get_activity_connection()
+            act_cursor = act_conn.cursor()
+            act_cursor.execute("SELECT COUNT(*) FROM activity_clusters")
+            act_cluster_count = act_cursor.fetchone()[0]
+            if act_cluster_count > 0:
+                act_conn.close()
+                main_conn.close()
+                return  # Activity DB already has data, skip migration
+
+            logger.info(f"Auto-migrating activity data from main DB ({main_cluster_count} clusters)...")
+
+            # Migrate activity_clusters
+            main_cursor.execute("SELECT * FROM activity_clusters")
+            rows = main_cursor.fetchall()
+            for row in rows:
+                act_cursor.execute(
+                    "INSERT INTO activity_clusters (id, app_name, label, centroid, frame_count, "
+                    "representative_frame_ids, cluster_status, committed_at, last_frame_timestamp, "
+                    "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row["id"], row["app_name"], row["label"], row["centroid"],
+                     row["frame_count"], row["representative_frame_ids"],
+                     row["cluster_status"] or "committed", row["committed_at"],
+                     row["last_frame_timestamp"], row["created_at"], row["updated_at"]),
+                )
+
+            # Migrate activity_sessions
+            main_cursor.execute("SELECT * FROM activity_sessions")
+            rows = main_cursor.fetchall()
+            for row in rows:
+                act_cursor.execute(
+                    "INSERT INTO activity_sessions (id, app_name, cluster_id, label, session_status, "
+                    "start_time, end_time, frame_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row["id"], row["app_name"], row["cluster_id"], row["label"],
+                     row["session_status"] or "committed", row["start_time"],
+                     row["end_time"], row["frame_count"], row["created_at"]),
+                )
+
+            # Migrate activity columns from sub_frames → activity_assignments
+            # Check if sub_frames has activity columns
+            main_cursor.execute("PRAGMA table_info(sub_frames)")
+            sub_cols = {r[1] for r in main_cursor.fetchall()}
+            if "activity_cluster_id" in sub_cols:
+                main_cursor.execute(
+                    "SELECT sub_frame_id, app_name, timestamp, activity_cluster_id, "
+                    "activity_label, provisional_label, cluster_status, frozen_at, "
+                    "cluster_updated_at FROM sub_frames "
+                    "WHERE activity_cluster_id IS NOT NULL OR cluster_status IS NOT NULL"
+                )
+                migrated_count = 0
+                for row in main_cursor:
+                    act_cursor.execute(
+                        "INSERT OR IGNORE INTO activity_assignments "
+                        "(sub_frame_id, app_name, timestamp, activity_cluster_id, "
+                        "activity_label, provisional_label, cluster_status, frozen_at, "
+                        "cluster_updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (row["sub_frame_id"], row["app_name"], row["timestamp"],
+                         row["activity_cluster_id"], row["activity_label"],
+                         row["provisional_label"], row["cluster_status"],
+                         row["frozen_at"], row["cluster_updated_at"]),
+                    )
+                    migrated_count += 1
+                logger.info(f"Migrated {migrated_count} activity assignments from sub_frames")
+
+            act_conn.commit()
+            act_conn.close()
+            main_conn.close()
+            logger.info("Activity data migration completed successfully")
+        except Exception as e:
+            logger.warning(f"Activity data auto-migration failed (non-fatal): {e}")
+
     def store_frame_with_ocr(
         self,
         frame_id: str,

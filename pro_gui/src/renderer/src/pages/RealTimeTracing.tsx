@@ -122,6 +122,7 @@ const RealTimeTracing: React.FC = () => {
       )
       setFrames(sortedFrames)
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       console.error('Failed to fetch recent frames:', error)
     }
   }

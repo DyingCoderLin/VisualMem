@@ -254,6 +254,7 @@ const TimelineView: React.FC = () => {
             }
           }
         } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') return
           console.error('Failed to perform incremental refresh:', error)
         }
       }
@@ -414,6 +415,7 @@ const TimelineView: React.FC = () => {
             // count === 0，静默跳过，但 while 循环会继续处理前一天
           }
         } catch (error) {
+          if (error instanceof DOMException && error.name === 'AbortError') return
           console.error(`Error checking date ${dateStr}`, error)
         }
 
