@@ -1,0 +1,361 @@
+/* Daily Report page — tokens from theme.css only */
+
+.daily-report-view-container {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.daily-report-page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background-color: var(--bg-app);
+  color: var(--text-primary);
+}
+
+.daily-report-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---- Left: date list ---- */
+.daily-report-date-sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background-color: var(--bg-panel);
+  border-right: 1px solid var(--border-dim);
+  display: flex;
+  flex-direction: column;
+  padding: var(--spacing-md);
+  overflow-y: auto;
+}
+
+.daily-report-date-sidebar-title {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--spacing-sm);
+}
+
+.daily-report-date-item {
+  padding: var(--spacing-sm) var(--spacing-md);
+  margin-bottom: var(--spacing-xs);
+  border-radius: var(--radius-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+  font-size: var(--font-size-base);
+  font-variant-numeric: tabular-nums;
+}
+
+.daily-report-date-item:hover {
+  background-color: var(--bg-panel-hover);
+  color: var(--text-primary);
+}
+
+.daily-report-date-item.active {
+  background-color: rgba(255, 215, 0, 0.05);
+  color: var(--text-accent);
+  border-left: 3px solid var(--accent-primary);
+  padding-left: calc(var(--spacing-md) - 3px);
+}
+
+.daily-report-date-empty {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ---- Main column ---- */
+.daily-report-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: var(--spacing-md) var(--spacing-lg);
+  overflow: hidden;
+}
+
+.daily-report-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--spacing-md);
+  flex-shrink: 0;
+  margin-bottom: var(--spacing-md);
+}
+
+.daily-report-date-field {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  background-color: var(--bg-input);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
+  padding: var(--spacing-xs) var(--spacing-sm);
+}
+
+.daily-report-date-field svg {
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.daily-report-date-input {
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  min-width: 140px;
+}
+
+.daily-report-date-input::-webkit-calendar-picker-indicator {
+  filter: invert(0.8);
+  cursor: pointer;
+}
+
+.daily-report-gen-btn {
+  padding: var(--spacing-sm) var(--spacing-lg);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--accent-primary);
+  background: transparent;
+  color: var(--accent-primary);
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.daily-report-gen-btn:hover:not(:disabled) {
+  background: rgba(255, 215, 0, 0.08);
+}
+
+.daily-report-gen-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ---- Card ---- */
+.daily-report-card-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: var(--spacing-lg);
+}
+
+.daily-report-card {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 0 24px var(--accent-glow);
+  padding: var(--spacing-lg);
+  max-width: 960px;
+}
+
+.daily-report-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: var(--spacing-lg);
+  margin-bottom: var(--spacing-lg);
+  padding-bottom: var(--spacing-md);
+  border-bottom: 1px solid var(--border-dim);
+}
+
+.daily-report-kicker {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  margin-bottom: var(--spacing-xs);
+}
+
+.daily-report-title {
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.daily-report-focus-box {
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.daily-report-focus-value {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent-primary);
+  line-height: 1.1;
+}
+
+.daily-report-focus-caption {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  margin-top: var(--spacing-xs);
+  max-width: 200px;
+}
+
+/* Sections */
+.daily-report-section-title {
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  color: var(--accent-primary);
+  margin-bottom: var(--spacing-md);
+}
+
+.daily-report-app-row {
+  margin-bottom: var(--spacing-md);
+}
+
+.daily-report-app-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-xs);
+}
+
+.daily-report-app-name {
+  font-weight: 600;
+  font-size: var(--font-size-base);
+}
+
+.daily-report-app-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.daily-report-chip {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  background-color: var(--bg-input);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.daily-report-pill {
+  display: inline-block;
+  font-size: var(--font-size-sm);
+  padding: 2px 10px;
+  border-radius: 999px;
+  background-color: var(--bg-input);
+  color: var(--text-secondary);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.daily-report-bar-track {
+  height: 8px;
+  border-radius: 4px;
+  background-color: var(--bg-input);
+  overflow: hidden;
+}
+
+.daily-report-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-primary), rgba(255, 215, 0, 0.75));
+  border-radius: 4px;
+  min-width: 2px;
+  transition: width 0.3s ease;
+}
+
+.daily-report-pill-work {
+  color: var(--accent-primary);
+  border: 1px solid var(--accent-primary);
+  background: rgba(255, 215, 0, 0.06);
+}
+
+.daily-report-pill-life {
+  color: var(--text-secondary);
+  border: 1px solid var(--border-dim);
+}
+
+.daily-report-panel {
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  background-color: rgba(0, 0, 0, 0.15);
+}
+
+.daily-report-panel h4 {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--spacing-sm);
+}
+
+.daily-report-panel ul {
+  margin: 0;
+  padding-left: var(--spacing-lg);
+}
+
+.daily-report-panel li {
+  margin-bottom: var(--spacing-xs);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  line-height: 1.45;
+}
+
+.daily-report-takeaway {
+  padding: var(--spacing-md);
+  border: 1px solid var(--accent-primary);
+  border-radius: var(--radius-md);
+  background-color: rgba(255, 215, 0, 0.05);
+  margin-top: var(--spacing-md);
+}
+
+.daily-report-takeaway p {
+  margin-bottom: var(--spacing-sm);
+  font-size: var(--font-size-base);
+  line-height: 1.55;
+  color: var(--text-primary);
+}
+
+.daily-report-takeaway p:last-child {
+  margin-bottom: 0;
+}
+
+.daily-report-banner {
+  padding: var(--spacing-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-dim);
+  background-color: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+  margin-bottom: var(--spacing-md);
+}
+
+.daily-report-banner.warn {
+  border-color: rgba(255, 180, 0, 0.35);
+  color: var(--text-primary);
+}
+
+.daily-report-error {
+  color: #f87171;
+  font-size: var(--font-size-sm);
+  margin-top: var(--spacing-xs);
+  max-width: 360px;
+  text-align: right;
+}
+
+.daily-report-empty-state {
+  padding: var(--spacing-xl);
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+  line-height: 1.6;
+}

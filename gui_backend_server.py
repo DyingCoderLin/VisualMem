@@ -29,6 +29,8 @@ from pathlib import Path
 from config import config
 from utils.logger import setup_logger
 from utils.app_name_manager import app_name_manager
+from core.api.router import router as data_platform_router, init_data_service
+from core.api.daily_report_routes import router as daily_report_router
 from core.encoder import create_encoder
 from core.storage.lancedb_storage import LanceDBStorage
 from core.storage.sqlite_storage import SQLiteStorage
@@ -58,6 +60,10 @@ app.add_middleware(
     allow_methods=["*"],  # 允许所有 HTTP 方法
     allow_headers=["*"],  # 允许所有请求头
 )
+
+# Mount Data Platform API router (timeline, OCR, focus, reports)
+app.include_router(data_platform_router)
+app.include_router(daily_report_router)
 
 
 # ============ 工具函数 ============
@@ -169,6 +175,8 @@ reranker: Optional[Reranker] = None
 vlm: Optional[ApiVLM] = None
 ocr_engine = None
 region_ocr_engine = None  # RegionOCREngine (UIED region detection + per-region OCR)
+_models_loaded = False  # Whether heavy models (encoder, reranker, OCR) have been loaded
+_models_loading = False  # Whether models are currently being loaded
 
 # ============ 视频存储相关组件 ============
 temp_frame_buffer: Optional[TempFrameBuffer] = None
@@ -178,6 +186,9 @@ ffmpeg_extractor: Optional[FFmpegFrameExtractor] = None
 # 帧差检测（窗口级别去重）
 from core.preprocess.frame_diff import FrameDiffDetector, is_solid_color_image
 window_diff_detector: Optional[FrameDiffDetector] = None
+
+# Cache last OCR text per fullscreen app (used when dedup skips the frame)
+_fullscreen_ocr_cache: Dict[str, tuple] = {}  # app_name -> (ocr_text, confidence)
 
 # Activity clustering
 from core.activity.cluster_manager import ClusterManager
@@ -321,16 +332,15 @@ def _resolve_sub_frame_image_path(sf: dict) -> Optional[str]:
         return f"window_chunk:{wc_id}:{off}"
     if sqlite_storage is not None:
         try:
-            conn = sqlite_storage._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT image_path FROM frames WHERE frame_id = ?",
-                (sf["sub_frame_id"],),
-            )
-            row = cursor.fetchone()
-            conn.close()
-            if row and row["image_path"]:
-                return row["image_path"]
+            with sqlite_storage._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT image_path FROM frames WHERE frame_id = ?",
+                    (sf["sub_frame_id"],),
+                )
+                row = cursor.fetchone()
+                if row and row["image_path"]:
+                    return row["image_path"]
         except Exception:
             pass
     return None
@@ -345,18 +355,17 @@ def _log_non_committed_cluster_result(app_name: str, sub_frame_id: str):
     if sqlite_storage is None:
         return
     try:
-        conn = sqlite_storage._get_activity_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT activity_cluster_id, activity_label, provisional_label, cluster_status
-            FROM activity_assignments
-            WHERE sub_frame_id = ?
-            """,
-            (sub_frame_id,),
-        )
-        row = cursor.fetchone()
-        conn.close()
+        with sqlite_storage._activity_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT activity_cluster_id, activity_label, provisional_label, cluster_status
+                FROM activity_assignments
+                WHERE sub_frame_id = ?
+                """,
+                (sub_frame_id,),
+            )
+            row = cursor.fetchone()
         if not row:
             return
 
@@ -480,44 +489,43 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
                             # 对于 sub_frame，video_chunk_id 设为 NULL（因为它是 window_chunk）
                             # 我们需要直接更新 frames 表
                             try:
-                                conn = sqlite_storage._get_connection()
-                                cursor = conn.cursor()
-                                
-                                # First check if frame exists
-                                cursor.execute("SELECT 1 FROM frames WHERE frame_id = ?", (frame.frame_id,))
-                                if cursor.fetchone():
-                                    cursor.execute("""
-                                        UPDATE frames 
-                                        SET image_path = ?,
-                                            offset_index = ?,
-                                            app_name = ?,
-                                            window_name = ?
-                                        WHERE frame_id = ?
-                                    """, (
-                                        image_path,
-                                        i,
-                                        frame.app_name or "",
-                                        frame.window_name or "",
-                                        frame.frame_id
-                                    ))
-                                else:
-                                    # Insert if it doesn't exist
-                                    cursor.execute("""
-                                        INSERT INTO frames 
-                                        (frame_id, timestamp, image_path, device_name, metadata, app_name, window_name, offset_index)
-                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        frame.frame_id,
-                                        frame.timestamp.isoformat(),
-                                        image_path,
-                                        f"{frame.app_name}/{frame.window_name}",
-                                        "{}",
-                                        frame.app_name or "",
-                                        frame.window_name or "",
-                                        i
-                                    ))
-                                conn.commit()
-                                conn.close()
+                                with sqlite_storage._connection() as conn:
+                                    cursor = conn.cursor()
+
+                                    # First check if frame exists
+                                    cursor.execute("SELECT 1 FROM frames WHERE frame_id = ?", (frame.frame_id,))
+                                    if cursor.fetchone():
+                                        cursor.execute("""
+                                            UPDATE frames
+                                            SET image_path = ?,
+                                                offset_index = ?,
+                                                app_name = ?,
+                                                window_name = ?
+                                            WHERE frame_id = ?
+                                        """, (
+                                            image_path,
+                                            i,
+                                            frame.app_name or "",
+                                            frame.window_name or "",
+                                            frame.frame_id
+                                        ))
+                                    else:
+                                        # Insert if it doesn't exist
+                                        cursor.execute("""
+                                            INSERT INTO frames
+                                            (frame_id, timestamp, image_path, device_name, metadata, app_name, window_name, offset_index)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            frame.frame_id,
+                                            frame.timestamp.isoformat(),
+                                            image_path,
+                                            f"{frame.app_name}/{frame.window_name}",
+                                            "{}",
+                                            frame.app_name or "",
+                                            frame.window_name or "",
+                                            i
+                                        ))
+                                    conn.commit()
                                 logger.debug(f"Updated sub_frame {frame.frame_id} in frames table")
                             except Exception as e:
                                 logger.error(f"Failed to update sub_frame {frame.frame_id} in frames table: {e}")
@@ -582,81 +590,89 @@ def _recover_temp_frames():
         return
         
     try:
-        conn = sqlite_storage._get_connection()
-        cursor = conn.cursor()
-        
-        # 1. 恢复全屏截图
-        cursor.execute("SELECT frame_id, timestamp, image_path, device_name, metadata FROM frames WHERE image_path LIKE '%temp_frames%' AND frame_id LIKE 'frame_%' ORDER BY timestamp ASC")
-        fs_records = cursor.fetchall()
-        
         from collections import defaultdict
         from core.storage.temp_frame_buffer import FrameInfo
         import json
-        
+
+        # ── Phase 1: 恢复全屏截图 ──
+        # 全屏帧压缩时 store_frame_with_video_ref 会同步更新 _fullscreen 全屏应用子帧的
+        # image_path，所以必须先完成全屏压缩，再查窗口子帧，否则 _fullscreen 子帧会
+        # 被窗口查询捞出来，而它们引用的 PNG 已在全屏 cleanup 中删除。
         fs_groups = defaultdict(list)
-        for row in fs_records:
-            path = Path(row["image_path"])
-            if path.exists():
-                monitor_id = 0
-                if row["device_name"] and row["device_name"].startswith("monitor_"):
-                    try:
-                        monitor_id = int(row["device_name"].split("_")[1])
-                    except ValueError:
-                        pass
-                
-                ts_str = row["timestamp"]
-                ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
-                
-                fs_groups[monitor_id].append(FrameInfo(
-                    frame_id=row["frame_id"],
-                    timestamp=ts,
-                    image_path=str(path),
-                    monitor_id=monitor_id,
-                    metadata=json.loads(row["metadata"]) if row["metadata"] else {}
-                ))
-            else:
-                # 文件丢失，清理僵尸路径
-                cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["frame_id"],))
 
-        # 2. 恢复窗口截图
-        cursor.execute("""
-            SELECT s.sub_frame_id, s.timestamp, f.image_path, s.app_name, s.window_name
-            FROM sub_frames s
-            JOIN frames f ON s.sub_frame_id = f.frame_id
-            WHERE f.image_path LIKE '%temp_frames%'
-            ORDER BY s.timestamp ASC
-        """)
-        win_records = cursor.fetchall()
-        
-        win_groups = defaultdict(list)
-        for row in win_records:
-            path = Path(row["image_path"])
-            if path.exists():
-                app_name = row["app_name"] or "unknown"
-                window_name = row["window_name"] or "unknown"
-                key = f"{app_name}_{window_name}"
-                
-                ts_str = row["timestamp"]
-                ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
-                
-                win_groups[key].append(FrameInfo(
-                    frame_id=row["sub_frame_id"],
-                    timestamp=ts,
-                    image_path=str(path),
-                    app_name=app_name,
-                    window_name=window_name
-                ))
-            else:
-                cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["sub_frame_id"],))
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
 
-        # Commit zombie-path cleanups before compression. _compress_video_batch opens new
-        # SQLite connections; an open uncommitted transaction on this conn would lock them.
-        conn.commit()
-        conn.close()
+            cursor.execute("SELECT frame_id, timestamp, image_path, device_name, metadata FROM frames WHERE image_path LIKE '%temp_frames%' AND frame_id LIKE 'frame_%' ORDER BY timestamp ASC")
+            fs_records = cursor.fetchall()
+
+            for row in fs_records:
+                path = Path(row["image_path"])
+                if path.exists():
+                    monitor_id = 0
+                    if row["device_name"] and row["device_name"].startswith("monitor_"):
+                        try:
+                            monitor_id = int(row["device_name"].split("_")[1])
+                        except ValueError:
+                            pass
+
+                    ts_str = row["timestamp"]
+                    ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
+
+                    fs_groups[monitor_id].append(FrameInfo(
+                        frame_id=row["frame_id"],
+                        timestamp=ts,
+                        image_path=str(path),
+                        monitor_id=monitor_id,
+                        metadata=json.loads(row["metadata"]) if row["metadata"] else {}
+                    ))
+                else:
+                    cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["frame_id"],))
+
+            conn.commit()
 
         for monitor_id, frames in fs_groups.items():
             logger.info(f"Recovering {len(frames)} leftover full_screen temp_frames for monitor_{monitor_id}...")
             _compress_video_batch("full_screen", f"monitor_{monitor_id}", frames)
+
+        # ── Phase 2: 恢复窗口截图 ──
+        # 在全屏压缩完成后再查询，此时 _fullscreen 子帧的 image_path 已被同步更新为
+        # video_chunk 引用，不再匹配 '%temp_frames%'，自然被排除。
+        win_groups = defaultdict(list)
+
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT s.sub_frame_id, s.timestamp, f.image_path, s.app_name, s.window_name
+                FROM sub_frames s
+                JOIN frames f ON s.sub_frame_id = f.frame_id
+                WHERE f.image_path LIKE '%temp_frames%'
+                ORDER BY s.timestamp ASC
+            """)
+            win_records = cursor.fetchall()
+
+            for row in win_records:
+                path = Path(row["image_path"])
+                if path.exists():
+                    app_name = row["app_name"] or "unknown"
+                    window_name = row["window_name"] or "unknown"
+                    key = f"{app_name}_{window_name}"
+
+                    ts_str = row["timestamp"]
+                    ts = datetime.fromisoformat(ts_str) if isinstance(ts_str, str) else ts_str
+
+                    win_groups[key].append(FrameInfo(
+                        frame_id=row["sub_frame_id"],
+                        timestamp=ts,
+                        image_path=str(path),
+                        app_name=app_name,
+                        window_name=window_name
+                    ))
+                else:
+                    cursor.execute("UPDATE frames SET image_path = '' WHERE frame_id = ?", (row["sub_frame_id"],))
+
+            conn.commit()
 
         for key, frames in win_groups.items():
             logger.info(f"Recovering {len(frames)} leftover window temp_frames for {key}...")
@@ -707,127 +723,301 @@ def _init_components():
     if region_ocr_engine is None and ocr_engine is not None:
         from core.ocr.region_detector import UIEDRegionDetector
         from core.ocr.region_ocr_engine import RegionOCREngine
+        _uied = UIEDRegionDetector() if config.ENABLE_UIED else None
         region_ocr_engine = RegionOCREngine(
             ocr_engine=ocr_engine,
-            region_detector=UIEDRegionDetector(),
+            region_detector=_uied,
         )
-        logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
-
-
-def _init_all_components():
-    """
-    强制初始化所有组件（用于服务器启动时预加载）。
-    与 _init_components() 不同，这个函数会强制加载，不检查是否已加载。
-    """
-    global encoder, vector_storage, sqlite_storage, reranker, vlm, ocr_engine, region_ocr_engine, batch_write_buffer
-    global temp_frame_buffer, ffmpeg_compressor, ffmpeg_extractor, window_diff_detector
-    
-    logger.info("=" * 60)
-    logger.info("Initializing all backend components (startup preload)...")
-    logger.info("=" * 60)
-
-    # 0. Pre-flight check: Ensure models are downloaded
-    # This provides better UX by explicitly showing download progress
-    ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
-    
-    if config.ENABLE_RERANK:
-        ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
-    
-    # 1. Load encoder (embedding model)
-    logger.info(f"[1/7] Loading encoder {config.EMBEDDING_MODEL}...")
-    encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
-    
-    # 2. Initialize LanceDB storage
-    logger.info("[2/7] Initializing LanceDB storage...")
-    vector_storage = LanceDBStorage(
-        db_path=config.LANCEDB_PATH,
-        embedding_dim=encoder.embedding_dim,
-    )
-    
-    # 3. Initialize SQLite storage
-    logger.info("[3/7] Initializing SQLite storage...")
-    sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
-    
-    # 4. Load Reranker model
-    if config.ENABLE_RERANK:
-        logger.info("[4/7] Loading Reranker model...")
-        reranker = Reranker()
-    else:
-        logger.info("[4/7] Reranker disabled (ENABLE_RERANK=False)")
-        reranker = None
-    
-    # 5. Initialize VLM client
-    logger.info("[5/7] Initializing VLM API client...")
-    vlm = ApiVLM()
-    
-    # 6. Initialize OCR engine (if enabled)
-    if config.ENABLE_OCR:
-        logger.info(f"[6/7] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
-        try:
-            ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
-        except Exception as e:
-            logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
-            ocr_engine = create_ocr_engine("dummy")
-        # Build RegionOCREngine on top of the platform OCR engine
-        from core.ocr.region_detector import UIEDRegionDetector
-        from core.ocr.region_ocr_engine import RegionOCREngine
-        region_ocr_engine = RegionOCREngine(
-            ocr_engine=ocr_engine,
-            region_detector=UIEDRegionDetector(),
-        )
-        logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
-    else:
-        logger.info("[6/7] OCR engine disabled (ENABLE_OCR=False)")
-        ocr_engine = None
-    
-    # 7. Optimize LanceDB (启动时优化：清理旧版本 + 压缩文件)
-    logger.info("[7/7] Optimizing LanceDB (cleanup old versions + compact files)...")
-    try:
-        from datetime import timedelta
-        if vector_storage is not None and vector_storage.table is not None:
-            # 使用 optimize 方法（清理旧版本 + 压缩文件）
-            # 清理 6 分钟前的版本（只保留最新的）
-            logger.info("优化 LanceDB（清理旧版本 + 压缩文件）...")
-            stats = vector_storage.cleanup_old_versions(
-                older_than_hours=0.1,  # 清理 6 分钟前的版本（只保留最新的）
-                delete_unverified=True
-            )
-            if stats:
-                logger.info(f"✓ 优化完成（cleanup_older_than=0.1小时）")
+        if _uied is not None:
+            logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
         else:
-            logger.info("LanceDB 表不存在，跳过优化")
+            logger.info("RegionOCREngine initialized (whole-image OCR only; ENABLE_UIED=false).")
+
+
+_DIFF_STATE_TABLE = "window_diff_state"
+
+
+_THUMBNAIL_SIZE = (128, 128)
+
+
+def _ensure_diff_state_table():
+    """Create or migrate the persistent diff state table."""
+    global sqlite_storage
+    if not sqlite_storage:
+        return
+    try:
+        with sqlite_storage._connection() as conn:
+            conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {_DIFF_STATE_TABLE} (
+                    window_key  TEXT PRIMARY KEY,
+                    app_name    TEXT NOT NULL,
+                    window_name TEXT NOT NULL,
+                    image_hash  INTEGER NOT NULL,
+                    thumbnail   BLOB,
+                    updated_at  TEXT NOT NULL
+                )
+            """)
+            # Migrate: add thumbnail column if missing (old schema)
+            cursor = conn.execute(f"PRAGMA table_info({_DIFF_STATE_TABLE})")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "thumbnail" not in columns:
+                conn.execute(f"ALTER TABLE {_DIFF_STATE_TABLE} ADD COLUMN thumbnail BLOB")
+            conn.commit()
     except Exception as e:
-        logger.warning(f"优化 LanceDB 失败: {e}")
-    
-    # 8. Initialize batch write buffer
-    logger.info("[8/10] Initializing batch write buffer...")
+        logger.warning(f"Failed to create {_DIFF_STATE_TABLE} table: {e}")
+
+
+_diff_state_flush_thread: Optional[threading.Thread] = None
+
+
+def _start_periodic_diff_state_flush(interval: float = 300.0):
+    """Start a daemon thread that flushes diff state every `interval` seconds."""
+    global _diff_state_flush_thread
+    import time
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            _flush_diff_state()
+
+    _diff_state_flush_thread = threading.Thread(target=_loop, daemon=True)
+    _diff_state_flush_thread.start()
+    logger.info(f"Periodic diff state flush started (every {interval:.0f}s).")
+
+
+def _flush_diff_state():
+    """
+    Batch-persist all window_diff_detector states (hash + thumbnail) to DB.
+    Called on shutdown + periodically (crash safety).
+    """
+    global window_diff_detector, sqlite_storage
+    if not window_diff_detector or not sqlite_storage:
+        return
+    states = window_diff_detector.window_states
+    if not states:
+        return
+    try:
+        rows = []
+        for key, s in states.items():
+            if s.previous_image is None:
+                continue
+            # Save thumbnail as lossless PNG to avoid compression artifacts
+            # affecting cross-session diff comparison
+            thumb = s.previous_image.resize(_THUMBNAIL_SIZE, PILImage.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            thumb.save(buf, format="PNG")
+            rows.append((
+                key, s.app_name, s.window_name, s.previous_hash,
+                buf.getvalue(),
+            ))
+        with sqlite_storage._connection() as conn:
+            conn.execute(f"DELETE FROM {_DIFF_STATE_TABLE}")
+            conn.executemany(f"""
+                INSERT INTO {_DIFF_STATE_TABLE}
+                    (window_key, app_name, window_name, image_hash, thumbnail, updated_at)
+                VALUES (?, ?, ?, ?, ?, datetime('now'))
+            """, rows)
+            conn.commit()
+        logger.info(f"Flushed {len(rows)} window diff states to DB.")
+    except Exception as e:
+        logger.warning(f"Failed to flush diff state: {e}")
+
+
+def _warm_up_frame_diff_detector():
+    """
+    Restore window_diff_detector state from persisted thumbnails.
+    Loads small JPEG thumbnails (not full images), fast startup.
+    """
+    global window_diff_detector, sqlite_storage
+    if not window_diff_detector or not sqlite_storage:
+        return
+
+    from core.capture.window_capturer import calculate_image_hash
+
+    _ensure_diff_state_table()
+
+    try:
+        with sqlite_storage._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT app_name, window_name, image_hash, thumbnail
+                FROM {_DIFF_STATE_TABLE}
+            """)
+            rows = cursor.fetchall()
+
+        if not rows:
+            logger.info("No persisted diff state found, skipping warm-up.")
+            return
+
+        seeded = 0
+        seeded_keys = []
+        for row in rows:
+            try:
+                blob = row["thumbnail"]
+                if not blob:
+                    continue
+                thumb = PILImage.open(io.BytesIO(blob)).convert("RGB")
+                img_hash = calculate_image_hash(thumb)
+                window_diff_detector.seed_window_state(
+                    row["app_name"], row["window_name"], thumb, img_hash
+                )
+                seeded += 1
+                seeded_keys.append(f"{row['app_name']}::{row['window_name']}")
+            except Exception:
+                pass
+
+        logger.info(
+            f"Warm-up: seeded {seeded}/{len(rows)} window diff states from DB.\n"
+            + "\n".join(f"  {k}" for k in seeded_keys)
+        )
+    except Exception as e:
+        logger.warning(f"Frame diff warm-up failed (non-fatal): {e}")
+
+
+def _init_models():
+    """
+    Load heavy ML models: encoder, reranker, OCR engine.
+    Called eagerly at startup (MODEL_LAZY_LOAD=false) or on-demand via /api/load_models.
+    """
+    global encoder, vector_storage, reranker, ocr_engine, region_ocr_engine
+    global _models_loaded, _models_loading
+
+    if _models_loaded:
+        return
+    _models_loading = True
+
+    try:
+        # 0. Pre-flight check: Ensure models are downloaded
+        ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
+        if config.ENABLE_RERANK:
+            ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
+
+        # 1. Load encoder (embedding model)
+        logger.info(f"[model 1/4] Loading encoder {config.EMBEDDING_MODEL}...")
+        encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
+
+        # 2. Initialize LanceDB storage (needs encoder.embedding_dim)
+        logger.info("[model 2/4] Initializing LanceDB storage...")
+        vector_storage = LanceDBStorage(
+            db_path=config.LANCEDB_PATH,
+            embedding_dim=encoder.embedding_dim,
+        )
+
+        # 2b. Optimize LanceDB
+        try:
+            if vector_storage.table is not None:
+                logger.info("Optimizing LanceDB (cleanup old versions)...")
+                vector_storage.cleanup_old_versions(older_than_hours=0.1, delete_unverified=True)
+                logger.info("LanceDB optimization done.")
+            else:
+                logger.info("LanceDB table does not exist, skipping optimization.")
+        except Exception as e:
+            logger.warning(f"LanceDB optimization failed: {e}")
+
+        # 3. Load Reranker model
+        if config.ENABLE_RERANK:
+            logger.info("[model 3/4] Loading Reranker model...")
+            reranker = Reranker()
+        else:
+            logger.info("[model 3/4] Reranker disabled (ENABLE_RERANK=False)")
+
+        # 4. Initialize OCR engine (if enabled)
+        if config.ENABLE_OCR:
+            logger.info(f"[model 4/4] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
+            try:
+                ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
+            except Exception as e:
+                logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
+                ocr_engine = create_ocr_engine("dummy")
+            from core.ocr.region_detector import UIEDRegionDetector
+            from core.ocr.region_ocr_engine import RegionOCREngine
+            _uied = UIEDRegionDetector() if config.ENABLE_UIED else None
+            region_ocr_engine = RegionOCREngine(
+                ocr_engine=ocr_engine,
+                region_detector=_uied,
+            )
+            if _uied is not None:
+                logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
+            else:
+                logger.info("RegionOCREngine initialized (whole-image OCR only; ENABLE_UIED=false).")
+        else:
+            logger.info("[model 4/4] OCR engine disabled (ENABLE_OCR=False)")
+
+        _models_loaded = True
+        logger.info("All ML models loaded successfully!")
+    finally:
+        _models_loading = False
+
+
+def _init_infra():
+    """
+    Initialize lightweight infrastructure components (no ML models).
+    Always called at startup regardless of MODEL_LAZY_LOAD.
+    """
+    global sqlite_storage, vlm, batch_write_buffer
+    global temp_frame_buffer, ffmpeg_compressor, ffmpeg_extractor, window_diff_detector
+
+    logger.info("=" * 60)
+    logger.info("Initializing infrastructure components...")
+    logger.info("=" * 60)
+
+    # SQLite storage
+    logger.info("[infra 1/7] Initializing SQLite storage...")
+    sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
+
+    # VLM client (lightweight API wrapper, no model loading)
+    logger.info("[infra 2/7] Initializing VLM API client...")
+    vlm = ApiVLM()
+
+    # Batch write buffer
+    logger.info("[infra 3/7] Initializing batch write buffer...")
     batch_write_buffer = BatchWriteBuffer(batch_size=10, flush_interval_seconds=60.0)
     batch_write_buffer.start()
-    
-    # 9. Initialize temp frame buffer for video compression
-    logger.info("[9/10] Initializing temp frame buffer for video compression...")
+
+    # Temp frame buffer for video compression
+    logger.info("[infra 4/7] Initializing temp frame buffer for video compression...")
     temp_frame_buffer = TempFrameBuffer(
         storage_root=config.STORAGE_ROOT,
         batch_size=VIDEO_BATCH_SIZE,
         fps=VIDEO_FPS,
         on_batch_ready=_on_video_batch_ready
     )
-    
-    # 10. Initialize FFmpeg utilities
-    logger.info("[10/11] Initializing FFmpeg utilities...")
+
+    # FFmpeg utilities
+    logger.info("[infra 5/7] Initializing FFmpeg utilities...")
     ffmpeg_compressor = FFmpegFrameCompressor(fps=VIDEO_FPS)
     ffmpeg_extractor = FFmpegFrameExtractor()
-    
-    # 11. Initialize window-level frame diff detector for dedup
-    logger.info("[11/11] Initializing window frame diff detector...")
+
+    # Window-level frame diff detector for dedup
+    logger.info("[infra 6/7] Initializing window frame diff detector...")
     window_diff_detector = FrameDiffDetector(
         screen_threshold=config.SIMPLE_FILTER_DIFF_THRESHOLD,
         window_threshold=config.SIMPLE_FILTER_DIFF_THRESHOLD,
     )
-    
-    # 12. Recover leftover temp frames from previous abnormal exit
-    logger.info("[12/12] Recovering leftover temp frames...")
+
+    # Recover leftover temp frames from previous abnormal exit
+    logger.info("[infra 7/7] Recovering leftover temp frames...")
     _recover_temp_frames()
+
+    # Warm up frame diff detector from DB (avoid cold-start re-capture)
+    logger.info("Warming up frame diff detector from previous session...")
+    _warm_up_frame_diff_detector()
+    _start_periodic_diff_state_flush(interval=300.0)  # every 5 min, crash safety
+
+
+def _init_all_components():
+    """
+    Initialize all components. Respects MODEL_LAZY_LOAD config:
+    - When true: only loads infra at startup, models loaded on-demand
+    - When false: loads everything eagerly at startup (original behavior)
+    """
+    _init_infra()
+
+    if config.MODEL_LAZY_LOAD:
+        logger.info("MODEL_LAZY_LOAD=true: Deferring ML model loading until recording starts.")
+    else:
+        logger.info("MODEL_LAZY_LOAD=false: Loading ML models eagerly at startup...")
+        _init_models()
 
     # 13. Initialize activity cluster manager
     global cluster_manager
@@ -948,6 +1138,8 @@ async def startup_event():
 
     try:
         _init_all_components()
+        # Initialize Data Platform API service (timeline, OCR, focus, analytics)
+        init_data_service(config.OCR_DB_PATH, config.ACTIVITY_DB_PATH)
     except Exception as e:
         logger.critical(f"Fatal error during startup: {e}", exc_info=True)
         # 让进程以非零状态退出，Electron 端可以感知到后端启动失败
@@ -965,6 +1157,13 @@ async def shutdown_event():
     
     global encoder, reranker, vlm, ocr_engine, region_ocr_engine, vector_storage, sqlite_storage
     
+    # 0. Persist frame diff state (before any cleanup)
+    try:
+        logger.info("Flushing window diff state...")
+        _flush_diff_state()
+    except Exception as e:
+        logger.error(f"Error flushing diff state: {e}")
+
     # 1. 先刷新视频缓冲区
     try:
         if temp_frame_buffer is not None:
@@ -1038,6 +1237,34 @@ async def shutdown_event():
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.post("/api/load_models")
+def load_models_api():
+    """
+    On-demand loading of heavy ML models (encoder, reranker, OCR).
+    Called by frontend before starting recording when MODEL_LAZY_LOAD=true.
+    Returns immediately if models are already loaded.
+    """
+    if _models_loaded:
+        return {"status": "ok", "message": "Models already loaded"}
+    if _models_loading:
+        return {"status": "loading", "message": "Models are currently loading"}
+    try:
+        _init_models()
+        return {"status": "ok", "message": "Models loaded successfully"}
+    except Exception as e:
+        logger.error(f"Failed to load models on demand: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to load models: {e}")
+
+
+@app.get("/api/models_status")
+def get_models_status():
+    """Check whether ML models are loaded and ready."""
+    return {
+        "loaded": _models_loaded,
+        "loading": _models_loading,
+    }
 
 
 @app.get("/api/stats")
@@ -1127,6 +1354,7 @@ def store_frame(req: StoreFrameRequest):
     global temp_frame_buffer
 
     _t0 = time_module.time()
+    _HANDLER_MAX_SECONDS = 25
     logger.info(f"store_frame: START {req.frame_id}")
 
     # 组件检查
@@ -1144,6 +1372,11 @@ def store_frame(req: StoreFrameRequest):
     # Decode full screen image
     img_bytes = base64.b64decode(req.image_base64)
     image = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
+
+    # Skip solid-color / black-screen frames entirely (e.g. monitor off, lid closed)
+    if is_solid_color_image(image):
+        logger.debug("store_frame: skipping solid-color full screen image (screen off?)")
+        return {"status": "skipped", "reason": "solid_color_frame", "frame_id": None}
 
     # 生成 frame_id
     base_frame_id = ts.strftime("%Y%m%d_%H%M%S_") + f"{ts.microsecond:06d}"
@@ -1193,6 +1426,7 @@ def store_frame(req: StoreFrameRequest):
     # ========== 3. 处理窗口截图 ==========
     
     sub_frame_ids = []
+    sub_frame_summaries = []  # Collect sub_frame info for response (avoid extra HTTP round-trips)
     windows_to_process = []
     
     # 如果前端提供了窗口信息，使用前端数据
@@ -1234,11 +1468,17 @@ def store_frame(req: StoreFrameRequest):
         except Exception as e:
             logger.warning(f"Backend window capture failed: {e}")
     
+    # Tracking for final summary log (shared across window batch + fullscreen app subframe)
+    _processed_apps: List[str] = []
+    _processed_reasons: List[str] = []
+    _skipped_dedup_apps: List[str] = []
+    _skipped_solid = 0
+
     # 处理窗口（帧差去重 + embedding + app_name/window_name 记录）
     if windows_to_process and temp_frame_buffer is not None:
         from utils.data_models import WindowFrame as WF
         from core.capture.window_capturer import calculate_image_hash
-        
+
         # 收集所有窗口的应用名称和窗口名称进行持久化
         current_apps = []
         app_window_pairs = []
@@ -1254,7 +1494,7 @@ def store_frame(req: StoreFrameRequest):
             app_name_manager.add_apps(current_apps)
         if app_window_pairs:
             app_name_manager.add_window_pairs(app_window_pairs)
-        
+
         for i, win_data in enumerate(windows_to_process):
             try:
                 win_image = win_data["image"]
@@ -1277,6 +1517,7 @@ def store_frame(req: StoreFrameRequest):
                             f"Skipping duplicate window {app_name}/{window_name} "
                             f"(diff={diff_result.diff_score:.4f})"
                         )
+                        _skipped_dedup_apps.append(app_name)
                         continue
 
                 # Skip solid-color / black-screen window images
@@ -1284,7 +1525,14 @@ def store_frame(req: StoreFrameRequest):
                     logger.debug(
                         f"Skipping solid-color window: {app_name}/{window_name}"
                     )
+                    _skipped_solid += 1
                     continue
+
+                _processed_apps.append(app_name)
+                _processed_reasons.append(
+                    f"{app_name}/{window_name} diff={diff_result.diff_score:.4f} reason={diff_result.reason}"
+                    if window_diff_detector is not None else f"{app_name}/{window_name} no_detector"
+                )
 
                 # 生成 sub_frame_id
                 safe_app = app_name.replace(" ", "_").replace("/", "_")[:20]
@@ -1302,6 +1550,15 @@ def store_frame(req: StoreFrameRequest):
                 win_ocr_engine_name = "none"
                 win_ocr_conf = 0.0
                 win_ocr_regions_stored = False
+                win_layout_text = ""
+                win_regions = []
+                _elapsed_check = time_module.time() - _t0
+                if _elapsed_check > _HANDLER_MAX_SECONDS:
+                    logger.warning(
+                        f"store_frame: {frame_id} TIMEOUT GUARD — {_elapsed_check:.1f}s elapsed, "
+                        f"skipping remaining window OCR"
+                    )
+                    break
                 if region_ocr_engine is not None:
                     try:
                         win_regions = region_ocr_engine.recognize_regions(win_image)
@@ -1325,6 +1582,26 @@ def store_frame(req: StoreFrameRequest):
                                     len(r.get("text", "")) * r.get("ocr_confidence", 0.0)
                                     for r in win_regions
                                 ) / total_len
+                            try:
+                                from core.activity.vlm_labeler import build_region_layout_text
+
+                                win_layout_regions = []
+                                for r in win_regions:
+                                    bbox = r.get("bbox")
+                                    text = r.get("text", "")
+                                    if not bbox or not text:
+                                        continue
+                                    win_layout_regions.append(
+                                        {
+                                            "bbox": bbox,
+                                            "text": text,
+                                            "image_width": win_w,
+                                            "image_height": win_h,
+                                        }
+                                    )
+                                win_layout_text = build_region_layout_text(win_layout_regions)
+                            except Exception:
+                                win_layout_text = ""
                     except Exception as e:
                         logger.warning(f"Region OCR failed for window {app_name}: {e}")
 
@@ -1394,6 +1671,7 @@ def store_frame(req: StoreFrameRequest):
                             embedding=win_embedding,
                             image=win_image,
                             ocr_text=win_ocr_text,
+                            layout_text=win_layout_text,
                             timestamp=ts.isoformat(),
                             window_name=window_name,
                         )
@@ -1405,6 +1683,13 @@ def store_frame(req: StoreFrameRequest):
                         logger.debug(f"Cluster assign failed for {sub_frame_id}: {e}")
 
                 sub_frame_ids.append(sub_frame_id)
+                sub_frame_summaries.append({
+                    "sub_frame_id": sub_frame_id,
+                    "timestamp": ts.isoformat(),
+                    "app_name": app_name,
+                    "window_name": window_name,
+                    "image_path": win_temp_path,
+                })
 
                 # 如果窗口批次就绪，触发压缩
                 if win_batch_ready:
@@ -1413,124 +1698,195 @@ def store_frame(req: StoreFrameRequest):
             except Exception as e:
                 logger.warning(f"Failed to process window {win_data.get('app_name', 'unknown')}: {e}")
                 continue
-    
-    # ========== 4. 全屏应用检测：如果聚焦的应用不在已捕获的窗口中，创建合成子帧 ==========
+
+        # (batch summary moved to final done log)
+
+    # ========== 4. 全屏应用检测：如果聚焦的应用不在已捕获的窗口中，创建全屏应用子帧 ==========
+    # When an app is in macOS native fullscreen, screencap_rs can't capture its
+    # window.  The fullscreen screenshot IS the focused app, so we OCR the
+    # fullscreen image directly — sub_frame_ocr_parts contain background-window
+    # OCR which is NOT what's on screen.
     if focused_app and temp_frame_buffer is not None:
         captured_app_names = {w.get("app_name", "") for w in windows_to_process}
         if focused_app not in captured_app_names:
-            try:
-                safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
-                syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
-
-                # Run independent region OCR for this synthetic sub_frame
-                # (do NOT reuse full-screen OCR — it contains text from all windows)
-                syn_ocr_text = ""
-                syn_ocr_engine_name = "none"
-                syn_ocr_conf = 0.0
-                syn_ocr_regions_stored = False
-                if region_ocr_engine is not None:
-                    try:
-                        syn_regions = region_ocr_engine.recognize_regions(image)
-                        if syn_regions:
-                            syn_img_w, syn_img_h = image.size
-                            syn_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
-                            sqlite_storage.store_ocr_with_regions(
-                                sub_frame_id=syn_sub_id,
-                                regions=syn_regions,
-                                ocr_engine=syn_ocr_engine_name,
-                                image_width=syn_img_w,
-                                image_height=syn_img_h,
-                            )
-                            syn_ocr_text = "\n".join(
-                                r.get("text", "") for r in syn_regions if r.get("text")
-                            )
-                            syn_ocr_regions_stored = True
-                            total_len = sum(len(r.get("text", "")) for r in syn_regions)
-                            if total_len > 0:
-                                syn_ocr_conf = sum(
-                                    len(r.get("text", "")) * r.get("ocr_confidence", 0.0)
-                                    for r in syn_regions
-                                ) / total_len
-                    except Exception as e:
-                        logger.warning(f"Region OCR failed for synthetic sub_frame {focused_app}: {e}")
-
-                # SQLite: sub_frames record (window_chunk_id=0 marks it as synthetic)
-                if sqlite_storage is not None:
-                    sqlite_storage.store_sub_frame(
-                        sub_frame_id=syn_sub_id,
-                        timestamp=ts,
-                        window_chunk_id=0,
-                        offset_index=0,
-                        app_name=focused_app,
-                        window_name=focused_win or focused_app,
-                    )
-                    sqlite_storage.add_frame_subframe_mapping(
-                        frame_id=frame_id,
-                        sub_frame_id=syn_sub_id,
-                    )
-                    # Pre-create frames table entry (image_path updated on compression)
-                    # Pass empty ocr_text since region OCR already wrote to ocr_text
-                    sqlite_storage.store_frame_with_ocr(
-                        frame_id=syn_sub_id,
-                        timestamp=ts,
-                        image_path=temp_image_path,
-                        ocr_text="" if syn_ocr_regions_stored else syn_ocr_text,
-                        ocr_text_json="",
-                        ocr_engine=syn_ocr_engine_name,
-                        ocr_confidence=syn_ocr_conf,
-                        device_name=f"{focused_app}/{focused_win}",
-                        app_name=focused_app,
-                        window_name=focused_win or focused_app,
-                    )
-
-                # LanceDB: reuse the same embedding (no re-encoding)
-                syn_frame_data = {
-                    "frame_id": syn_sub_id,
-                    "timestamp": ts,
-                    "image": image,
-                    "embedding": embedding,
-                    "ocr_text": syn_ocr_text,
-                    "image_path": temp_image_path,
-                    "ocr_text_json": "",
-                    "ocr_engine": syn_ocr_engine_name,
-                    "ocr_confidence": syn_ocr_conf,
-                    "device_name": f"{focused_app}/{focused_win}",
-                    "metadata": {"is_fullscreen_synthetic": True, "parent_frame_id": frame_id},
-                    "app_name": focused_app,
-                    "window_name": focused_win or focused_app,
-                    "_ocr_regions_stored": syn_ocr_regions_stored,
-                }
-                batch_write_buffer.add_frame(syn_frame_data)
-
-                if cluster_manager is not None:
-                    try:
-                        activity_label = cluster_manager.assign_frame(
-                            app_name=focused_app,
-                            frame_id=syn_sub_id,
-                            embedding=embedding,
-                            image=image,
-                            ocr_text=syn_ocr_text,
-                            timestamp=ts.isoformat(),
-                            window_name=focused_win or "",
-                        )
-                        if activity_label:
-                            logger.debug(f"Assigned {syn_sub_id} -> '{activity_label}'")
-                        _log_non_committed_cluster_result(focused_app, syn_sub_id)
-                    except Exception as e:
-                        logger.debug(f"Cluster assign failed for {syn_sub_id}: {e}")
-
-                sub_frame_ids.append(syn_sub_id)
-
-                # Collect for frame-level combined OCR
-                if syn_ocr_text:
-                    sub_frame_ocr_parts.append((focused_app, syn_ocr_text, syn_ocr_conf))
-
-                logger.debug(
-                    f"Created synthetic sub_frame {syn_sub_id} for "
-                    f"full-screen app {focused_app}/{focused_win}"
+            logger.info(f"store_frame: {frame_id} step=fullscreen_subframe_start app={focused_app}")
+            _syn_should_store = True
+            if window_diff_detector is not None:
+                from core.capture.window_capturer import calculate_image_hash as _calc_hash
+                from utils.data_models import WindowFrame as _WF
+                _syn_hash = _calc_hash(image)
+                _syn_wf = _WF(
+                    app_name=focused_app,
+                    window_name=focused_win or focused_app,
+                    image=image,
+                    image_hash=_syn_hash,
+                    timestamp=ts,
                 )
-            except Exception as e:
-                logger.warning(f"Failed to create synthetic sub_frame for {focused_app}: {e}")
+                _syn_diff = window_diff_detector.check_window_diff(_syn_wf)
+                if not _syn_diff.should_store:
+                    _skipped_dedup_apps.append(f"{focused_app}(fullscreen)")
+                    _syn_should_store = False
+                    # Reuse cached OCR so the frame-level combined OCR still
+                    # contains the fullscreen app's text
+                    _cached = _fullscreen_ocr_cache.get(focused_app)
+                    if _cached:
+                        sub_frame_ocr_parts.append((focused_app, _cached[0], _cached[1]))
+                else:
+                    _processed_apps.append(f"{focused_app}(fullscreen)")
+                    _processed_reasons.append(
+                        f"{focused_app}(fullscreen) diff={_syn_diff.diff_score:.4f} "
+                        f"reason={_syn_diff.reason}"
+                    )
+
+            if _syn_should_store:
+                try:
+                    safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
+                    syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
+
+                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_start")
+                    syn_ocr_text = ""
+                    syn_ocr_engine_name = "none"
+                    syn_ocr_conf = 0.0
+                    syn_ocr_regions_stored = False
+                    syn_layout_text = ""
+                    _elapsed_check = time_module.time() - _t0
+                    if _elapsed_check > _HANDLER_MAX_SECONDS:
+                        logger.warning(
+                            f"store_frame: {frame_id} TIMEOUT GUARD — {_elapsed_check:.1f}s elapsed, "
+                            f"skipping fullscreen OCR for {focused_app}"
+                        )
+                    elif region_ocr_engine is not None:
+                        try:
+                            syn_regions = region_ocr_engine.recognize_regions(image)
+                            if syn_regions:
+                                syn_img_w, syn_img_h = image.size
+                                syn_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
+                                sqlite_storage.store_ocr_with_regions(
+                                    sub_frame_id=syn_sub_id,
+                                    regions=syn_regions,
+                                    ocr_engine=syn_ocr_engine_name,
+                                    image_width=syn_img_w,
+                                    image_height=syn_img_h,
+                                )
+                                syn_ocr_text = "\n".join(
+                                    r.get("text", "") for r in syn_regions if r.get("text")
+                                )
+                                syn_ocr_regions_stored = True
+                                total_len = sum(len(r.get("text", "")) for r in syn_regions)
+                                if total_len > 0:
+                                    syn_ocr_conf = sum(
+                                        len(r.get("text", "")) * r.get("ocr_confidence", 0.0)
+                                        for r in syn_regions
+                                    ) / total_len
+                                try:
+                                    from core.activity.vlm_labeler import build_region_layout_text
+
+                                    syn_layout_regions = []
+                                    for r in syn_regions:
+                                        bbox = r.get("bbox")
+                                        text = r.get("text", "")
+                                        if not bbox or not text:
+                                            continue
+                                        syn_layout_regions.append(
+                                            {
+                                                "bbox": bbox,
+                                                "text": text,
+                                                "image_width": syn_img_w,
+                                                "image_height": syn_img_h,
+                                            }
+                                        )
+                                    syn_layout_text = build_region_layout_text(syn_layout_regions)
+                                except Exception:
+                                    syn_layout_text = ""
+                        except Exception as e:
+                            logger.warning(f"Region OCR failed for fullscreen app sub_frame {focused_app}: {e}")
+
+                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_done len={len(syn_ocr_text)}")
+                    # SQLite: sub_frames record (window_chunk_id=0 marks fullscreen app)
+                    if sqlite_storage is not None:
+                        sqlite_storage.store_sub_frame(
+                            sub_frame_id=syn_sub_id,
+                            timestamp=ts,
+                            window_chunk_id=0,
+                            offset_index=0,
+                            app_name=focused_app,
+                            window_name=focused_win or focused_app,
+                        )
+                        sqlite_storage.add_frame_subframe_mapping(
+                            frame_id=frame_id,
+                            sub_frame_id=syn_sub_id,
+                        )
+                        sqlite_storage.store_frame_with_ocr(
+                            frame_id=syn_sub_id,
+                            timestamp=ts,
+                            image_path=temp_image_path,
+                            ocr_text="" if syn_ocr_regions_stored else syn_ocr_text,
+                            ocr_text_json="",
+                            ocr_engine=syn_ocr_engine_name,
+                            ocr_confidence=syn_ocr_conf,
+                            device_name=f"{focused_app}/{focused_win}",
+                            app_name=focused_app,
+                            window_name=focused_win or focused_app,
+                        )
+
+                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_sqlite_done")
+                    # LanceDB: reuse the same embedding (no re-encoding)
+                    syn_frame_data = {
+                        "frame_id": syn_sub_id,
+                        "timestamp": ts,
+                        "image": image,
+                        "embedding": embedding,
+                        "ocr_text": syn_ocr_text,
+                        "image_path": temp_image_path,
+                        "ocr_text_json": "",
+                        "ocr_engine": syn_ocr_engine_name,
+                        "ocr_confidence": syn_ocr_conf,
+                        "device_name": f"{focused_app}/{focused_win}",
+                        "metadata": {"is_fullscreen_synthetic": True, "parent_frame_id": frame_id},
+                        "app_name": focused_app,
+                        "window_name": focused_win or focused_app,
+                        "_ocr_regions_stored": syn_ocr_regions_stored,
+                    }
+                    batch_write_buffer.add_frame(syn_frame_data)
+
+                    if cluster_manager is not None:
+                        try:
+                            activity_label = cluster_manager.assign_frame(
+                                app_name=focused_app,
+                                frame_id=syn_sub_id,
+                                embedding=embedding,
+                                image=image,
+                                ocr_text=syn_ocr_text,
+                                layout_text=syn_layout_text,
+                                timestamp=ts.isoformat(),
+                                window_name=focused_win or "",
+                            )
+                            if activity_label:
+                                logger.debug(f"Assigned {syn_sub_id} -> '{activity_label}'")
+                            _log_non_committed_cluster_result(focused_app, syn_sub_id)
+                        except Exception as e:
+                            logger.debug(f"Cluster assign failed for {syn_sub_id}: {e}")
+
+                    sub_frame_ids.append(syn_sub_id)
+                    sub_frame_summaries.append({
+                        "sub_frame_id": syn_sub_id,
+                        "timestamp": ts.isoformat(),
+                        "app_name": focused_app,
+                        "window_name": focused_win or focused_app,
+                        "image_path": temp_image_path,
+                    })
+
+                    # Collect for frame-level combined OCR + update cache
+                    if syn_ocr_text:
+                        sub_frame_ocr_parts.append((focused_app, syn_ocr_text, syn_ocr_conf))
+                        _fullscreen_ocr_cache[focused_app] = (syn_ocr_text, syn_ocr_conf)
+
+                    logger.debug(
+                        f"Created fullscreen app sub_frame {syn_sub_id} for "
+                        f"full-screen app {focused_app}/{focused_win}"
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to create fullscreen app sub_frame for {focused_app}: {e}")
 
     # ========== 5. 组合全屏帧 OCR：拼接所有 sub_frame 的 OCR 文本 ==========
     combined_ocr_text = ""
@@ -1583,7 +1939,25 @@ def store_frame(req: StoreFrameRequest):
     batch_write_buffer.add_frame(frame_data)
 
     _elapsed = time_module.time() - _t0
-    logger.info(f"store_frame: {frame_id} done in {_elapsed:.2f}s, {len(sub_frame_ids)} windows (focused={focused_app})")
+
+    def _format_app_list(apps: List[str]) -> str:
+        counts: Dict[str, int] = {}
+        for a in apps:
+            counts[a] = counts.get(a, 0) + 1
+        return ", ".join(f"{a}×{c}" if c > 1 else a for a, c in counts.items())
+
+    _summary_parts = [
+        f"store_frame: {frame_id} done in {_elapsed:.2f}s "
+        f"sub_frames={len(sub_frame_ids)} processed={len(_processed_apps)} "
+        f"deduped={len(_skipped_dedup_apps)} solid={_skipped_solid} "
+        f"focused={focused_app}"
+    ]
+    if _processed_reasons:
+        for _r in _processed_reasons:
+            _summary_parts.append(f"  + {_r}")
+    if _skipped_dedup_apps:
+        _summary_parts.append(f"  deduped: {_format_app_list(_skipped_dedup_apps)}")
+    logger.info("\n".join(_summary_parts))
 
     # Check if cluster recalculation is needed (runs in background thread)
     if cluster_manager is not None and cluster_manager.should_recalculate():
@@ -1594,7 +1968,37 @@ def store_frame(req: StoreFrameRequest):
                 daemon=True,
             ).start()
 
-    return {"status": "ok", "frame_id": frame_id, "sub_frame_count": len(sub_frame_ids)}
+    # Build frame summary for frontend (avoids extra HTTP round-trips for timeline refresh)
+    today_count = 0
+    try:
+        today_str = ts.strftime("%Y-%m-%d")
+        next_day_str = (ts + timedelta(days=1)).strftime("%Y-%m-%d")
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT COUNT(*) as count FROM frames
+                WHERE timestamp >= ? AND timestamp < ?
+                  AND image_path IS NOT NULL AND image_path != ''
+                  AND frame_id LIKE 'frame_%'
+            """, (today_str, next_day_str))
+            row = cursor.fetchone()
+            today_count = row["count"] if row else 0
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "frame_id": frame_id,
+        "sub_frame_count": len(sub_frame_ids),
+        "today_count": today_count,
+        "frame_summary": {
+            "frame_id": frame_id,
+            "timestamp": ts.isoformat(),
+            "image_path": temp_image_path,
+            "ocr_text": combined_ocr_text,
+            "sub_frames": sub_frame_summaries,
+        },
+    }
 
 
 @app.post("/api/query_rag_with_time", response_model=QueryRagWithTimeResponse)
@@ -1795,14 +2199,13 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
     # Activity label post-filter (queries activity DB, not main DB)
     if req.activity_label and sqlite_storage is not None:
         try:
-            conn_al = sqlite_storage._get_activity_connection()
-            cursor_al = conn_al.cursor()
-            cursor_al.execute(
-                "SELECT sub_frame_id FROM activity_assignments WHERE activity_label LIKE ?",
-                (f"%{req.activity_label}%",),
-            )
-            matching_ids = {r["sub_frame_id"] for r in cursor_al.fetchall()}
-            conn_al.close()
+            with sqlite_storage._activity_connection() as conn_al:
+                cursor_al = conn_al.cursor()
+                cursor_al.execute(
+                    "SELECT sub_frame_id FROM activity_assignments WHERE activity_label LIKE ?",
+                    (f"%{req.activity_label}%",),
+                )
+                matching_ids = {r["sub_frame_id"] for r in cursor_al.fetchall()}
             before = len(frames)
             frames = [f for f in frames if f.get("frame_id") in matching_ids]
             logger.info(f"activity_label filter '{req.activity_label}': {before} -> {len(frames)}")
@@ -1825,11 +2228,10 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
             fid = f.get("frame_id")
             if fid:
                 try:
-                    conn = sqlite_storage._get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (fid,))
-                    row = cursor.fetchone()
-                    conn.close()
+                    with sqlite_storage._connection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (fid,))
+                        row = cursor.fetchone()
                     if row and row["image_path"] and row["image_path"] != path:
                         resolved_path = row["image_path"]
                         img = _load_image_from_path(resolved_path)
@@ -1939,14 +2341,13 @@ def _load_image_from_path(path_str: str):
         if sqlite_storage is None or ffmpeg_extractor is None:
             return None
         try:
-            conn = sqlite_storage._get_connection()
-            cursor = conn.cursor()
-            if path_str.startswith("video_chunk:"):
-                cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
-            else:
-                cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
-            row = cursor.fetchone()
-            conn.close()
+            with sqlite_storage._connection() as conn:
+                cursor = conn.cursor()
+                if path_str.startswith("video_chunk:"):
+                    cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
+                else:
+                    cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
+                row = cursor.fetchone()
             if not row or not row["file_path"]:
                 return None
             video_path = row["file_path"]
@@ -2014,18 +2415,17 @@ def get_image(path: str = Query(..., description="Image file path")):
             if sqlite_storage is None:
                 raise HTTPException(status_code=500, detail="Storage not initialized")
             
-            conn = sqlite_storage._get_connection()
-            cursor = conn.cursor()
-            
-            # 根据 chunk 类型查询不同的表
-            if path_str.startswith("video_chunk:"):
-                cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
-            else:  # window_chunk
-                cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
-            
-            row = cursor.fetchone()
-            conn.close()
-            
+            with sqlite_storage._connection() as conn:
+                cursor = conn.cursor()
+
+                # 根据 chunk 类型查询不同的表
+                if path_str.startswith("video_chunk:"):
+                    cursor.execute("SELECT file_path, fps FROM video_chunks WHERE id = ?", (chunk_id,))
+                else:  # window_chunk
+                    cursor.execute("SELECT file_path, fps FROM window_chunks WHERE id = ?", (chunk_id,))
+
+                row = cursor.fetchone()
+
             if not row:
                 chunk_type = "video" if path_str.startswith("video_chunk:") else "window"
                 raise HTTPException(status_code=404, detail=f"{chunk_type} chunk {chunk_id} not found")
@@ -2110,12 +2510,11 @@ def get_image(path: str = Query(..., description="Image file path")):
                             
                             # 查询数据库获取最新路径
                             if sqlite_storage:
-                                conn = sqlite_storage._get_connection()
-                                cursor = conn.cursor()
-                                cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
-                                row = cursor.fetchone()
-                                conn.close()
-                                
+                                with sqlite_storage._connection() as conn:
+                                    cursor = conn.cursor()
+                                    cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+                                    row = cursor.fetchone()
+
                                 if row and row['image_path'] and row['image_path'] != path_str:
                                     logger.info(f"Found updated path for {frame_id}: {row['image_path']}")
                                     # 递归调用 get_image 处理新路径（可能是 video_chunk）
@@ -2125,14 +2524,13 @@ def get_image(path: str = Query(..., description="Image file path")):
                             # 窗口子帧: subframe_{safe_app}_{ts_str}_{index}
                             # 注意：由于 safe_app 和 index 难以从路径反推，我们尝试模糊匹配 timestamp
                             if sqlite_storage:
-                                conn = sqlite_storage._get_connection()
-                                cursor = conn.cursor()
-                                # 转换 ts_str (20260126_103850_579000) 到 ISO 格式的一部分进行匹配
-                                # 或者直接匹配 sub_frame_id 包含 ts_str 的记录
-                                cursor.execute("SELECT window_chunk_id, offset_index FROM sub_frames WHERE sub_frame_id LIKE ?", (f"%{ts_str}%",))
-                                row = cursor.fetchone()
-                                conn.close()
-                                
+                                with sqlite_storage._connection() as conn:
+                                    cursor = conn.cursor()
+                                    # 转换 ts_str (20260126_103850_579000) 到 ISO 格式的一部分进行匹配
+                                    # 或者直接匹配 sub_frame_id 包含 ts_str 的记录
+                                    cursor.execute("SELECT window_chunk_id, offset_index FROM sub_frames WHERE sub_frame_id LIKE ?", (f"%{ts_str}%",))
+                                    row = cursor.fetchone()
+
                                 if row and row["window_chunk_id"]:
                                     new_path = f"window_chunk:{row['window_chunk_id']}:{row['offset_index']}"
                                     logger.info(f"Found updated window_chunk path for temp window frame: {new_path}")
@@ -2268,20 +2666,19 @@ def get_frames_count_by_date(req: GetFramesByDateRequest):
         end_time_str = next_day.strftime("%Y-%m-%d")
         
         # 使用 COUNT 查询获取总数（只统计主帧：frame_* 开头，有 image_path）
-        conn = sqlite_storage._get_connection()
-        cursor = conn.cursor()
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
 
-        cursor.execute("""
-            SELECT COUNT(*) as count
-            FROM frames f
-            WHERE f.timestamp >= ? AND f.timestamp < ?
-            AND f.image_path IS NOT NULL AND f.image_path != ''
-            AND f.frame_id LIKE 'frame_%'
-        """, (start_time_str, end_time_str))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
+            cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM frames f
+                WHERE f.timestamp >= ? AND f.timestamp < ?
+                AND f.image_path IS NOT NULL AND f.image_path != ''
+                AND f.frame_id LIKE 'frame_%'
+            """, (start_time_str, end_time_str))
+
+            row = cursor.fetchone()
+
         total_count = row["count"] if row else 0
         
         return DateFrameCountResponse(date=req.date, total_count=total_count)
@@ -2319,28 +2716,27 @@ def get_frames_by_date(req: GetFramesByDateRequest):
         
         # 直接从 SQLite 获取该天的帧（使用 OFFSET 和 LIMIT 进行分页）
         # 注意：现在排序是 ASC（从早到晚），所以 offset=0 是最早的，offset=50 是第 51-100 张
-        conn = sqlite_storage._get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT
-                f.frame_id,
-                f.timestamp,
-                f.image_path,
-                f.device_name,
-                f.metadata,
-                o.text as ocr_text,
-                o.confidence as ocr_confidence
-            FROM frames f
-            LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
-            WHERE f.timestamp >= ? AND f.timestamp < ?
-            AND f.frame_id LIKE 'frame_%'
-            ORDER BY f.timestamp ASC
-            LIMIT ? OFFSET ?
-        """, (start_time_str, end_time_str, limit, offset))
-        
-        rows = cursor.fetchall()
-        conn.close()
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT
+                    f.frame_id,
+                    f.timestamp,
+                    f.image_path,
+                    f.device_name,
+                    f.metadata,
+                    o.text as ocr_text,
+                    o.confidence as ocr_confidence
+                FROM frames f
+                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
+                WHERE f.timestamp >= ? AND f.timestamp < ?
+                AND f.frame_id LIKE 'frame_%'
+                ORDER BY f.timestamp ASC
+                LIMIT ? OFFSET ?
+            """, (start_time_str, end_time_str, limit, offset))
+
+            rows = cursor.fetchall()
         
         # 转换为 API 响应格式（只返回路径，不返回 base64），并附带子帧（含可用的 image_path）
         result = []
@@ -2573,7 +2969,6 @@ def _check_clustering_health() -> tuple:
     Returns (is_healthy: bool, issue: str).
     Only relevant when ENABLE_CLUSTERING=True.
     """
-    import sqlite3
     import os
 
     db_path = config.OCR_DB_PATH
@@ -2581,49 +2976,38 @@ def _check_clustering_health() -> tuple:
         return True, ""  # Fresh install, nothing to check
 
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        with sqlite_storage._connection() as conn, sqlite_storage._activity_connection() as act_conn:
+            cursor = conn.cursor()
+            act_cursor = act_conn.cursor()
 
-        # Use activity DB for clustering health checks
-        act_conn = sqlite_storage._get_activity_connection()
-        act_cursor = act_conn.cursor()
+            # Check if required tables exist in activity DB
+            act_cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+                "('activity_clusters', 'activity_sessions', 'activity_assignments')"
+            )
+            existing = {row[0] for row in act_cursor.fetchall()}
+            missing = {"activity_clusters", "activity_sessions", "activity_assignments"} - existing
+            if missing:
+                return False, f"Missing clustering tables in activity DB: {', '.join(sorted(missing))}"
 
-        # Check if required tables exist in activity DB
-        act_cursor.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('activity_clusters', 'activity_sessions', 'activity_assignments')"
-        )
-        existing = {row[0] for row in act_cursor.fetchall()}
-        missing = {"activity_clusters", "activity_sessions", "activity_assignments"} - existing
-        if missing:
-            act_conn.close()
-            conn.close()
-            return False, f"Missing clustering tables in activity DB: {', '.join(sorted(missing))}"
+            # Check if there are any frames to worry about
+            cursor.execute("SELECT COUNT(*) FROM sub_frames")
+            total_frames = cursor.fetchone()[0]
+            if total_frames == 0:
+                return True, ""
 
-        # Check if there are any frames to worry about
-        cursor.execute("SELECT COUNT(*) FROM sub_frames")
-        total_frames = cursor.fetchone()[0]
-        if total_frames == 0:
-            act_conn.close()
-            conn.close()
-            return True, ""
+            # Check if timeline is empty while frames exist
+            act_cursor.execute("SELECT MAX(end_time) FROM activity_sessions")
+            latest_session = act_cursor.fetchone()[0]
+            if not latest_session:
+                return False, f"Timeline is empty but {total_frames} frames exist"
 
-        # Check if timeline is empty while frames exist
-        act_cursor.execute("SELECT MAX(end_time) FROM activity_sessions")
-        latest_session = act_cursor.fetchone()[0]
-        if not latest_session:
-            act_conn.close()
-            conn.close()
-            return False, f"Timeline is empty but {total_frames} frames exist"
-
-        # Check how many frames are uncovered after the last session
-        act_cursor.execute(
-            "SELECT COUNT(*) FROM activity_assignments WHERE timestamp > ? AND activity_cluster_id IS NULL",
-            (latest_session,),
-        )
-        uncovered = act_cursor.fetchone()[0]
-        act_conn.close()
-        conn.close()
+            # Check how many frames are uncovered after the last session
+            act_cursor.execute(
+                "SELECT COUNT(*) FROM activity_assignments WHERE timestamp > ? AND activity_cluster_id IS NULL",
+                (latest_session,),
+            )
+            uncovered = act_cursor.fetchone()[0]
 
         if uncovered > 200:
             return False, (

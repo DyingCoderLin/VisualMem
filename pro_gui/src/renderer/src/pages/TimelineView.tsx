@@ -32,7 +32,7 @@ interface DateGroup {
 // ========== 可调整参数 ==========
 const INITIAL_LOAD_BATCH_SIZE = 50
 const LOAD_MORE_BATCH_SIZE = 50
-const LOAD_MORE_THRESHOLD = 10  // 降低阈值：距离末尾 10 个 item 宽度时触发加载（约 2080px）
+const LOAD_MORE_THRESHOLD = 5  // 距离末尾 5 个 item 宽度时触发加载（约 1040px）
 const DAYS_TO_LOAD_PER_BATCH = 4  // 每次希望能找出多少天的数据（初始加载更多，让用户能看到更多内容）
 const MAX_EMPTY_CHECKS = 30       // 关键参数：如果连着查了30天都没数据，先暂停，防止瞬间请求过多
 
@@ -161,6 +161,12 @@ const TimelineView: React.FC = () => {
   // 使用 ref 存储最新的 loading 和 hasMore 状态，避免闭包问题
   const loadingRef = useRef(false)
   const hasMoreRef = useRef(true)
+
+  // 防止 loadMoreFramesForDate 并发/重试风暴：
+  // - inflightDates: 正在请求中的日期（ref 级别，比 state 更及时）
+  // - failedDateBackoff: 失败后退避到指定时间戳
+  const inflightDatesRef = useRef<Set<string>>(new Set())
+  const failedDateBackoffRef = useRef<Map<string, number>>(new Map())
   
   // 【关键修改】cursorDateRef: 记录时间轴目前探索到的最后日期
   // 无论那天有没有数据，只要检查过，这个指针就往前推
@@ -264,54 +270,62 @@ const TimelineView: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [timelineRefreshTrigger])
 
-  // 监听录制服务的数据刷新事件（每 10 帧后触发）
+  // 监听录制服务的帧存储事件（每帧实时推送，无需额外 HTTP 请求）
   useEffect(() => {
-    const handleRecordingTimelineRefresh = (event: CustomEvent) => {
-      const { date, totalCount } = event.detail
-      // console.log('Recording timeline refresh event received:', date, 'totalCount:', totalCount)
-      
-      // 更新该日期的 totalCount，并检查是否需要自动加载新数据
+    const handleFrameStored = (event: CustomEvent) => {
+      const { frame, todayCount } = event.detail
+      if (!frame || !frame.image_path) return
+
+      // 从 timestamp 推导日期
+      const frameDate = new Date(frame.timestamp)
+      const dateStr = `${frameDate.getFullYear()}-${String(frameDate.getMonth() + 1).padStart(2, '0')}-${String(frameDate.getDate()).padStart(2, '0')}`
+
       setDateGroups(prev => {
-        const existingGroup = prev.find(g => g.date === date)
+        const existingGroup = prev.find(g => g.date === dateStr)
 
         if (existingGroup) {
-          // 如果已存在，更新 totalCount（但绝不减少，防止失败的 API 返回 0 覆盖真实值）
-          const safeTotalCount = Math.max(existingGroup.totalCount, totalCount)
-          const updatedGroups = prev.map(group => {
-            if (group.date === date) {
-              return {
-                ...group,
-                totalCount: safeTotalCount
-              }
+          // 去重
+          if (existingGroup.frames.some(f => f.frame_id === frame.frame_id)) {
+            const safeTotalCount = Math.max(existingGroup.totalCount, todayCount)
+            if (safeTotalCount !== existingGroup.totalCount) {
+              return prev.map(g => g.date === dateStr ? { ...g, totalCount: safeTotalCount } : g)
             }
-            return group
-          })
-          
-          // 如果有新数据未加载，自动触发加载（不再检查滚动位置，实现完全增量）
-          if (existingGroup.loadedCount < safeTotalCount) {
-            setTimeout(() => {
-              if (loadMoreFramesForDateRef.current) {
-                loadMoreFramesForDateRef.current(date)
-              }
-            }, 100)
+            return prev
           }
-          
-          return updatedGroups
-        } else if (totalCount > 0) {
-          // 如果该日期组还不存在，且有数据，则在下次 refreshTimeline 时会处理它
-          // 或者我们也可以在这里直接触发一次 refreshTimeline
-          return prev
+
+          // 直接 append 新帧
+          return prev.map(g => {
+            if (g.date !== dateStr) return g
+            const newFrames = [...g.frames, frame]
+            const safeTotalCount = Math.max(g.totalCount, todayCount)
+            return {
+              ...g,
+              frames: newFrames,
+              groupedFrames: groupFramesByTime(newFrames),
+              totalCount: safeTotalCount,
+              loadedCount: newFrames.length,
+            }
+          })
+        } else if (todayCount > 0) {
+          // 新日期组
+          const newGroup: DateGroup = {
+            date: dateStr,
+            frames: [frame],
+            groupedFrames: groupFramesByTime([frame]),
+            totalCount: todayCount,
+            loadedCount: 1,
+            isLoading: false,
+          }
+          return [newGroup, ...prev]
         }
         return prev
       })
     }
-    
-    window.addEventListener('recording-timeline-refresh', handleRecordingTimelineRefresh as EventListener)
-    
+
+    window.addEventListener('recording-frame-stored', handleFrameStored as EventListener)
     return () => {
-      window.removeEventListener('recording-timeline-refresh', handleRecordingTimelineRefresh as EventListener)
+      window.removeEventListener('recording-frame-stored', handleFrameStored as EventListener)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const formatTimestamp = (timestamp: string): string => {
@@ -473,6 +487,13 @@ const TimelineView: React.FC = () => {
 
   // 【修复】加载更多照片（增加帧级别的去重逻辑）
   const loadMoreFramesForDate = useCallback(async (date: string) => {
+    // ── 防并发/防重试风暴 ──
+    // 1. ref 级别的 inflight 检查（比 React state 更及时）
+    if (inflightDatesRef.current.has(date)) return
+    // 2. 失败退避检查（5 秒内不重试）
+    const backoffUntil = failedDateBackoffRef.current.get(date)
+    if (backoffUntil && Date.now() < backoffUntil) return
+
     // 使用 ref 获取最新的 dateGroups，避免闭包问题
     const currentGroups = dateGroupsRef.current
     const dateGroup = currentGroups.find(g => g.date === date)
@@ -480,19 +501,13 @@ const TimelineView: React.FC = () => {
       console.warn(`[TimelineView] Date group not found for ${date}`)
       return
     }
-    
-    if (dateGroup.isLoading) {
-      // console.log(`[TimelineView] Already loading frames for ${date}`)
-      return
-    }
-    
-    if (dateGroup.loadedCount >= dateGroup.totalCount) {
-      // console.log(`[TimelineView] All frames loaded for ${date} (${dateGroup.loadedCount}/${dateGroup.totalCount})`)
-      return
-    }
 
-    // console.log(`[TimelineView] Loading more frames for ${date}: offset=${dateGroup.loadedCount}, limit=${LOAD_MORE_BATCH_SIZE}, total=${dateGroup.totalCount}`)
-    setDateGroups(prev => prev.map(g => 
+    if (dateGroup.isLoading) return
+
+    if (dateGroup.loadedCount >= dateGroup.totalCount) return
+
+    inflightDatesRef.current.add(date)
+    setDateGroups(prev => prev.map(g =>
       g.date === date ? { ...g, isLoading: true } : g
     ))
 
@@ -500,20 +515,16 @@ const TimelineView: React.FC = () => {
       const offset = dateGroup.loadedCount
       const frames = await apiClient.getFramesByDate(date, offset, LOAD_MORE_BATCH_SIZE)
       const validFrames = frames.filter(f => f.image_path || f.image_base64)
-      
-      // console.log(`[TimelineView] Received ${validFrames.length} valid frames for ${date} (offset=${offset})`)
+
+      // 成功：清除退避
+      failedDateBackoffRef.current.delete(date)
 
       setDateGroups(prev => prev.map(g => {
         if (g.date !== date) return g
 
-        // 【关键修复】去重逻辑：确保新加载的 frame 不在已有列表中
-        // 这解决了 "Encountered two children with the same key" 错误
         const existingIds = new Set(g.frames.map(f => f.frame_id))
         const uniqueNewFrames = validFrames.filter(f => !existingIds.has(f.frame_id))
-        
-        // console.log(`[TimelineView] Adding ${uniqueNewFrames.length} new frames to ${date} (had ${g.frames.length} frames, ${validFrames.length - uniqueNewFrames.length} duplicates filtered)`)
-        
-        // 合并并确保按时间戳升序排序（从最早到最晚）
+
         const mergedFrames = [...g.frames, ...uniqueNewFrames]
         const sortedFrames = mergedFrames.sort((a, b) => {
           const timeA = new Date(a.timestamp).getTime()
@@ -525,15 +536,24 @@ const TimelineView: React.FC = () => {
           ...g,
           frames: sortedFrames,
           groupedFrames: groupFramesByTime(sortedFrames),
-          loadedCount: sortedFrames.length, // 使用实际长度更新 count，防止偏差
+          loadedCount: sortedFrames.length,
           isLoading: false
         }
       }))
     } catch (error) {
-      console.error(`[TimelineView] Failed to load more frames for date ${date}:`, error)
-      setDateGroups(prev => prev.map(g => 
+      // AbortError（超时）不打日志刷屏，只静默退避
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // 超时：退避 5 秒后再允许重试
+        failedDateBackoffRef.current.set(date, Date.now() + 5000)
+      } else {
+        console.error(`[TimelineView] Failed to load more frames for date ${date}:`, error)
+        failedDateBackoffRef.current.set(date, Date.now() + 5000)
+      }
+      setDateGroups(prev => prev.map(g =>
         g.date === date ? { ...g, isLoading: false } : g
       ))
+    } finally {
+      inflightDatesRef.current.delete(date)
     }
   }, [])
   
@@ -869,22 +889,11 @@ const TimelineView: React.FC = () => {
     >
       {dateGroups.map((group) => {
         const groupedFrames = group.groupedFrames || groupFramesByTime(group.frames);
-        const avgScreens = group.frames.length > 0 ? (group.frames.length / groupedFrames.length) : 1;
-        
-        // 计算剩余未加载的照片数量，用于撑开滚动条
-        // 使用 loadedCount 而不是 frames.length，因为可能有无效的帧被过滤掉了
-        const remainingCount = Math.max(0, group.totalCount - group.loadedCount);
-        const remainingGroups = Math.ceil(remainingCount / avgScreens);
-        const spacerWidth = remainingGroups * (ITEM_WIDTH + GAP);
-        
-        // 调试日志：只在有剩余时才输出
-        if (remainingCount > 0) {
-          // console.log(`[TimelineView] ${group.date}: loaded=${group.loadedCount}, total=${group.totalCount}, remaining=${remainingCount}, spacerWidth=${spacerWidth}px`)
-        }
+        const hasMore = group.loadedCount < group.totalCount;
 
         return (
-          <div 
-            key={group.date} 
+          <div
+            key={group.date}
             className="timeline-date-group"
             ref={(el) => {
               if (el) dateGroupRefs.current.set(group.date, el)
@@ -892,42 +901,49 @@ const TimelineView: React.FC = () => {
             }}
           >
             <div className="timeline-date-header">
-              {group.date} ({group.loadedCount} / {group.totalCount}) 
+              {group.date} ({group.loadedCount} / {group.totalCount})
             </div>
-            <div 
-              className="timeline-images" 
+            <div
+              className="timeline-images"
               style={{ display: 'flex', overflowX: 'auto', gap: `${GAP}px`, paddingBottom: '0px' }}
               data-date={group.date}
               data-loaded={group.loadedCount}
               data-total={group.totalCount}
             >
               {groupedFrames.map((gFrames) => (
-                <FrameGroupItem 
-                  key={gFrames[0].frame_id} 
-                  frames={gFrames} 
+                <FrameGroupItem
+                  key={gFrames[0].frame_id}
+                  frames={gFrames}
                   onPreview={(url, ts) => setPreviewImage({ url, timestamp: ts })}
                   getImageUrl={getImageUrl}
                   formatTimestamp={formatTimestamp}
                 />
               ))}
-              
-              {/* 加载指示器：放在已加载内容的末尾 */}
-              {group.isLoading && <LoadingSpinner />}
-              
-              {/* Spacer：用于撑开滚动条，模拟剩余未加载内容的宽度 */}
-              {/* 注意：如果有 loading 状态，Spacer 依然存在，保持总长度恒定 */}
-              {spacerWidth > 0 && (
-                <div 
-                  style={{ 
-                    flex: '0 0 auto', 
-                    width: `${spacerWidth}px`, 
-                    height: '190px', // 与图片高度一致，确保滚动条正确计算
-                    backgroundColor: 'transparent',
-                    pointerEvents: 'none' // 不可交互，只是一个占位符
+
+              {/* 加载指示器：当正在加载或还有更多数据时显示在末尾 */}
+              {group.isLoading && (
+                <div style={{ flex: '0 0 auto', display: 'flex', alignItems: 'center', justifyContent: 'center', width: '60px', height: '150px' }}>
+                  <LoadingSpinner />
+                </div>
+              )}
+
+              {/* 末尾提示：还有更多数据但未在加载中 */}
+              {hasMore && !group.isLoading && (
+                <div
+                  style={{
+                    flex: '0 0 auto',
+                    width: '40px',
+                    height: '150px',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: '#666',
+                    fontSize: '12px',
+                    cursor: 'default'
                   }}
-                  data-spacer="true"
-                  data-remaining-count={remainingCount}
-                />
+                >
+                  ›
+                </div>
               )}
             </div>
           </div>

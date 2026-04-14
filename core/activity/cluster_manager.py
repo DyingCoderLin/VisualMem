@@ -119,17 +119,18 @@ class ClusterManager:
 
     def _connect(self) -> sqlite3.Connection:
         """Connect to the activity DB (for all writes)."""
-        conn = sqlite3.connect(self.activity_db_path, timeout=10)
+        conn = sqlite3.connect(self.activity_db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _connect_main_readonly(self) -> sqlite3.Connection:
         """Connect to the main DB (read-only, for OCR text / image extraction)."""
-        conn = sqlite3.connect(f"file:{self.main_db_path}?mode=ro", uri=True, timeout=10)
+        conn = sqlite3.connect(f"file:{self.main_db_path}?mode=ro", uri=True, timeout=30)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA busy_timeout=15000")
         return conn
 
     # ------------------------------------------------------------------
@@ -269,24 +270,64 @@ class ClusterManager:
         app_name: str,
         image,
         ocr_text: str,
+        layout_text: str = "",
+        window_name: str = "",
     ) -> Optional[str]:
-        from core.activity.vlm_labeler import call_vlm, fuzzy_match_label
+        from core.activity.vlm_labeler import (
+            call_vlm,
+            fuzzy_match_label,
+            is_cluster_vlm_endpoint_configured,
+            log_cluster_labeling_event,
+        )
 
-        vlm_url = config.CLUSTER_VLM_URL
-        if not vlm_url or image is None:
+        if not is_cluster_vlm_endpoint_configured():
             return None
+        vlm_url = config.CLUSTER_VLM_URL
 
         # Circuit breaker: skip VLM if too many recent failures
         if self._is_vlm_circuit_open():
             return None
 
         existing_labels = self._get_existing_labels(conn, app_name)
-        label = call_vlm(vlm_url, app_name, image, existing_labels, ocr_text)
-        if not label:
+        raw_label, meta = call_vlm(
+            vlm_url,
+            app_name,
+            image,
+            existing_labels,
+            ocr_text,
+            layout_text=layout_text,
+            window_name=window_name,
+            return_meta=True,
+        )
+        if not raw_label:
+            log_cluster_labeling_event(
+                {
+                    "source": "realtime",
+                    "app_name": app_name,
+                    "window_name": window_name,
+                    "label": "",
+                    "status": "failed_empty_label",
+                    **meta,
+                }
+            )
             self._vlm_call_failed()
             return None
         self._vlm_call_succeeded()
-        return fuzzy_match_label(label, existing_labels) or label
+        matched = fuzzy_match_label(raw_label, existing_labels)
+        final_label = matched or raw_label
+        log_cluster_labeling_event(
+            {
+                "source": "realtime",
+                "app_name": app_name,
+                "window_name": window_name,
+                "label": final_label,
+                "raw_label": raw_label,
+                "status": "merged_existing" if matched else "new_label",
+                "merged_into": matched or "",
+                **meta,
+            }
+        )
+        return final_label
 
     def _label_unknown_frame_with_labels(
         self,
@@ -294,22 +335,62 @@ class ClusterManager:
         image,
         ocr_text: str,
         existing_labels: List[str],
+        layout_text: str = "",
+        window_name: str = "",
     ) -> Optional[str]:
         """Like _label_unknown_frame but takes pre-fetched labels (no DB needed)."""
-        from core.activity.vlm_labeler import call_vlm, fuzzy_match_label
+        from core.activity.vlm_labeler import (
+            call_vlm,
+            fuzzy_match_label,
+            is_cluster_vlm_endpoint_configured,
+            log_cluster_labeling_event,
+        )
 
-        vlm_url = config.CLUSTER_VLM_URL
-        if not vlm_url or image is None:
+        if not is_cluster_vlm_endpoint_configured():
             return None
+        vlm_url = config.CLUSTER_VLM_URL
         if self._is_vlm_circuit_open():
             return None
 
-        label = call_vlm(vlm_url, app_name, image, existing_labels, ocr_text)
-        if not label:
+        raw_label, meta = call_vlm(
+            vlm_url,
+            app_name,
+            image,
+            existing_labels,
+            ocr_text,
+            layout_text=layout_text,
+            window_name=window_name,
+            return_meta=True,
+        )
+        if not raw_label:
+            log_cluster_labeling_event(
+                {
+                    "source": "recalculate",
+                    "app_name": app_name,
+                    "window_name": window_name,
+                    "label": "",
+                    "status": "failed_empty_label",
+                    **meta,
+                }
+            )
             self._vlm_call_failed()
             return None
         self._vlm_call_succeeded()
-        return fuzzy_match_label(label, existing_labels) or label
+        matched = fuzzy_match_label(raw_label, existing_labels)
+        final_label = matched or raw_label
+        log_cluster_labeling_event(
+            {
+                "source": "recalculate",
+                "app_name": app_name,
+                "window_name": window_name,
+                "label": final_label,
+                "raw_label": raw_label,
+                "status": "merged_existing" if matched else "new_label",
+                "merged_into": matched or "",
+                **meta,
+            }
+        )
+        return final_label
 
     # ------------------------------------------------------------------
     # Activity assignment (writes to activity_assignments in activity DB)
@@ -862,6 +943,7 @@ class ClusterManager:
         embedding: np.ndarray,
         image=None,
         ocr_text: str = "",
+        layout_text: str = "",
         timestamp: Optional[str] = None,
         window_name: str = "",
     ) -> Optional[str]:
@@ -1004,7 +1086,14 @@ class ClusterManager:
                 self._vlm_called_frames += 1
 
             logger.info(f"VLM labeling triggered: app={app_name}{_win} time={_ts_display} sim={best_sim:.3f}")
-            provisional_label = self._label_unknown_frame(conn, app_name, image, ocr_text or "")
+            provisional_label = self._label_unknown_frame(
+                conn,
+                app_name,
+                image,
+                ocr_text or "",
+                layout_text=layout_text or "",
+                window_name=window_name or "",
+            )
             if provisional_label:
                 logger.info(f"VLM label result: app={app_name}{_win} -> \"{provisional_label}\"")
             if not provisional_label:
@@ -1395,9 +1484,12 @@ class ClusterManager:
                 sqlite_db = SQLiteStorage(db_path=self.main_db_path, activity_db_path=self.activity_db_path)
             image = sqlite_db.extract_sub_frame_image(leader_id)
 
-            # Get OCR text from main DB (read-only)
+            # Get OCR text + optional OCR region layout from main DB (read-only)
             ocr_text = ""
+            layout_text = ""
+            window_name = ""
             try:
+                from core.activity.vlm_labeler import build_region_layout_text
                 main_conn = self._connect_main_readonly()
                 oc = main_conn.cursor()
                 oc.execute(
@@ -1407,6 +1499,36 @@ class ClusterManager:
                 r = oc.fetchone()
                 if r:
                     ocr_text = r["text"]
+                oc.execute(
+                    "SELECT window_name FROM sub_frames WHERE sub_frame_id = ? LIMIT 1",
+                    (leader_id,),
+                )
+                win_row = oc.fetchone()
+                if win_row and win_row["window_name"]:
+                    window_name = win_row["window_name"]
+                if config.CLUSTER_VLM_INCLUDE_REGION_LAYOUT:
+                    oc.execute(
+                        """
+                        SELECT bbox_x1, bbox_y1, bbox_x2, bbox_y2, text, image_width, image_height
+                        FROM ocr_regions
+                        WHERE sub_frame_id = ? AND text IS NOT NULL AND text != ''
+                        ORDER BY bbox_y1 ASC, bbox_x1 ASC
+                        LIMIT 80
+                        """,
+                        (leader_id,),
+                    )
+                    region_rows = oc.fetchall()
+                    if region_rows:
+                        regions = [
+                            {
+                                "bbox": [rr["bbox_x1"], rr["bbox_y1"], rr["bbox_x2"], rr["bbox_y2"]],
+                                "text": rr["text"],
+                                "image_width": rr["image_width"],
+                                "image_height": rr["image_height"],
+                            }
+                            for rr in region_rows
+                        ]
+                        layout_text = build_region_layout_text(regions)
                 main_conn.close()
             except Exception:
                 pass
@@ -1414,7 +1536,12 @@ class ClusterManager:
             # --- VLM call: NO activity DB connection held here ---
             existing_labels = app_existing_labels.get(group_app, [])
             provisional = self._label_unknown_frame_with_labels(
-                group_app, image, ocr_text, existing_labels,
+                group_app,
+                image,
+                ocr_text,
+                existing_labels,
+                layout_text=layout_text,
+                window_name=window_name,
             )
             if not provisional:
                 vlm_failures_in_batch += 1

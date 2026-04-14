@@ -26,14 +26,15 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
   const searchRequestRef = useRef<AbortController | null>(null)
   
   // 使用全局状态
-  const { 
-    isRecording, 
-    startRecording, 
-    stopRecording, 
+  const {
+    isRecording,
+    isModelLoading,
+    startRecording,
+    stopRecording,
     recordingMode,
     setRecordingMode,
-    currentView, 
-    setRealtimeSearchResult 
+    currentView,
+    setRealtimeSearchResult
   } = useAppStore()
 
   const handleSearch = async () => {
@@ -194,21 +195,30 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
         </div> */}
 
         {/* 录屏按钮 */}
-        <button
-          className={`record-btn ${isRecording ? 'recording' : ''}`}
-          onClick={handleToggleRecording}
-          title={isRecording ? '停止录制' : '开始录制'}
-        >
-          {isRecording ? (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-              <rect x="6" y="6" width="12" height="12" />
+        {isModelLoading ? (
+          <div className="record-btn-loading">
+            <svg className="loading-spinner" width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeDasharray="50 20" />
             </svg>
-          ) : (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '2px' }}>
-              <path d="M8 5v14l11-7z" />
-            </svg>
-          )}
-        </button>
+            <span className="loading-text">Loading model</span>
+          </div>
+        ) : (
+          <button
+            className={`record-btn ${isRecording ? 'recording' : ''}`}
+            onClick={handleToggleRecording}
+            title={isRecording ? '停止录制' : '开始录制'}
+          >
+            {isRecording ? (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" />
+              </svg>
+            ) : (
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style={{ marginLeft: '2px' }}>
+                <path d="M8 5v14l11-7z" />
+              </svg>
+            )}
+          </button>
+        )}
 
         <button
           className="btn btn-primary"

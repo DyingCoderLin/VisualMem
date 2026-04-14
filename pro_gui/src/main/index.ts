@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut } from 'el
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import { existsSync, mkdirSync, createWriteStream, writeFileSync } from 'fs'
+import { existsSync, writeFileSync } from 'fs'
 import * as http from 'http'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -243,17 +243,8 @@ function startPythonBackend(): Promise<void> {
   // 生产模式下，假设后端已经通过其他方式启动
   if (isDev) {
     return new Promise((resolve, reject) => {
-      // 确保 logs 目录存在
-      const logDir = join(rootDir, 'logs')
-      if (!existsSync(logDir)) {
-        mkdirSync(logDir, { recursive: true })
-      }
-      
-      const logFile = join(logDir, 'backend_server.log')
-      const logStream = createWriteStream(logFile, { flags: 'w' })
-      
       console.log('Starting Python backend...')
-      console.log(`Backend logs are being redirected to: ${logFile}`)
+      console.log(`Backend logs are written directly by Python to: ${join(rootDir, 'logs', 'backend_server.log')}`)
 
       pythonProcess = spawn('python', [pythonScript], {
         cwd: rootDir,
@@ -266,10 +257,11 @@ function startPythonBackend(): Promise<void> {
         }
       })
 
-      // 将 stdout 和 stderr 重定向到日志文件，并检测是否在下载/加载模型
+      // Python now writes logs directly to file (not through this pipe).
+      // We still read stdout/stderr to detect startup phases and drain the pipe
+      // so the buffer never fills up and blocks the Python process.
       const handleOutput = (data: Buffer, isStderr: boolean) => {
         const str = data.toString()
-        // 只在启动阶段输出到终端
         if (isStartingUp) {
           if (isStderr) {
             process.stderr.write(data)
@@ -277,8 +269,7 @@ function startPythonBackend(): Promise<void> {
             process.stdout.write(data)
           }
         }
-        
-        // 检测模型下载
+
         if (str.includes('Starting download')) {
           if (!isDownloading) {
             isDownloading = true
@@ -290,7 +281,6 @@ function startPythonBackend(): Promise<void> {
           console.log('✅ A model download has finished!')
         }
 
-        // 检测模型加载开始（[1/7] Loading encoder 或 [1/10] Loading encoder）
         if (str.includes('Loading encoder') && str.includes('[1/')) {
           console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
           console.log('⏳ This may take 1-2 minutes on first run (loading 2B+ parameter model)...')
@@ -298,21 +288,22 @@ function startPythonBackend(): Promise<void> {
           isLoadingModel = true
         }
 
-        // 检测初始化完成
         if (str.includes('All backend components initialized successfully!')) {
           console.log('✅ All models loaded successfully!')
           isLoadingModel = false
-          isStartingUp = false // 停止输出到终端，后续日志只进入文件
+          isStartingUp = false
         }
       }
 
       if (pythonProcess.stdout) {
         pythonProcess.stdout.on('data', (data) => handleOutput(data, false))
-        pythonProcess.stdout.pipe(logStream)
+        // Drain stdout continuously — do NOT pipe to a file (Python writes its own log).
+        // Just consuming 'data' events is enough to keep the pipe buffer from filling up.
+        pythonProcess.stdout.resume()
       }
       if (pythonProcess.stderr) {
         pythonProcess.stderr.on('data', (data) => handleOutput(data, true))
-        pythonProcess.stderr.pipe(logStream)
+        pythonProcess.stderr.resume()
       }
 
       pythonProcess.on('error', (error) => {

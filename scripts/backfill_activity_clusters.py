@@ -15,8 +15,6 @@ Usage:
     python scripts/backfill_activity_clusters.py --phase all --mode full --vlm-url http://localhost:8088
 """
 import argparse
-import base64
-import io
 import os
 import sys
 import time
@@ -26,16 +24,30 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import re
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from config import config
+from core.activity.vlm_labeler import build_region_layout_text
+from core.activity.vlm_labeler import call_vlm as shared_call_vlm
+from core.activity.vlm_labeler import fuzzy_match_label as shared_fuzzy_match_label
+from core.activity.vlm_labeler import log_cluster_labeling_event
 from core.storage.sqlite_storage import SQLiteStorage
 from utils.logger import setup_logger
 
 logger = setup_logger("backfill_activity_clusters")
+
+
+def _safe_print(*args, **kwargs):
+    """Stdout can be non-blocking (tmux/pipe), causing BlockingIOError on large prints."""
+    kwargs.setdefault("flush", True)
+    for attempt in range(12):
+        try:
+            print(*args, **kwargs)
+            return
+        except BlockingIOError:
+            time.sleep(0.03 * (attempt + 1))
 
 
 def _utcnow() -> str:
@@ -353,15 +365,6 @@ def is_solid_color_image(img) -> bool:
         return False
 
 
-def image_to_base64(img) -> str:
-    """Convert PIL Image to base64 data URI."""
-    buf = io.BytesIO()
-    if img.mode in ("RGBA", "LA", "P"):
-        img = img.convert("RGB")
-    img.save(buf, format="JPEG", quality=85)
-    return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
 # ===========================================================================
 # Phase A: Discover Clusters
 # ===========================================================================
@@ -569,42 +572,52 @@ def phase_discover(args):
             if not ranked_fids:
                 continue
 
-            # Check the frame closest to centroid — if it's solid-color, discard entire cluster
-            center_img = sqlite_db.extract_sub_frame_image(ranked_fids[0])
-            if center_img is None or is_solid_color_image(center_img):
-                # Save centroid image for debugging when --save-discarded is set
-                if args.save_discarded and center_img is not None:
-                    safe_app = app_name.replace("/", "_").replace(" ", "_")
-                    discard_dir = output_dir / "discarded"
-                    discard_dir.mkdir(parents=True, exist_ok=True)
-                    discard_path = discard_dir / f"{safe_app}_discarded_{cluster['count']}frames_{ranked_fids[0]}.jpg"
-                    center_img.save(str(discard_path), "JPEG", quality=85)
-                    print(f"  [DISCARDED] cluster with {cluster['count']} frames -> {discard_path}")
-                else:
-                    print(f"  [DISCARDED] cluster with {cluster['count']} frames (centroid is solid-color)")
-                continue
+            # Solid-color guard: vision mode decodes PNG from video; text-only mode skips FFmpeg/PIL.
+            if config.CLUSTER_VLM_USE_VISION:
+                center_img = sqlite_db.extract_sub_frame_image(ranked_fids[0])
+                if center_img is None or is_solid_color_image(center_img):
+                    if args.save_discarded and center_img is not None:
+                        safe_app = app_name.replace("/", "_").replace(" ", "_")
+                        discard_dir = output_dir / "discarded"
+                        discard_dir.mkdir(parents=True, exist_ok=True)
+                        discard_path = discard_dir / f"{safe_app}_discarded_{cluster['count']}frames_{ranked_fids[0]}.jpg"
+                        center_img.save(str(discard_path), "JPEG", quality=85)
+                        print(f"  [DISCARDED] cluster with {cluster['count']} frames -> {discard_path}")
+                    else:
+                        print(f"  [DISCARDED] cluster with {cluster['count']} frames (centroid is solid-color)")
+                    continue
+            else:
+                vec0 = embeddings_map.get(ranked_fids[0])
+                if vec0 is not None and is_solid_color_embedding(vec0, []):
+                    print(
+                        f"  [DISCARDED] cluster with {cluster['count']} frames "
+                        f"(centroid embedding near-zero, text-only discover)"
+                    )
+                    continue
 
             valid_idx += 1
             label = f"{app_name}_activity_{valid_idx}"
             centroid_blob = cluster["centroid"].tobytes()
 
-            # Collect valid preview images
             safe_app = app_name.replace("/", "_").replace(" ", "_")
             saved_samples = []
             valid_rep_ids = []
-            for fid in ranked_fids:
-                if len(saved_samples) >= REPRESENTATIVE_SAMPLE_COUNT:
-                    break
-                img = sqlite_db.extract_sub_frame_image(fid)
-                if img is None:
-                    continue
-                if is_solid_color_image(img):
-                    continue
-                sample_idx = len(saved_samples) + 1
-                img_path = preview_dir / f"{safe_app}_cluster_{valid_idx}_sample_{sample_idx}.jpg"
-                img.save(str(img_path), "JPEG", quality=85)
-                saved_samples.append(str(img_path))
-                valid_rep_ids.append(fid)
+            if config.CLUSTER_VLM_USE_VISION:
+                for fid in ranked_fids:
+                    if len(saved_samples) >= REPRESENTATIVE_SAMPLE_COUNT:
+                        break
+                    img = sqlite_db.extract_sub_frame_image(fid)
+                    if img is None:
+                        continue
+                    if is_solid_color_image(img):
+                        continue
+                    sample_idx = len(saved_samples) + 1
+                    img_path = preview_dir / f"{safe_app}_cluster_{valid_idx}_sample_{sample_idx}.jpg"
+                    img.save(str(img_path), "JPEG", quality=85)
+                    saved_samples.append(str(img_path))
+                    valid_rep_ids.append(fid)
+            else:
+                valid_rep_ids = ranked_fids[:REPRESENTATIVE_SAMPLE_COUNT]
 
             cursor.execute("""
                 INSERT INTO activity_clusters
@@ -711,171 +724,40 @@ def _log_vlm_verbose(app_name: str, raw: str, parsed_label: str):
         json.dump(_verbose_log_entries, f, ensure_ascii=False, indent=2)
 
 
-def call_vlm(vlm_url: str, app_name: str, images: List, existing_labels: List[str], ocr_texts: List[str], verbose: bool = False) -> str:
-    """Call VLM to generate a semantic label. Only sends 1 image + OCR text."""
-    import requests
-
-    # Only use the first image — multiple images are usually near-identical
-    img = images[0]
-    b64 = image_to_base64(img)
-    ocr_text = ""
-    if ocr_texts and ocr_texts[0] and ocr_texts[0].strip():
-        ocr_text = ocr_texts[0].strip()[:500]
-
-    existing_labels_text = ""
-    if existing_labels:
-        existing_labels_text = (
-            f"该应用已有标签供参考：{', '.join(existing_labels)}\n"
-            f"如果截图内容与某个已有标签相同，可以复用。但不要强行匹配，内容不同就创建新标签。\n\n"
-        )
-
-    user_text = f"应用：{app_name}\n{existing_labels_text}"
-    if ocr_text:
-        user_text += f"屏幕文字：{ocr_text}\n"
-    user_text += (
-        "请简要描述这张桌面截图中用户在做什么操作，然后在最后一行输出：\n"
-        "标签：（你的标签）\n"
-        "标签要求3-8个中文词，描述具体操作。如：和朋友聊天、阅读arXiv论文、编写Python代码、查看邮件通知"
+def call_vlm(
+    vlm_url: str,
+    app_name: str,
+    images: List,
+    existing_labels: List[str],
+    ocr_texts: List[str],
+    layout_texts: List[str],
+    window_names: List[str],
+    verbose: bool = False,
+    force_use_vision: Optional[bool] = None,
+    return_meta: bool = False,
+):
+    """Call shared cluster VLM labeler for script/offline labeling."""
+    use_vision = config.CLUSTER_VLM_USE_VISION if force_use_vision is None else force_use_vision
+    if use_vision and not images:
+        empty_meta = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "elapsed_ms": 0, "mode": "vision"}
+        return ("", empty_meta) if return_meta else ""
+    if verbose:
+        logger.warning("Verbose raw VLM output is no longer supported in shared call_vlm path.")
+    first_ocr = ocr_texts[0] if ocr_texts else ""
+    first_layout = layout_texts[0] if layout_texts else ""
+    first_window_name = window_names[0] if window_names else ""
+    first_image = images[0] if images else None
+    return shared_call_vlm(
+        vlm_url,
+        app_name,
+        first_image,
+        existing_labels,
+        first_ocr,
+        layout_text=first_layout,
+        window_name=first_window_name,
+        force_use_vision=force_use_vision,
+        return_meta=return_meta,
     )
-
-    messages = [
-        {"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            {"type": "text", "text": user_text},
-        ]},
-    ]
-
-    payload = {
-        "model": "Qwen/Qwen3.5-9B",
-        "messages": messages,
-        "temperature": 0.1,
-    }
-
-    url = vlm_url.rstrip("/") + "/v1/chat/completions"
-    try:
-        resp = requests.post(url, json=payload, timeout=120)
-        resp.raise_for_status()
-        result = resp.json()
-        raw = result["choices"][0]["message"]["content"].strip()
-        label = _parse_label(raw)
-        if verbose:
-            _log_vlm_verbose(app_name, raw, label)
-        return label
-    except Exception as e:
-        logger.error(f"VLM call failed: {e}")
-        return ""
-
-
-def _clean_label(text: str) -> str:
-    """Clean a candidate label string."""
-    text = text.strip().strip('"').strip("'").strip('*').strip('`').strip()
-    # Remove markdown bold
-    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
-    # Remove trailing punctuation
-    text = re.sub(r'[。.，,！!？?；;：:]+$', '', text).strip()
-    # Remove leading markers
-    text = re.sub(r'^[\d]+[.、)\]]\s*', '', text).strip()
-    text = re.sub(r'^[-•·]\s*', '', text).strip()
-    # Remove "或者" prefix (with or without colon/space)
-    text = re.sub(r'^或者\s*[：:]?\s*', '', text).strip()
-    # If contains "、" (enumeration), take only the first item
-    if '、' in text:
-        text = text.split('、')[0].strip()
-    # If contains "，" or "," (comma), take only the first clause
-    for sep in ['，', ',']:
-        if sep in text:
-            text = text.split(sep)[0].strip()
-    # Final cleanup: strip any remaining quotes/parens
-    text = text.strip('"').strip("'").strip('"').strip('"').strip('(').strip(')').strip('（').strip('）').strip()
-    return text
-
-
-_GARBAGE_PATTERNS = re.compile(
-    r'(xxx|用户|截图|显示|正在|需要|提供|可以|应该|让我|候选|分析|或者|这里截断'
-    r'|如果截图|标签要求|中文词|描述具体|请分析|分析完后|输出标签|回复格式'
-    r'|属于以上|第一行|看起来像)'
-)
-
-
-def _is_valid_label(text: str) -> bool:
-    """Check if a cleaned string is a valid label."""
-    if not text or len(text) < 2 or len(text) > 30:
-        return False
-    if _GARBAGE_PATTERNS.search(text):
-        return False
-    return True
-
-
-def _parse_label(raw: str) -> str:
-    """Extract a clean short label from VLM response.
-
-    Strategy: scan from LAST to FIRST for '标签[：:]' pattern,
-    take the content after it, clean it, validate it.
-    """
-
-    # 1. Find ALL "标签：xxx" matches, try from last to first
-    matches = re.findall(r'标签[：:]\s*(.+)', raw)
-    for match in reversed(matches):
-        label = _clean_label(match)
-        if _is_valid_label(label):
-            return label
-
-    # 2. Try JSON {"label": "..."}
-    m = re.search(r'"label"\s*:\s*"([^"]+)"', raw)
-    if m:
-        label = _clean_label(m.group(1))
-        if _is_valid_label(label):
-            return label
-
-    # 3. Scan lines from bottom up for a clean short label
-    lines = [l.strip() for l in raw.strip().split("\n") if l.strip()]
-    for line in reversed(lines):
-        cleaned = _clean_label(line)
-        if 3 <= len(cleaned) <= 20 and _is_valid_label(cleaned):
-            return cleaned
-
-    # 4. Last resort: return empty to signal failure (caller will skip)
-    return ""
-
-
-def _fuzzy_match_label(candidate: str, existing_labels: List[str]) -> Optional[str]:
-    """Check if candidate label matches any existing label.
-
-    Returns the matched existing label (canonical form), or None if no match.
-    Matching rules:
-    1. Exact match
-    2. Normalized match (strip spaces/punctuation)
-    3. One is a substring of the other
-    4. High character overlap (Jaccard > 0.6)
-    """
-    if not existing_labels:
-        return None
-
-    import re
-
-    def _normalize(s: str) -> str:
-        return re.sub(r'[\s，。、！？""\'\'·\-]', '', s).lower()
-
-    c_norm = _normalize(candidate)
-
-    for existing in existing_labels:
-        e_norm = _normalize(existing)
-        # Exact or normalized match
-        if candidate == existing or c_norm == e_norm:
-            return existing
-        # Substring match (either direction)
-        if len(c_norm) >= 3 and len(e_norm) >= 3:
-            if c_norm in e_norm or e_norm in c_norm:
-                return existing
-        # Jaccard similarity on characters
-        c_set = set(c_norm)
-        e_set = set(e_norm)
-        if c_set and e_set:
-            jaccard = len(c_set & e_set) / len(c_set | e_set)
-            if jaccard > 0.6:
-                return existing
-
-    return None
 
 
 def get_ocr_for_sub_frame(sqlite_db: SQLiteStorage, sub_frame_id: str) -> str:
@@ -894,11 +776,68 @@ def get_ocr_for_sub_frame(sqlite_db: SQLiteStorage, sub_frame_id: str) -> str:
         return ""
 
 
+def get_window_and_layout_for_sub_frame(sqlite_db: SQLiteStorage, sub_frame_id: str) -> Tuple[str, str]:
+    """Get window name + region-layout text for a sub_frame from SQLite."""
+    conn = None
+    try:
+        conn = sqlite_db._get_connection()
+        cursor = conn.cursor()
+
+        window_name = ""
+        cursor.execute(
+            "SELECT window_name FROM sub_frames WHERE sub_frame_id = ? LIMIT 1",
+            (sub_frame_id,),
+        )
+        wrow = cursor.fetchone()
+        if wrow and wrow["window_name"]:
+            window_name = wrow["window_name"]
+
+        layout_text = ""
+        if config.CLUSTER_VLM_INCLUDE_REGION_LAYOUT:
+            cursor.execute(
+                """
+                SELECT bbox_x1, bbox_y1, bbox_x2, bbox_y2, text, image_width, image_height
+                FROM ocr_regions
+                WHERE sub_frame_id = ? AND text IS NOT NULL AND text != ''
+                ORDER BY bbox_y1 ASC, bbox_x1 ASC
+                LIMIT 80
+                """,
+                (sub_frame_id,),
+            )
+            rows = cursor.fetchall()
+            if rows:
+                regions = [
+                    {
+                        "bbox": [r["bbox_x1"], r["bbox_y1"], r["bbox_x2"], r["bbox_y2"]],
+                        "text": r["text"],
+                        "image_width": r["image_width"],
+                        "image_height": r["image_height"],
+                    }
+                    for r in rows
+                ]
+                layout_text = build_region_layout_text(regions)
+        return window_name, layout_text
+    except Exception:
+        return "", ""
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def phase_label(args):
     """Phase B: generate VLM labels for pending clusters."""
-    if not args.vlm_url:
-        print("Error: --vlm-url is required for phase label")
+    effective_vlm_url = (args.vlm_url or config.CLUSTER_VLM_URL or "").strip()
+    if not effective_vlm_url:
+        print("Error: no cluster VLM URL. Set CLUSTER_VLM_URL in .env or pass --vlm-url")
         sys.exit(1)
+    effective_use_vision = config.CLUSTER_VLM_USE_VISION if args.cluster_use_vision is None else args.cluster_use_vision
+    use_vision_source = ".env(CLUSTER_VLM_USE_VISION)" if args.cluster_use_vision is None else "CLI(--use-vision/--no-use-vision)"
+
+    print(
+        "Labeling config: "
+        f"CLUSTER_VLM_URL={effective_vlm_url} "
+        f"use_vision={effective_use_vision} source={use_vision_source}"
+    )
 
     sqlite_db = SQLiteStorage(db_path=config.OCR_DB_PATH, activity_db_path=config.ACTIVITY_DB_PATH)
     act_conn = get_activity_connection()
@@ -968,27 +907,62 @@ def phase_label(args):
                 logger.warning(f"Cluster {cluster['id']} has no representative frames, skipping")
                 continue
 
-            # Extract images
             images = []
             ocr_texts = []
+            layout_texts = []
+            window_names = []
             for fid in rep_ids[:3]:
-                img = sqlite_db.extract_sub_frame_image(fid)
-                if img:
-                    images.append(img)
-                    ocr_texts.append(get_ocr_for_sub_frame(sqlite_db, fid))
+                ocr_texts.append(get_ocr_for_sub_frame(sqlite_db, fid))
+                win_name, layout_text = get_window_and_layout_for_sub_frame(sqlite_db, fid)
+                window_names.append(win_name)
+                layout_texts.append(layout_text)
+                if effective_use_vision:
+                    img = sqlite_db.extract_sub_frame_image(fid)
+                    if img:
+                        images.append(img)
 
-            if not images:
+            if effective_use_vision and not images:
                 logger.warning(f"Could not extract any images for cluster {cluster['id']}, skipping")
                 continue
+            if not effective_use_vision:
+                first_ocr = (ocr_texts[0] if ocr_texts else "").strip()
+                first_layout = (layout_texts[0] if layout_texts else "").strip()
+                if not first_ocr and not first_layout:
+                    logger.warning(
+                        f"No OCR/layout for cluster {cluster['id']} (text-only labeling), skipping"
+                    )
+                    continue
 
             # Call VLM
-            label = call_vlm(args.vlm_url, app_name, images, existing, ocr_texts, verbose=args.verbose)
+            label, meta = call_vlm(
+                effective_vlm_url,
+                app_name,
+                images,
+                existing,
+                ocr_texts,
+                layout_texts,
+                window_names,
+                verbose=args.verbose,
+                force_use_vision=effective_use_vision,
+                return_meta=True,
+            )
             if not label:
                 logger.warning(f"VLM returned empty label for cluster {cluster['id']}, keeping fallback")
+                log_cluster_labeling_event(
+                    {
+                        "source": "backfill",
+                        "app_name": app_name,
+                        "window_name": window_names[0] if window_names else "",
+                        "cluster_id": cluster["id"],
+                        "label": "",
+                        "status": "failed_empty_label",
+                        **meta,
+                    }
+                )
                 continue
 
             # Check if label matches an existing one (fuzzy: normalize spaces and find substring matches)
-            matched_label = _fuzzy_match_label(label, existing)
+            matched_label = shared_fuzzy_match_label(label, existing)
             if matched_label:
                 # Use the canonical existing label, not the VLM's variant
                 label = matched_label
@@ -1017,6 +991,7 @@ def phase_label(args):
                     # Delete merged cluster
                     cursor.execute("DELETE FROM activity_clusters WHERE id = ?", (cluster["id"],))
                     print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> merged into \"{matched_label}\" (cluster {target_id})")
+                    merge_status = "merged_cluster"
                 else:
                     # First cluster with this label — just update
                     cursor.execute(
@@ -1028,6 +1003,7 @@ def phase_label(args):
                         (matched_label, cluster["id"]),
                     )
                     print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{matched_label}\"")
+                    merge_status = "merged_existing"
             else:
                 # New label
                 cursor.execute(
@@ -1041,6 +1017,19 @@ def phase_label(args):
                 existing.append(label)
                 app_labels[app_name] = existing
                 print(f"  Cluster {cluster['id']}: \"{cluster['label']}\" -> \"{label}\" [NEW]")
+                merge_status = "new_label"
+
+            log_cluster_labeling_event(
+                {
+                    "source": "backfill",
+                    "app_name": app_name,
+                    "window_name": window_names[0] if window_names else "",
+                    "cluster_id": cluster["id"],
+                    "label": label,
+                    "status": merge_status,
+                    **meta,
+                }
+            )
 
             act_conn.commit()
 
@@ -1091,7 +1080,7 @@ def phase_timeline(args):
         cursor.execute("DELETE FROM activity_sessions")
         act_conn.commit()
 
-    print("\n=== Activity Timeline ===")
+    _safe_print("\n=== Activity Timeline ===")
     total_sessions = 0
     apps_processed = 0
 
@@ -1109,7 +1098,7 @@ def phase_timeline(args):
     app_names = [row["app_name"] for row in cursor.fetchall()]
 
     if not app_names:
-        print("No clustered frames found. Run --phase discover first.")
+        _safe_print("No clustered frames found. Run --phase discover first.")
         act_conn.close()
         return
 
@@ -1245,13 +1234,13 @@ def phase_timeline(args):
             except Exception:
                 start_str = str(start)[:16]
                 end_str = str(end)[11:16]
-            print(f"  [{start_str} - {end_str}] {app}: {clabel} ({count} frames)")
+            _safe_print(f"  [{start_str} - {end_str}] {app}: {clabel} ({count} frames)")
 
     act_conn.commit()
     act_conn.close()
-    print(f"\nProcessed apps: {apps_processed}")
-    print(f"Total sessions written: {total_sessions}")
-    print("Timeline built. Check activity_sessions table in activity DB.")
+    _safe_print(f"\nProcessed apps: {apps_processed}")
+    _safe_print(f"Total sessions written: {total_sessions}")
+    _safe_print("Timeline built. Check activity_sessions table in activity DB.")
 
 
 # ===========================================================================
@@ -1276,6 +1265,19 @@ def main():
     )
     parser.add_argument("--save-discarded", action="store_true", help="Save centroid images of discarded solid-color clusters to cluster_output/discarded/")
     parser.add_argument("--verbose", action="store_true", help="Print raw VLM response for each cluster during label phase")
+    parser.set_defaults(cluster_use_vision=None)
+    parser.add_argument(
+        "--use-vision",
+        dest="cluster_use_vision",
+        action="store_true",
+        help="Force image+text labeling for this run (override env CLUSTER_VLM_USE_VISION).",
+    )
+    parser.add_argument(
+        "--no-use-vision",
+        dest="cluster_use_vision",
+        action="store_false",
+        help="Force text-only labeling for this run (override env CLUSTER_VLM_USE_VISION).",
+    )
 
     args = parser.parse_args()
 

@@ -2,7 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, Rea
 import { apiClient } from '../services/api'
 import { recordingService, RecordingMode } from '../services/recording'
 
-export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings'
+export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings' | 'daily'
 
 export interface SearchResult {
   answer: string
@@ -24,14 +24,15 @@ interface AppStoreContextType {
   // Date range state
   dateRange: DateRange
   refreshDateRange: () => Promise<void>
-  
+
   // Recording state
   isRecording: boolean
+  isModelLoading: boolean
   recordingMode: RecordingMode
   startRecording: () => Promise<void>
   stopRecording: () => Promise<void>
   setRecordingMode: (mode: RecordingMode) => void
-  
+
   // Refresh timeline
   refreshTimeline: () => void
   timelineRefreshTrigger: number
@@ -65,6 +66,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     latest_date: null
   })
   const [isRecording, setIsRecording] = useState(false)
+  const [isModelLoading, setIsModelLoading] = useState(false)
   const [recordingMode, setRecordingModeState] = useState<RecordingMode>(recordingService.getMode())
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = useState(0)
   const [currentView, setCurrentView] = useState<ViewType>('timeline')
@@ -116,12 +118,23 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     return unsubscribe
   }, [refreshDateRange, refreshTimeline])
 
-  // 开始录制
+  // 开始录制（先确保模型已加载）
   const startRecording = useCallback(async () => {
     try {
+      // Check if models are loaded, if not, load them first
+      const modelsStatus = await apiClient.getModelsStatus()
+      if (!modelsStatus.loaded) {
+        setIsModelLoading(true)
+        try {
+          await apiClient.loadModels()
+        } finally {
+          setIsModelLoading(false)
+        }
+      }
       await recordingService.start()
       // setIsRecording 将通过 subscribeStatus 自动更新
     } catch (error) {
+      setIsModelLoading(false)
       console.error('Failed to start recording:', error)
     }
   }, [])
@@ -161,6 +174,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     dateRange,
     refreshDateRange,
     isRecording,
+    isModelLoading,
     recordingMode,
     startRecording,
     stopRecording,

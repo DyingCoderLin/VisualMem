@@ -5,6 +5,7 @@ import TimelineView from './pages/TimelineView'
 import RealTimeTracing from './pages/RealTimeTracing.tsx'
 import SmartTags from './pages/SmartTags'
 import Settings from './pages/Settings'
+import DailyReportView from './pages/DailyReportView'
 import SearchResults from './components/SearchResults'
 import { SearchResult } from './components/SearchBar'
 import { AppStoreProvider, useAppStore } from './store/AppStore'
@@ -24,7 +25,7 @@ function AppContent() {
         <TopBar onSearchResult={setSearchResult} />
         <div className="content-area">
           {/* 全局搜索结果 - 仅在非实时追踪页面显示 */}
-          {searchResult && currentView !== 'realtime' && (
+          {searchResult && currentView !== 'realtime' && currentView !== 'daily' && (
             <div className="global-search-results-wrapper">
               <SearchResults 
                 result={searchResult} 
@@ -41,6 +42,12 @@ function AppContent() {
             </div>
             {currentView === 'tags' && <SmartTags />}
             {currentView === 'settings' && <Settings />}
+            <div
+              className="daily-report-view-container"
+              style={{ display: currentView === 'daily' ? undefined : 'none' }}
+            >
+              <DailyReportView />
+            </div>
           </div>
         </div>
       </div>

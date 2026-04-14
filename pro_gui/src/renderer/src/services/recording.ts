@@ -30,6 +30,10 @@ class RecordingService {
   private sendQueue: Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number }> = []
   private isSending: boolean = false
   private readonly maxQueueSize: number = 20  // 队列超过此大小时丢弃最旧的帧
+  /** 发送积压超过此值时暂停截屏，直到队列下降（避免后端单帧 5–8s 时永久满队列） */
+  private readonly sendQueueBackpressureThreshold: number = 12
+  private lastBackpressureLogMs: number = 0
+  private lastQueueDropLogMs: number = 0
 
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
@@ -342,58 +346,20 @@ class RecordingService {
   }
 
   /**
-   * 刷新数据（每 10 帧后调用）
-   * - 获取今天的图片 count（轻量级，只更新数量，不加载实际数据）
-   * - 获取 stats 更新左下角的数据
+   * 轻量级 stats 刷新（每 10 帧后调用）
+   * 仅获取 stats 用于 SystemStatus 组件，不再请求 count/frames
+   * （帧数据已通过 store_frame 响应直接推送给 TimelineView）
    */
-  private async refreshData(): Promise<void> {
+  private async refreshStatsOnly(): Promise<void> {
     try {
-      // 获取今天的本地日期字符串，避免 UTC 导致的时间差问题
-      const now = new Date()
-      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-      
-      // 并行获取今天的图片 count 和 stats
-      let countFailed = false
-      let statsFailed = false
-      const [countResult, statsResult] = await Promise.all([
-        apiClient.getFramesCountByDate(today).catch(err => {
-          countFailed = true
-          console.error('Failed to get today\'s frame count:', err)
-          return { date: today, total_count: 0 }
-        }),
-        apiClient.getStats().catch(err => {
-          statsFailed = true
-          console.error('Failed to get stats:', err)
-          return null
-        })
-      ])
-
-      console.log(`Refreshed data after 10 frames: today's count=${countFailed ? 'FAILED' : countResult.total_count}, stats=`, statsFailed ? 'FAILED' : statsResult)
-
-      // 触发全局刷新事件，通知 SystemStatus 和 TimelineView 更新
-      if (typeof window !== 'undefined') {
-        // 事件1：通知 SystemStatus 更新 stats（仅在成功时）
-        if (!statsFailed && statsResult) {
-          window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
-            detail: {
-              todayCount: countResult.total_count,
-              stats: statsResult
-            }
-          }))
-        }
-
-        // 事件2：通知 TimelineView 只更新今天的 totalCount（仅在 count API 成功时，防止用 0 覆盖真实值）
-        if (!countFailed) {
-          window.dispatchEvent(new CustomEvent('recording-timeline-refresh', {
-            detail: {
-              date: today,
-              totalCount: countResult.total_count  // 只传递总数量
-            }
-          }))
-        }
+      const statsResult = await apiClient.getStats()
+      if (typeof window !== 'undefined' && statsResult) {
+        window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
+          detail: { stats: statsResult }
+        }))
       }
     } catch (error) {
-      console.error('Error refreshing data:', error)
+      console.error('Error refreshing stats:', error)
     }
   }
 
@@ -419,6 +385,7 @@ class RecordingService {
   private async startLoop(): Promise<void> {
     this.lastImageDataArray = []
     this.frameCounter = 0 // 重置计数器
+    this.isSending = false  // 确保发送锁干净
 
     console.log(`[RecordingService] Starting capture loop with interval: ${this.options.interval}ms, mode: ${this.options.mode}`)
 
@@ -438,6 +405,19 @@ class RecordingService {
   private async captureAndProcessLoop(): Promise<void> {
     // 在函数开始处检查录制状态
     if (!this.isRecording) {
+      return
+    }
+
+    // 背压：后端 store_frame 常需数秒（多窗口 OCR），若仍按固定间隔截屏，发送队列会永远追不上
+    if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
+      const now = Date.now()
+      if (now - this.lastBackpressureLogMs > 8000) {
+        console.warn(
+          `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), ` +
+            `skipping capture until below ${this.sendQueueBackpressureThreshold}`
+        )
+        this.lastBackpressureLogMs = now
+      }
       return
     }
 
@@ -505,7 +485,13 @@ class RecordingService {
     // 队列满时丢弃最旧的帧（保留最新的截屏）
     if (this.sendQueue.length >= this.maxQueueSize) {
       const dropped = this.sendQueue.shift()
-      console.warn(`[RecordingService] Send queue full (${this.maxQueueSize}), dropped oldest frame ${dropped?.frameId}`)
+      const now = Date.now()
+      if (now - this.lastQueueDropLogMs > 3000) {
+        console.warn(
+          `[RecordingService] Send queue full (${this.maxQueueSize}), dropped oldest frame ${dropped?.frameId}`
+        )
+        this.lastQueueDropLogMs = now
+      }
     }
     this.sendQueue.push({ base64Data, frameId, timestamp, width, height, monitorId })
     // 启动队列处理（如果没在运行）
@@ -548,7 +534,7 @@ class RecordingService {
     }
     
     try {
-      await apiClient.storeFrame({
+      const result = await apiClient.storeFrame({
         frame_id: frameId,
         timestamp: timestamp,
         image_base64: base64Data,
@@ -559,14 +545,24 @@ class RecordingService {
           monitor_id: monitorId
         }
       })
-      
+
+      // Dispatch frame data directly to TimelineView (no extra HTTP round-trips)
+      if (result.status === 'ok' && result.frame_summary && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('recording-frame-stored', {
+          detail: {
+            frame: result.frame_summary,
+            todayCount: result.today_count || 0,
+          }
+        }))
+      }
+
       // 递增计数器（0-10）
       this.frameCounter = (this.frameCounter + 1) % 10
-      
-      // 每 10 次成功发送后刷新数据
+
+      // 每 10 次成功发送后刷新 stats（仅用于 SystemStatus 组件）
       if (this.frameCounter === 0) {
-        this.refreshData().catch(err => {
-          console.error('Error in refreshData:', err)
+        this.refreshStatsOnly().catch(err => {
+          console.error('Error in refreshStatsOnly:', err)
         })
       }
     } catch (error) {
@@ -600,6 +596,7 @@ class RecordingService {
     // 重置状态
     this.lastImageDataArray = []
     this.sendQueue = []
+    this.isSending = false  // 释放发送锁，防止残留的 inflight 请求阻塞下次录制
     console.log('Recording stopped')
 
     // 通知后端刷新缓冲区

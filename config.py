@@ -2,8 +2,22 @@
 import os
 from dotenv import load_dotenv
 
-ENV_FILE = os.environ.get("VISUALMEM_ENV_FILE", ".env")
-load_dotenv(dotenv_path=ENV_FILE)  # Load selected env file (default: .env)
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_path(path: str) -> str:
+    """Resolve a path relative to the project root if it is not absolute."""
+    if os.path.isabs(path):
+        return os.path.normpath(path)
+    return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
+
+
+_default_env = os.path.join(_PROJECT_ROOT, ".env")
+ENV_FILE = os.environ.get("VISUALMEM_ENV_FILE", _default_env)
+# If user specified a relative path via env var, resolve it relative to project root
+if not os.path.isabs(ENV_FILE):
+    ENV_FILE = os.path.join(_PROJECT_ROOT, ENV_FILE)
+load_dotenv(dotenv_path=ENV_FILE)  # Load selected env file (default: <project_root>/.env)
 
 class Config:
     # ============================================
@@ -27,40 +41,47 @@ class Config:
     # ============================================
     # Simple Mode Configuration
     # ============================================
-    STORAGE_ROOT = os.environ.get("STORAGE_ROOT", "./visualmem_storage")
-    IMAGE_STORAGE_PATH = os.environ.get(
+    STORAGE_ROOT = _resolve_path(os.environ.get("STORAGE_ROOT", "./visualmem_storage"))
+    IMAGE_STORAGE_PATH = _resolve_path(os.environ.get(
         "IMAGE_STORAGE_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_image"),
-    )
+    ))
     # Benchmark name (if set, automatically switches to the benchmark dataset paths)
     BENCHMARK_NAME = os.environ.get("BENCHMARK_NAME", "").strip() or None
     # Benchmark dataset image root directory, default: IMAGE_STORAGE_PATH/benchmarks
-    BENCHMARK_IMAGE_ROOT = os.environ.get(
+    BENCHMARK_IMAGE_ROOT = _resolve_path(os.environ.get(
         "BENCHMARK_IMAGE_ROOT",
         os.path.join(IMAGE_STORAGE_PATH, "benchmarks"),
-    )
+    ))
     # Benchmark dataset database root directory, default: STORAGE_ROOT/dbs_benchmark
-    BENCHMARK_DB_ROOT = os.environ.get(
+    BENCHMARK_DB_ROOT = _resolve_path(os.environ.get(
         "BENCHMARK_DB_ROOT",
         os.path.join(STORAGE_ROOT, "dbs_benchmark"),
-    )
+    ))
     # OCR SQLite database path (can be automatically redirected by BENCHMARK_NAME)
-    OCR_DB_PATH = os.environ.get(
+    OCR_DB_PATH = _resolve_path(os.environ.get(
         "OCR_DB_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_ocr.db"),
-    )
+    ))
     # Activity clustering database (separate DB to avoid write lock contention with capture pipeline)
-    ACTIVITY_DB_PATH = os.environ.get(
+    ACTIVITY_DB_PATH = _resolve_path(os.environ.get(
         "ACTIVITY_DB_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_activity.db"),
-    )
+    ))
     # Text index LanceDB path (can be automatically redirected by BENCHMARK_NAME)
-    TEXT_LANCEDB_PATH = os.environ.get(
+    TEXT_LANCEDB_PATH = _resolve_path(os.environ.get(
         "TEXT_LANCEDB_PATH",
         os.path.join(STORAGE_ROOT, "visualmem_textdb"),
-    )
+    ))
     MAX_IMAGES_TO_LOAD = int(os.environ.get("MAX_IMAGES_TO_LOAD", "20"))
     
+    # ============================================
+    # Model Loading Configuration
+    # ============================================
+    # When true, heavy models (encoder, reranker, OCR) are NOT loaded at startup.
+    # They are loaded on-demand when recording starts (via /api/load_models).
+    MODEL_LAZY_LOAD = os.environ.get("MODEL_LAZY_LOAD", "true").lower() == "true"
+
     # ============================================
     # Vector Mode Configuration (if STORAGE_MODE=vector)
     # ============================================
@@ -71,15 +92,16 @@ class Config:
     
     # LanceDB Path selection based on model
     def _compute_lancedb_path():
-        storage_root = os.environ.get("STORAGE_ROOT", "./visualmem_storage")
+        raw = os.environ.get("STORAGE_ROOT", "./visualmem_storage")
+        storage_root = _resolve_path(raw)
         model = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
-        
+
         if "qwen" in model.lower():
             return os.path.join(storage_root, "visualmem_qwen_lancedb")
         else:
             return os.path.join(storage_root, "visualmem_clip_lancedb")
 
-    LANCEDB_PATH = os.environ.get("LANCEDB_PATH", _compute_lancedb_path())
+    LANCEDB_PATH = _resolve_path(os.environ.get("LANCEDB_PATH", _compute_lancedb_path()))
 
     # ============================================
     # Query Enhancement
@@ -139,6 +161,9 @@ class Config:
     ENABLE_OCR = os.environ.get("ENABLE_OCR", "true").lower() == "true"
     # OCR engine type: "auto" (platform-native), "apple_vision", "windows_ocr", "pytesseract", "dummy"
     OCR_ENGINE_TYPE = os.environ.get("OCR_ENGINE_TYPE", "auto")
+    # UIED-inspired CV region detection before OCR assignment (extra CPU vs whole-image OCR only).
+    # When false, RegionOCREngine still returns one full-frame region per image (storage shape unchanged).
+    ENABLE_UIED = os.environ.get("ENABLE_UIED", "true").lower() == "true"
     
     # Frame difference filtering during query (enabled by default)
     # If enabled: only feed images with frame difference > 0.006 to VLM
@@ -174,12 +199,48 @@ class Config:
     CLUSTER_CENTROID_EMA_ALPHA = float(os.environ.get("CLUSTER_CENTROID_EMA_ALPHA", "0.05"))
     CLUSTER_FREEZE_WINDOW_MINUTES = int(os.environ.get("CLUSTER_FREEZE_WINDOW_MINUTES", "30"))
     # Pending pool: similarity threshold to match an in-flight VLM leader
-    CLUSTER_PENDING_SIMILARITY_THRESHOLD = float(os.environ.get("CLUSTER_PENDING_SIMILARITY_THRESHOLD", "0.80"))
+    CLUSTER_PENDING_SIMILARITY_THRESHOLD = float(os.environ.get("CLUSTER_PENDING_SIMILARITY_THRESHOLD", "0.78"))
     # Pending pool: TTL in seconds for pending entries before auto-expiry
     CLUSTER_PENDING_TTL_SECONDS = int(os.environ.get("CLUSTER_PENDING_TTL_SECONDS", "1800"))
-    # VLM URL for cluster labeling (empty = skip VLM, use fallback labels)
+    # VLM base for cluster labeling (OpenAI-compatible). Example: https://models.sjtu.edu.cn/api
+    # Request URL is {CLUSTER_VLM_URL}/v1/chat/completions
     CLUSTER_VLM_URL = os.environ.get("CLUSTER_VLM_URL", "")
+    # Optional API key for cluster labeling endpoint. Falls back to VLM_API_KEY when empty.
+    CLUSTER_VLM_API_KEY = os.environ.get("CLUSTER_VLM_API_KEY", "").strip()
+    # Whether cluster labeling should send image to VLM (token expensive).
+    # false => prefer text-only prompt using OCR + optional region layout.
+    CLUSTER_VLM_USE_VISION = os.environ.get("CLUSTER_VLM_USE_VISION", "true").lower() == "true"
+    # Default model id for cluster labeling (vision + text if TEXT not set). Empty => Qwen/Qwen3.5-9B.
+    CLUSTER_VLM_MODEL = os.environ.get("CLUSTER_VLM_MODEL", "").strip()
+    # Optional text-only model id override. Empty => CLUSTER_VLM_MODEL or default.
+    CLUSTER_VLM_TEXT_MODEL = os.environ.get("CLUSTER_VLM_TEXT_MODEL", "").strip()
+    # Max OCR chars included in cluster-labeling prompt.
+    CLUSTER_VLM_TEXT_OCR_MAX_CHARS = int(os.environ.get("CLUSTER_VLM_TEXT_OCR_MAX_CHARS", "2000"))
+    # Include OCR region layout (bbox + text) in text-only prompt.
+    CLUSTER_VLM_INCLUDE_REGION_LAYOUT = os.environ.get("CLUSTER_VLM_INCLUDE_REGION_LAYOUT", "true").lower() == "true"
 
+    # ============================================
+    # Report Generation (Map-Reduce daily report pipeline)
+    # Defaults match SJTU OpenAI-compatible gateway; set REPORT_API_KEY in .env.
+    # Model ids must be litellm "provider/model" (e.g. openai/qwen3coder, openai/minimax-m2.5).
+    # Bare names are normalized in core/report/llm_caller.py. Native MiniMax: minimax/MiniMax-M2.5.
+    # Data platform URL defaults to local backend (override with REPORT_DATA_API_BASE if needed).
+    # ============================================
+    REPORT_MAP_MODEL = os.environ.get("REPORT_MAP_MODEL", "openai/minimax-m2.5")
+    REPORT_REDUCE_MODEL = os.environ.get("REPORT_REDUCE_MODEL", "openai/minimax-m2.5")
+    REPORT_API_KEY = os.environ.get("REPORT_API_KEY", "")
+    REPORT_API_BASE = os.environ.get(
+        "REPORT_API_BASE",
+        "https://models.sjtu.edu.cn/api/v1",
+    )
+    REPORT_CHUNK_TOKEN_LIMIT = int(os.environ.get("REPORT_CHUNK_TOKEN_LIMIT", "30000"))
+    REPORT_GAP_MINUTES = int(os.environ.get("REPORT_GAP_MINUTES", "10"))
+    REPORT_DAILY_GOAL = os.environ.get("REPORT_DAILY_GOAL", "")
+    REPORT_DATA_API_BASE = os.environ.get("REPORT_DATA_API_BASE", "http://localhost:18080")
+    # Reduce: read prior daily_report_*.json from this directory (project-relative ok).
+    REPORT_LOG_DIR = _resolve_path(os.environ.get("REPORT_LOG_DIR", "logs"))
+    # How many calendar days to walk backward when looking for prior report files.
+    REPORT_HISTORY_DAYS = int(os.environ.get("REPORT_HISTORY_DAYS", "14"))
     # ============================================
     # Logging Configuration
     # ============================================
@@ -193,26 +254,26 @@ class Config:
     # ============================================
     if BENCHMARK_NAME:
         _benchmark_dir = os.path.join(BENCHMARK_DB_ROOT, BENCHMARK_NAME)
-        IMAGE_STORAGE_PATH = os.environ.get(
+        IMAGE_STORAGE_PATH = _resolve_path(os.environ.get(
             "IMAGE_STORAGE_PATH",
             os.path.join(BENCHMARK_IMAGE_ROOT, BENCHMARK_NAME),
-        )
-        LANCEDB_PATH = os.environ.get(
+        ))
+        LANCEDB_PATH = _resolve_path(os.environ.get(
             "LANCEDB_PATH",
             os.path.join(_benchmark_dir, "lancedb"),
-        )
-        OCR_DB_PATH = os.environ.get(
+        ))
+        OCR_DB_PATH = _resolve_path(os.environ.get(
             "OCR_DB_PATH",
             os.path.join(_benchmark_dir, "ocr.db"),
-        )
-        ACTIVITY_DB_PATH = os.environ.get(
+        ))
+        ACTIVITY_DB_PATH = _resolve_path(os.environ.get(
             "ACTIVITY_DB_PATH",
             os.path.join(_benchmark_dir, "activity.db"),
-        )
-        TEXT_LANCEDB_PATH = os.environ.get(
+        ))
+        TEXT_LANCEDB_PATH = _resolve_path(os.environ.get(
             "TEXT_LANCEDB_PATH",
             os.path.join(_benchmark_dir, "textdb"),
-        )
+        ))
 
 # Export a singleton instance
 config = Config()

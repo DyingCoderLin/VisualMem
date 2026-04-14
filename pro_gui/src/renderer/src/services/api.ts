@@ -1,3 +1,9 @@
+import type {
+  DailyReportListResponse,
+  DailyReportPayload,
+  GenerateDailyReportResponse
+} from '../types/dailyReport'
+
 const API_BASE_URL = 'http://localhost:18080'
 
 interface QueryRagRequest {
@@ -71,7 +77,23 @@ class ApiClient {
       })
 
       if (!response.ok) {
-        throw new Error(`API request failed: ${response.statusText}`)
+        const text = await response.text()
+        let message = response.statusText || 'Request failed'
+        try {
+          const errBody = JSON.parse(text) as { detail?: unknown }
+          const d = errBody?.detail
+          if (typeof d === 'string') {
+            message = d
+          } else if (Array.isArray(d) && d.length > 0) {
+            message = d
+              .map((x: { msg?: string }) => x?.msg || '')
+              .filter(Boolean)
+              .join('; ')
+          }
+        } catch {
+          if (text) message = text.slice(0, 500)
+        }
+        throw new Error(message)
       }
 
       return response.json()
@@ -82,6 +104,17 @@ class ApiClient {
 
   async getStats(): Promise<StatsResponse> {
     return this.request<StatsResponse>('/api/stats')
+  }
+
+  async loadModels(): Promise<{ status: string; message: string }> {
+    // Load heavy ML models on demand. Uses long timeout since model loading takes time.
+    return this.request<{ status: string; message: string }>('/api/load_models', {
+      method: 'POST'
+    }, 300000)  // 5 min timeout for model loading
+  }
+
+  async getModelsStatus(): Promise<{ loaded: boolean; loading: boolean }> {
+    return this.request<{ loaded: boolean; loading: boolean }>('/api/models_status')
   }
 
   async getRecentFrames(minutes: number = 5): Promise<{ frames: FrameResult[] }> {
@@ -184,10 +217,19 @@ class ApiClient {
       window_name: string
       image_base64: string
     }>
-  }): Promise<{ status: string; frame_id?: string; sub_frame_count?: number }> {
+  }): Promise<{
+    status: string
+    frame_id?: string
+    sub_frame_count?: number
+    today_count?: number
+    frame_summary?: FrameResult
+  }> {
     // 存储帧到后端（支持窗口信息）
     // 使用更长的超时（120秒），因为后端需要做 embedding + OCR
-    return this.request<{ status: string; frame_id?: string; sub_frame_count?: number }>(
+    return this.request<{
+      status: string; frame_id?: string; sub_frame_count?: number
+      today_count?: number; frame_summary?: FrameResult
+    }>(
       '/api/store_frame',
       {
         method: 'POST',
@@ -210,6 +252,31 @@ class ApiClient {
   getVideoFrameImageUrl(videoPath: string, frameIndex: number = 0, fps: number = 1.0): string {
     // 获取视频帧图片URL（用于img标签）
     return `${this.baseUrl}/api/video/frame_image?video_path=${encodeURIComponent(videoPath)}&frame_index=${frameIndex}&fps=${fps}`
+  }
+
+  /** List ISO dates (YYYY-MM-DD) that have a saved daily report, newest first. */
+  async listDailyReports(): Promise<DailyReportListResponse> {
+    return this.request<DailyReportListResponse>('/api/daily-reports')
+  }
+
+  /** Full daily report JSON for one calendar day. */
+  async getDailyReport(date: string): Promise<DailyReportPayload> {
+    return this.request<DailyReportPayload>(`/api/daily-reports/${encodeURIComponent(date)}`)
+  }
+
+  /**
+   * Run the same pipeline as `python scripts/daily_report.py --date <date>`.
+   * Long-running (minutes); uses an extended timeout.
+   */
+  async generateDailyReport(date: string): Promise<GenerateDailyReportResponse> {
+    return this.request<GenerateDailyReportResponse>(
+      '/api/daily-reports/generate',
+      {
+        method: 'POST',
+        body: JSON.stringify({ date })
+      },
+      900000
+    )
   }
 }
 

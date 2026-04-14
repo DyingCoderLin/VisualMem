@@ -148,11 +148,10 @@ class LanceDBStorage:
 
         sqlite_storage = self._get_sqlite_storage()
         try:
-            conn = sqlite_storage._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
-            row = cursor.fetchone()
-            conn.close()
+            with sqlite_storage._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+                row = cursor.fetchone()
 
             if row and row["image_path"]:
                 resolved_path = row["image_path"]

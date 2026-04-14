@@ -288,17 +288,13 @@ class RecordingCoordinator:
         self.stats.frames_captured += 1
         
         # 0. Skip solid-color full screen (e.g. monitor off, lid closed)
+        #    Treat exactly like a deduplicated frame: return immediately, no further processing.
         if is_solid_color_image(screen_obj.full_screen_image):
-            logger.debug("Skipping solid-color full screen image")
-            # Still process windows below (they might be valid)
-            screen_diff_result = FrameDiffResult(
-                should_store=False, diff_score=0.0,
-                histogram_diff=0.0, ssim_diff=0.0,
-                reason="Solid-color image skipped"
-            )
-        else:
-            # 1. Check screen frame diff
-            screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
+            logger.debug("Skipping solid-color full screen image (screen off?)")
+            return result
+
+        # 1. Check screen frame diff
+        screen_diff_result = self.frame_diff.check_screen_diff(screen_obj)
         
         # 2. Track active windows and update app_name + window_name list
         current_window_keys = set()
@@ -323,7 +319,7 @@ class RecordingCoordinator:
         self.video_manager.cleanup_inactive_windows(current_window_keys)
         self._active_window_keys = current_window_keys
         
-        # Initialize sub_frame_ids early (may be populated by full-screen synthetic sub_frame)
+        # Initialize sub_frame_ids early (may be populated by full-screen fullscreen app sub_frame)
         sub_frame_ids = []
         # Collector for sub_frame OCR results: [(app_name, text, confidence), ...]
         sub_frame_ocr_parts = []
@@ -377,7 +373,7 @@ class RecordingCoordinator:
                 # Full-screen OCR is deferred — combined from sub_frame OCR results later.
 
                 # If focused app is full-screen (not among captured windows),
-                # create a synthetic sub_frame referencing the same video
+                # create a fullscreen app sub_frame referencing the same video
                 if fullscreen_app:
                     syn_id = self._generate_sub_frame_id(focused_app)
                     self.db.store_sub_frame(
@@ -399,7 +395,7 @@ class RecordingCoordinator:
                         app_name=focused_app,
                         window_name=focused_win or focused_app,
                     )
-                    # Region OCR for synthetic sub_frame
+                    # Region OCR for fullscreen app sub_frame
                     if self.config.run_ocr and self.region_ocr_engine is not None:
                         syn_regions = self._run_region_ocr(screen_obj.full_screen_image)
                         if syn_regions:
@@ -420,7 +416,7 @@ class RecordingCoordinator:
                             self.stats.ocr_processed += 1
                     sub_frame_ids.append(syn_id)
                     logger.debug(
-                        f"Created synthetic sub_frame {syn_id} for "
+                        f"Created fullscreen app sub_frame {syn_id} for "
                         f"full-screen app {focused_app}"
                     )
                 
@@ -570,33 +566,31 @@ class RecordingCoordinator:
     def _get_latest_video_chunk_id(self) -> int:
         """Get the ID of the most recent video chunk"""
         try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id FROM video_chunks 
-                WHERE monitor_id = ?
-                ORDER BY id DESC LIMIT 1
-            """, (self.config.monitor_id,))
-            row = cursor.fetchone()
-            conn.close()
-            return row[0] if row else 0
+            with self.db._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id FROM video_chunks
+                    WHERE monitor_id = ?
+                    ORDER BY id DESC LIMIT 1
+                """, (self.config.monitor_id,))
+                row = cursor.fetchone()
+                return row[0] if row else 0
         except Exception as e:
             logger.error(f"Failed to get latest video chunk id: {e}")
             return 0
-    
+
     def _get_latest_window_chunk_id(self, app_name: str, window_name: str) -> int:
         """Get the ID of the most recent window chunk for an app/window"""
         try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id FROM window_chunks 
-                WHERE app_name = ? AND window_name = ?
-                ORDER BY id DESC LIMIT 1
-            """, (app_name, window_name))
-            row = cursor.fetchone()
-            conn.close()
-            return row[0] if row else 0
+            with self.db._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id FROM window_chunks
+                    WHERE app_name = ? AND window_name = ?
+                    ORDER BY id DESC LIMIT 1
+                """, (app_name, window_name))
+                row = cursor.fetchone()
+                return row[0] if row else 0
         except Exception as e:
             logger.error(f"Failed to get latest window chunk id: {e}")
             return 0

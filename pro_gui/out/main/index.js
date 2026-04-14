@@ -200,14 +200,8 @@ function startPythonBackend() {
   }
   if (isDev) {
     return new Promise((resolve2, reject) => {
-      const logDir = path.join(rootDir, "logs");
-      if (!fs.existsSync(logDir)) {
-        fs.mkdirSync(logDir, { recursive: true });
-      }
-      const logFile = path.join(logDir, "backend_server.log");
-      const logStream = fs.createWriteStream(logFile, { flags: "w" });
       console.log("Starting Python backend...");
-      console.log(`Backend logs are being redirected to: ${logFile}`);
+      console.log(`Backend logs are written directly by Python to: ${path.join(rootDir, "logs", "backend_server.log")}`);
       pythonProcess = child_process.spawn("python", [pythonScript], {
         cwd: rootDir,
         stdio: ["ignore", "pipe", "pipe"],
@@ -250,11 +244,11 @@ function startPythonBackend() {
       };
       if (pythonProcess.stdout) {
         pythonProcess.stdout.on("data", (data) => handleOutput(data, false));
-        pythonProcess.stdout.pipe(logStream);
+        pythonProcess.stdout.resume();
       }
       if (pythonProcess.stderr) {
         pythonProcess.stderr.on("data", (data) => handleOutput(data, true));
-        pythonProcess.stderr.pipe(logStream);
+        pythonProcess.stderr.resume();
       }
       pythonProcess.on("error", (error) => {
         console.error("Failed to start Python backend:", error);

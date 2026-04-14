@@ -255,6 +255,27 @@ class FrameDiffDetector:
             f"(screen_threshold={screen_threshold}, window_threshold={window_threshold})"
         )
     
+    def seed_window_state(
+        self,
+        app_name: str,
+        window_name: str,
+        image: Image.Image,
+        image_hash: int,
+    ) -> None:
+        """
+        Pre-populate a window's diff state with a thumbnail from a previous
+        session so the first live frame goes through normal histogram+SSIM
+        comparison instead of being treated as "First frame".
+        """
+        key = self._get_window_key(app_name, window_name)
+        self.window_states[key] = WindowDiffState(
+            previous_image=image,
+            previous_hash=image_hash,
+            frame_count=0,
+            app_name=app_name,
+            window_name=window_name,
+        )
+
     def _get_window_key(self, app_name: str, window_name: str) -> str:
         """Generate a unique key for a window"""
         return f"{app_name}::{window_name}"
