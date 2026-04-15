@@ -42,12 +42,11 @@ function AppContent() {
             </div>
             {currentView === 'tags' && <SmartTags />}
             {currentView === 'settings' && <Settings />}
-            <div
-              className="daily-report-view-container"
-              style={{ display: currentView === 'daily' ? undefined : 'none' }}
-            >
-              <DailyReportView />
-            </div>
+            {currentView === 'daily' && (
+              <div className="daily-report-view-container">
+                <DailyReportView />
+              </div>
+            )}
           </div>
         </div>
       </div>

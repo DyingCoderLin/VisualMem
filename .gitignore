@@ -1,6 +1,6 @@
 /venv/*
 *.pyc
-logs/*.log
+logs/*
 *.db
 *.tnx
 /visualmem_storage/*

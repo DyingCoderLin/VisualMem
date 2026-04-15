@@ -2,9 +2,9 @@
 """
 Top-level daily report application (外挂 agent).
 
-Runs as a separate process. Implicitly calls the VisualMem data platform
-over HTTP (REPORT_DATA_API_BASE, default http://localhost:18080) — not
-mounted on the backend as an endpoint.
+Runs as a separate process. Calls the VisualMem data platform over HTTP
+(same base as gui_backend_server: localhost or GUI_REMOTE_BACKEND_URL — see
+config.REPORT_DATA_API_BASE) — not mounted on the backend as an endpoint.
 
 Usage:
   conda activate mobiagent
@@ -19,7 +19,7 @@ totals + pipeline_ms (no report body). Use --print-json to stream full JSON to s
 Debug logs: set LOG_LEVEL=DEBUG in .env or use -v (must run before imports).
 
 Requires .env with REPORT_API_KEY (and optional REPORT_API_BASE / models).
-The data platform server must be listening on REPORT_DATA_API_BASE.
+The data platform server must be reachable at config.REPORT_DATA_API_BASE.
 """
 
 from __future__ import annotations

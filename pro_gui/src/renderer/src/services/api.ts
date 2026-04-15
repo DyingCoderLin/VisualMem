@@ -200,10 +200,12 @@ class ApiClient {
   }
 
   async stopRecording(): Promise<{ status: string }> {
-    // 仅通知后端刷新缓冲区
-    return this.request<{ status: string }>('/api/recording/stop', {
-      method: 'POST'
-    })
+    // 刷新视频缓冲 + BatchWriteBuffer 可能很慢（积压帧多时），必须长于默认 30s，否则会 AbortError
+    return this.request<{ status: string }>(
+      '/api/recording/stop',
+      { method: 'POST' },
+      300000
+    )
   }
 
   async storeFrame(req: {

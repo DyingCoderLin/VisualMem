@@ -147,7 +147,8 @@ class DataFetcher:
         if not await self._probe_backend():
             logger.error(
                 "fetch_day_data: data platform unreachable at %s (GET /health failed). "
-                "Start gui_backend_server (or Electron) on that host/port, or set REPORT_DATA_API_BASE in .env.",
+                "Start gui_backend_server (or Electron), or set GUI_REMOTE_BACKEND_URL (remote GUI) "
+                "or REPORT_DATA_API_BASE (override).",
                 self.base_url,
             )
             return {k: {} for k in keys}

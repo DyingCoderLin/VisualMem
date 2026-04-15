@@ -19,6 +19,9 @@ if not os.path.isabs(ENV_FILE):
     ENV_FILE = os.path.join(_PROJECT_ROOT, ENV_FILE)
 load_dotenv(dotenv_path=ENV_FILE)  # Load selected env file (default: <project_root>/.env)
 
+# Default image embedding (SigLIP lighter; set EMBEDDING_MODEL=Qwen/Qwen3-VL-Embedding-2B for stronger GPU)
+_DEFAULT_EMBEDDING_MODEL = "google/siglip-large-patch16-384"
+
 class Config:
     # ============================================
     # Storage Mode Selection (Core)
@@ -86,15 +89,14 @@ class Config:
     # Vector Mode Configuration (if STORAGE_MODE=vector)
     # ============================================
     ENABLE_CLIP_ENCODER = os.environ.get("ENABLE_CLIP_ENCODER", "false").lower() == "true"
-    # For multimodal RAG, we need image-text alignment, so must use CLIP/ALIGN series embedding models
-    # Default is now Qwen3-VL-Embedding-2B
-    EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
-    
+    # Multimodal embeddings: SigLIP (default, lighter) or Qwen3-VL-Embedding-2B (heavier, stronger).
+    EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
+
     # LanceDB Path selection based on model
     def _compute_lancedb_path():
         raw = os.environ.get("STORAGE_ROOT", "./visualmem_storage")
         storage_root = _resolve_path(raw)
-        model = os.environ.get("EMBEDDING_MODEL", "Qwen/Qwen3-VL-Embedding-2B")
+        model = os.environ.get("EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
 
         if "qwen" in model.lower():
             return os.path.join(storage_root, "visualmem_qwen_lancedb")
@@ -224,7 +226,9 @@ class Config:
     # Defaults match SJTU OpenAI-compatible gateway; set REPORT_API_KEY in .env.
     # Model ids must be litellm "provider/model" (e.g. openai/qwen3coder, openai/minimax-m2.5).
     # Bare names are normalized in core/report/llm_caller.py. Native MiniMax: minimax/MiniMax-M2.5.
-    # Data platform URL defaults to local backend (override with REPORT_DATA_API_BASE if needed).
+    # Daily report HTTP fetcher: same host as VisualMem data API (gui_backend_server).
+    # Auto: GUI_MODE=remote + GUI_REMOTE_BACKEND_URL -> that URL; else http://localhost:18080.
+    # Set REPORT_DATA_API_BASE only to override (e.g. CLI on another host).
     # ============================================
     REPORT_MAP_MODEL = os.environ.get("REPORT_MAP_MODEL", "openai/minimax-m2.5")
     REPORT_REDUCE_MODEL = os.environ.get("REPORT_REDUCE_MODEL", "openai/minimax-m2.5")
@@ -236,7 +240,13 @@ class Config:
     REPORT_CHUNK_TOKEN_LIMIT = int(os.environ.get("REPORT_CHUNK_TOKEN_LIMIT", "30000"))
     REPORT_GAP_MINUTES = int(os.environ.get("REPORT_GAP_MINUTES", "10"))
     REPORT_DAILY_GOAL = os.environ.get("REPORT_DAILY_GOAL", "")
-    REPORT_DATA_API_BASE = os.environ.get("REPORT_DATA_API_BASE", "http://localhost:18080")
+    _report_data_env = os.environ.get("REPORT_DATA_API_BASE", "").strip()
+    if _report_data_env:
+        REPORT_DATA_API_BASE = _report_data_env.rstrip("/")
+    elif GUI_MODE == "remote" and GUI_REMOTE_BACKEND_URL:
+        REPORT_DATA_API_BASE = GUI_REMOTE_BACKEND_URL.rstrip("/")
+    else:
+        REPORT_DATA_API_BASE = "http://localhost:18080"
     # Reduce: read prior daily_report_*.json from this directory (project-relative ok).
     REPORT_LOG_DIR = _resolve_path(os.environ.get("REPORT_LOG_DIR", "logs"))
     # How many calendar days to walk backward when looking for prior report files.

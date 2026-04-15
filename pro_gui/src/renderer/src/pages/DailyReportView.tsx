@@ -50,25 +50,57 @@ function BulletList({ items }: { items: string[] }) {
 
 const DailyReportView: React.FC = () => {
   const [dates, setDates] = useState<string[]>([])
-  const [selectedDate, setSelectedDate] = useState(localISODate)
+  /** 列表拉取完成且已根据列表选好默认日期后再展示详情 */
+  const [listLoaded, setListLoaded] = useState(false)
+  const [selectedDate, setSelectedDate] = useState<string | null>(null)
   const [report, setReport] = useState<DailyReportPayload | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [genLoading, setGenLoading] = useState(false)
   const [genError, setGenError] = useState<string | null>(null)
-  const [detailLoading, setDetailLoading] = useState(true)
+  const [detailLoading, setDetailLoading] = useState(false)
 
-  const refreshList = useCallback(async () => {
+  /** `onlyDates`: 只刷新侧边栏列表，不改动当前选中日期（生成日报后调用） */
+  const refreshList = useCallback(async (options?: { onlyDates?: boolean }) => {
     const { dates: d } = await apiClient.listDailyReports()
     setDates(d)
+    if (options?.onlyDates) {
+      return
+    }
+    const today = localISODate()
+    if (d.includes(today)) {
+      setSelectedDate(today)
+    } else if (d.length > 0) {
+      setSelectedDate(d[0])
+    } else {
+      setSelectedDate(today)
+    }
+    setListLoaded(true)
   }, [])
 
   useEffect(() => {
     refreshList().catch((e) => console.error('listDailyReports', e))
   }, [refreshList])
 
+  /** 仅当该日在列表中（磁盘上确有 JSON）时才请求详情，避免对「今天」无脑 GET 导致 404 */
+  const selectedHasReport = useMemo(
+    () => (selectedDate != null ? dates.includes(selectedDate) : false),
+    [dates, selectedDate]
+  )
+
   useEffect(() => {
     let cancelled = false
     const run = async () => {
+      if (!listLoaded || selectedDate === null) {
+        return
+      }
+      if (!dates.includes(selectedDate)) {
+        if (!cancelled) {
+          setReport(null)
+          setLoadError(null)
+          setDetailLoading(false)
+        }
+        return
+      }
       setDetailLoading(true)
       setLoadError(null)
       setReport(null)
@@ -87,18 +119,22 @@ const DailyReportView: React.FC = () => {
     return () => {
       cancelled = true
     }
-  }, [selectedDate])
+  }, [listLoaded, selectedDate, dates])
 
-  const titleDate = useMemo(() => formatDateTitle(selectedDate), [selectedDate])
+  const titleDate = useMemo(
+    () => (selectedDate ? formatDateTitle(selectedDate) : ''),
+    [selectedDate]
+  )
 
   const handleGenerate = async () => {
+    if (!selectedDate) return
     setGenLoading(true)
     setGenError(null)
     try {
       const data = await apiClient.generateDailyReport(selectedDate)
       setReport(data)
       setLoadError(null)
-      await refreshList()
+      await refreshList({ onlyDates: true })
     } catch (e) {
       setGenError(e instanceof Error ? e.message : '生成失败')
     } finally {
@@ -147,7 +183,7 @@ const DailyReportView: React.FC = () => {
               <input
                 className="daily-report-date-input"
                 type="date"
-                value={selectedDate}
+                value={selectedDate ?? ''}
                 onChange={(e) => setSelectedDate(e.target.value)}
               />
             </div>
@@ -155,7 +191,7 @@ const DailyReportView: React.FC = () => {
               <button
                 type="button"
                 className="daily-report-gen-btn"
-                disabled={genLoading}
+                disabled={genLoading || !listLoaded || !selectedDate}
                 onClick={handleGenerate}
               >
                 {genLoading ? '生成中…' : '生成日报'}
@@ -165,8 +201,14 @@ const DailyReportView: React.FC = () => {
           </div>
 
           <div className="daily-report-card-wrap">
-            {detailLoading ? (
+            {!listLoaded ? (
               <div className="daily-report-empty-state">加载中…</div>
+            ) : detailLoading ? (
+              <div className="daily-report-empty-state">加载中…</div>
+            ) : !selectedHasReport ? (
+              <div className="daily-report-empty-state">
+                该日尚无日报文件。请从左侧选已有日期，或选日期后点击「生成日报」。
+              </div>
             ) : loadError && !report ? (
               <div className="daily-report-empty-state">{loadError}</div>
             ) : (

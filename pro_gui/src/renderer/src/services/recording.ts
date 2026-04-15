@@ -30,8 +30,16 @@ class RecordingService {
   private sendQueue: Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number }> = []
   private isSending: boolean = false
   private readonly maxQueueSize: number = 20  // 队列超过此大小时丢弃最旧的帧
-  /** 发送积压超过此值时暂停截屏，直到队列下降（避免后端单帧 5–8s 时永久满队列） */
+  /** 发送积压 ≥ 此值时进入背压（暂停新截屏） */
   private readonly sendQueueBackpressureThreshold: number = 12
+  /**
+   * 背压解除：队列长度 ≤ 此值时才恢复截屏（滞回，避免在 11↔13 之间因多显示器/重叠 tick 反复抖动）
+   */
+  private readonly sendQueueBackpressureResumeThreshold: number = 8
+  /** setInterval 不等待 async，防止上一 tick 仍在 await captureScreen 时又开一轮截屏 */
+  private captureTickInFlight: boolean = false
+  /** 背压锁存：进入后备压一直生效直到队列充分下降 */
+  private backpressureLatched: boolean = false
   private lastBackpressureLogMs: number = 0
   private lastQueueDropLogMs: number = 0
 
@@ -408,19 +416,29 @@ class RecordingService {
       return
     }
 
-    // 背压：后端 store_frame 常需数秒（多窗口 OCR），若仍按固定间隔截屏，发送队列会永远追不上
+    // 背压（带滞回）：队列冲高后暂停截屏，降到 resume 以下才恢复，避免 12/13 边界来回跳
     if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
+      this.backpressureLatched = true
+    }
+    if (this.sendQueue.length <= this.sendQueueBackpressureResumeThreshold) {
+      this.backpressureLatched = false
+    }
+    if (this.backpressureLatched) {
       const now = Date.now()
       if (now - this.lastBackpressureLogMs > 8000) {
         console.warn(
           `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), ` +
-            `skipping capture until below ${this.sendQueueBackpressureThreshold}`
+            `skipping capture until queue ≤ ${this.sendQueueBackpressureResumeThreshold}`
         )
         this.lastBackpressureLogMs = now
       }
       return
     }
 
+    if (this.captureTickInFlight) {
+      return
+    }
+    this.captureTickInFlight = true
     try {
       // 截屏（可能包含多个屏幕）
       const captureResults = await this.captureScreen()
@@ -475,6 +493,8 @@ class RecordingService {
         return
       }
       console.error('Error in capture loop:', error)
+    } finally {
+      this.captureTickInFlight = false
     }
   }
 
@@ -596,15 +616,27 @@ class RecordingService {
     // 重置状态
     this.lastImageDataArray = []
     this.sendQueue = []
+    this.backpressureLatched = false
+    this.captureTickInFlight = false
     this.isSending = false  // 释放发送锁，防止残留的 inflight 请求阻塞下次录制
     console.log('Recording stopped')
 
-    // 通知后端刷新缓冲区
+    // 通知后端刷新缓冲区（与 store_frame 可能并行；慢时勿用短超时误判为「后端卡死」）
     try {
       await apiClient.stopRecording()
       console.log('Backend buffer flushed on stop')
     } catch (error) {
-      console.warn('Failed to notify backend to flush buffer:', error)
+      const aborted =
+        error instanceof DOMException &&
+        (error.name === 'AbortError' || error.message?.includes('aborted'))
+      if (aborted) {
+        console.warn(
+          '[RecordingService] stopRecording timed out or was aborted before response; ' +
+            'backend may still be flushing. Check logs/backend_server.log if data looks incomplete.'
+        )
+      } else {
+        console.warn('Failed to notify backend to flush buffer:', error)
+      }
     }
   }
 
