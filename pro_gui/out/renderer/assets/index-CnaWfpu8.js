@@ -7074,9 +7074,11 @@ class ApiClient {
     });
   }
   async stopRecording() {
-    return this.request("/api/recording/stop", {
-      method: "POST"
-    });
+    return this.request(
+      "/api/recording/stop",
+      { method: "POST" },
+      3e5
+    );
   }
   async storeFrame(req) {
     return this.request(
@@ -7228,7 +7230,12 @@ class RecordingService {
   diffCanvas = null;
   diffCtx = null;
   options;
-  isRecording = false;
+  /** 会话进行中（含 warmup 与稳态录屏） */
+  sessionActive = false;
+  /** 首次截图 + store_frame drain 阶段 */
+  warmupPhase = false;
+  /** 稳态录屏（setInterval 已启动），对应 UI「正在录制」 */
+  liveRecording = false;
   frameCounter = 0;
   // 计数器：0-10，每成功发送 10 帧后刷新数据
   statusListeners = [];
@@ -7239,8 +7246,16 @@ class RecordingService {
   isSending = false;
   maxQueueSize = 20;
   // 队列超过此大小时丢弃最旧的帧
-  /** 发送积压超过此值时暂停截屏，直到队列下降（避免后端单帧 5–8s 时永久满队列） */
+  /** 发送积压 ≥ 此值时进入背压（暂停新截屏） */
   sendQueueBackpressureThreshold = 12;
+  /**
+   * 背压解除：队列长度 ≤ 此值时才恢复截屏（滞回，避免在 11↔13 之间因多显示器/重叠 tick 反复抖动）
+   */
+  sendQueueBackpressureResumeThreshold = 8;
+  /** setInterval 不等待 async，防止上一 tick 仍在 await captureScreen 时又开一轮截屏 */
+  captureTickInFlight = false;
+  /** 背压锁存：进入后备压一直生效直到队列充分下降 */
+  backpressureLatched = false;
   lastBackpressureLogMs = 0;
   lastQueueDropLogMs = 0;
   maxImageWidth = 1920;
@@ -7257,15 +7272,20 @@ class RecordingService {
     const savedState = sessionStorage.getItem("vlm_is_recording");
     if (savedState === "true") {
       console.log("[RecordingService] Restoring recording state from sessionStorage after refresh");
-      this.isRecording = true;
+      this.sessionActive = true;
+      this.warmupPhase = true;
+      this.liveRecording = false;
+      queueMicrotask(() => this.notifyStatusListeners());
       setTimeout(() => {
-        if (this.isRecording) {
-          this.startLoop().catch((err) => {
-            console.error("Failed to auto-resume recording loop:", err);
-            this.isRecording = false;
-            this.notifyStatusListeners();
-          });
-        }
+        if (!this.sessionActive) return;
+        this.resumeAfterPageReload().catch((err) => {
+          console.error("Failed to auto-resume recording:", err);
+          this.sessionActive = false;
+          this.warmupPhase = false;
+          this.liveRecording = false;
+          sessionStorage.removeItem("vlm_is_recording");
+          this.notifyStatusListeners();
+        });
       }, 1e3);
     }
     this.loadConfigFromBackend();
@@ -7275,13 +7295,21 @@ class RecordingService {
    */
   subscribeStatus(listener) {
     this.statusListeners.push(listener);
-    listener(this.isRecording);
+    listener(this.getRecordingStatus());
     return () => {
       this.statusListeners = this.statusListeners.filter((l2) => l2 !== listener);
     };
   }
+  getRecordingStatus() {
+    return {
+      sessionActive: this.sessionActive,
+      isWarmup: this.warmupPhase,
+      isLiveRecording: this.liveRecording
+    };
+  }
   notifyStatusListeners() {
-    this.statusListeners.forEach((listener) => listener(this.isRecording));
+    const s = this.getRecordingStatus();
+    this.statusListeners.forEach((listener) => listener(s));
   }
   /**
    * 从后端获取所有配置（diff_threshold, capture_interval, max_image_width, image_quality）
@@ -7298,7 +7326,7 @@ class RecordingService {
         if (this.options.interval !== newInterval) {
           console.log(`[RecordingService] Updating capture_interval from ${this.options.interval}ms to ${newInterval}ms`);
           this.options.interval = newInterval;
-          if (this.isRecording && this.intervalId !== null) {
+          if (this.liveRecording && this.intervalId !== null) {
             clearInterval(this.intervalId);
             this.intervalId = window.setInterval(() => this.captureAndProcessLoop(), this.options.interval);
           }
@@ -7507,52 +7535,95 @@ class RecordingService {
     }
   }
   /**
-   * 开始录制
+   * 开始录制：warmup（第一次截图 + 全部 store_frame 返回）→ 稳态 interval
    */
   async start() {
-    if (this.isRecording && this.intervalId !== null) {
-      console.warn("Recording is already in progress");
+    if (this.sessionActive) {
+      console.warn("Recording session already active");
       return;
     }
-    this.isRecording = true;
-    sessionStorage.setItem("vlm_is_recording", "true");
-    this.notifyStatusListeners();
-    await this.startLoop();
-  }
-  /**
-   * 启动录制循环
-   */
-  async startLoop() {
+    this.sessionActive = true;
+    this.warmupPhase = true;
+    this.liveRecording = false;
     this.lastImageDataArray = [];
     this.frameCounter = 0;
     this.isSending = false;
-    console.log(`[RecordingService] Starting capture loop with interval: ${this.options.interval}ms, mode: ${this.options.mode}`);
-    this.captureAndProcessLoop();
+    sessionStorage.setItem("vlm_is_recording", "true");
+    this.notifyStatusListeners();
+    try {
+      await this.runFirstScreenshotWarmup();
+    } catch (err) {
+      this.sessionActive = false;
+      this.warmupPhase = false;
+      this.liveRecording = false;
+      sessionStorage.removeItem("vlm_is_recording");
+      this.notifyStatusListeners();
+      throw err;
+    }
+    if (!this.sessionActive) {
+      return;
+    }
+    this.warmupPhase = false;
+    this.liveRecording = true;
+    this.notifyStatusListeners();
+    this.startLoopSteady();
+  }
+  /** 页面刷新后恢复：与手动开始相同，先 warmup 再 interval */
+  async resumeAfterPageReload() {
+    this.lastImageDataArray = [];
+    this.frameCounter = 0;
+    this.isSending = false;
+    await this.runFirstScreenshotWarmup();
+    if (!this.sessionActive) return;
+    this.warmupPhase = false;
+    this.liveRecording = true;
+    this.notifyStatusListeners();
+    this.startLoopSteady();
+  }
+  /**
+   * 第一次截图产生的全部 store_frame 请求完成后再进入稳态
+   */
+  async runFirstScreenshotWarmup() {
+    console.log("[RecordingService] Warmup: first capture tick + drain send queue");
+    await this.runSingleCaptureTick();
+    await this.drainSendQueue();
+    console.log("[RecordingService] Warmup complete");
+  }
+  async drainSendQueue() {
+    const maxWaitMs = 30 * 60 * 1e3;
+    const t0 = Date.now();
+    while (this.sendQueue.length > 0 || this.isSending) {
+      if (!this.sessionActive) {
+        break;
+      }
+      if (Date.now() - t0 > maxWaitMs) {
+        console.warn("[RecordingService] drainSendQueue: timeout waiting for queue (30m)");
+        break;
+      }
+      await new Promise((r2) => setTimeout(r2, 50));
+    }
+  }
+  /**
+   * 仅启动定时间隔，不立即再截一帧（首帧已在 warmup 完成）
+   */
+  startLoopSteady() {
+    console.log(
+      `[RecordingService] Steady capture loop interval: ${this.options.interval}ms, mode: ${this.options.mode}`
+    );
     if (this.intervalId !== null) {
       clearInterval(this.intervalId);
     }
     this.intervalId = window.setInterval(() => this.captureAndProcessLoop(), this.options.interval);
   }
-  /**
-   * 核心捕获和处理逻辑
-   */
-  async captureAndProcessLoop() {
-    if (!this.isRecording) {
+  /** 单次截屏 + 入队（与 captureAndProcessLoop 主体一致） */
+  async runSingleCaptureTick() {
+    if (this.captureTickInFlight) {
       return;
     }
-    if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
-      const now = Date.now();
-      if (now - this.lastBackpressureLogMs > 8e3) {
-        console.warn(
-          `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), skipping capture until below ${this.sendQueueBackpressureThreshold}`
-        );
-        this.lastBackpressureLogMs = now;
-      }
-      return;
-    }
+    this.captureTickInFlight = true;
     try {
       const captureResults = await this.captureScreen();
-      if (!this.isRecording || captureResults.length === 0) {
+      if (!this.sessionActive || captureResults.length === 0) {
         return;
       }
       const now = /* @__PURE__ */ new Date();
@@ -7565,7 +7636,7 @@ class RecordingService {
       const seconds = String(now.getSeconds()).padStart(2, "0");
       const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`;
       for (const { base64Data, diffData, index, width, height } of captureResults) {
-        if (!this.isRecording) {
+        if (!this.sessionActive) {
           break;
         }
         this.lastImageDataArray[index] = diffData;
@@ -7580,10 +7651,79 @@ class RecordingService {
         this.enqueueFrame(base64Data, frameId, timestamp, width, height, index);
       }
     } catch (error) {
-      if (!this.isRecording) {
+      if (!this.sessionActive) {
+        return;
+      }
+      console.error("Error in warmup capture tick:", error);
+    } finally {
+      this.captureTickInFlight = false;
+    }
+  }
+  /**
+   * 核心捕获和处理逻辑
+   */
+  async captureAndProcessLoop() {
+    if (!this.sessionActive || !this.liveRecording) {
+      return;
+    }
+    if (!this.warmupPhase) {
+      if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
+        this.backpressureLatched = true;
+      }
+      if (this.sendQueue.length <= this.sendQueueBackpressureResumeThreshold) {
+        this.backpressureLatched = false;
+      }
+      if (this.backpressureLatched) {
+        const now = Date.now();
+        if (now - this.lastBackpressureLogMs > 8e3) {
+          console.warn(
+            `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), skipping capture until queue ≤ ${this.sendQueueBackpressureResumeThreshold}`
+          );
+          this.lastBackpressureLogMs = now;
+        }
+        return;
+      }
+    }
+    if (this.captureTickInFlight) {
+      return;
+    }
+    this.captureTickInFlight = true;
+    try {
+      const captureResults = await this.captureScreen();
+      if (!this.sessionActive || !this.liveRecording || captureResults.length === 0) {
+        return;
+      }
+      const now = /* @__PURE__ */ new Date();
+      const timestamp = now.toISOString();
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, "0");
+      const day = String(now.getDate()).padStart(2, "0");
+      const hours = String(now.getHours()).padStart(2, "0");
+      const minutes = String(now.getMinutes()).padStart(2, "0");
+      const seconds = String(now.getSeconds()).padStart(2, "0");
+      const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`;
+      for (const { base64Data, diffData, index, width, height } of captureResults) {
+        if (!this.sessionActive || !this.liveRecording) {
+          break;
+        }
+        this.lastImageDataArray[index] = diffData;
+        if (!base64Data) {
+          continue;
+        }
+        if (this.isSolidColorFrame(diffData)) {
+          continue;
+        }
+        const microSeconds = String(index).padStart(6, "0");
+        const frameId = `${frameIdPrefix}${microSeconds}`;
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index);
+      }
+    } catch (error) {
+      if (!this.sessionActive) {
         return;
       }
       console.error("Error in capture loop:", error);
+    } finally {
+      this.captureTickInFlight = false;
     }
   }
   /**
@@ -7612,7 +7752,7 @@ class RecordingService {
     if (this.isSending) return;
     this.isSending = true;
     try {
-      while (this.sendQueue.length > 0 && this.isRecording) {
+      while (this.sendQueue.length > 0 && this.sessionActive) {
         const frame = this.sendQueue.shift();
         try {
           await this.sendFrameToBackendDirectly(
@@ -7635,7 +7775,7 @@ class RecordingService {
    * 直接发送 Base64 帧到后端
    */
   async sendFrameToBackendDirectly(base64Data, frameId, timestamp, width, height, monitorId = 0) {
-    if (!this.isRecording) {
+    if (!this.sessionActive) {
       return;
     }
     try {
@@ -7668,7 +7808,7 @@ class RecordingService {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
       }
-      if (this.isRecording) {
+      if (this.sessionActive) {
         console.error("Failed to send frame to backend:", error);
       }
     }
@@ -7677,7 +7817,9 @@ class RecordingService {
    * 停止录制
    */
   async stop() {
-    this.isRecording = false;
+    this.sessionActive = false;
+    this.warmupPhase = false;
+    this.liveRecording = false;
     sessionStorage.removeItem("vlm_is_recording");
     this.notifyStatusListeners();
     if (this.intervalId !== null) {
@@ -7686,20 +7828,29 @@ class RecordingService {
     }
     this.lastImageDataArray = [];
     this.sendQueue = [];
+    this.backpressureLatched = false;
+    this.captureTickInFlight = false;
     this.isSending = false;
     console.log("Recording stopped");
     try {
       await apiClient.stopRecording();
       console.log("Backend buffer flushed on stop");
     } catch (error) {
-      console.warn("Failed to notify backend to flush buffer:", error);
+      const aborted = error instanceof DOMException && (error.name === "AbortError" || error.message?.includes("aborted"));
+      if (aborted) {
+        console.warn(
+          "[RecordingService] stopRecording timed out or was aborted before response; backend may still be flushing. Check logs/backend_server.log if data looks incomplete."
+        );
+      } else {
+        console.warn("Failed to notify backend to flush buffer:", error);
+      }
     }
   }
   /**
    * 获取录制状态
    */
   getStatus() {
-    return this.isRecording;
+    return this.liveRecording;
   }
   /**
    * 设置录制模式
@@ -7733,6 +7884,7 @@ const AppStoreProvider = ({ children }) => {
     latest_date: null
   });
   const [isRecording, setIsRecording] = reactExports.useState(false);
+  const [isWarmingUp, setIsWarmingUp] = reactExports.useState(false);
   const [isModelLoading, setIsModelLoading] = reactExports.useState(false);
   const [recordingMode, setRecordingModeState] = reactExports.useState(recordingService.getMode());
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = reactExports.useState(0);
@@ -7757,23 +7909,25 @@ const AppStoreProvider = ({ children }) => {
   const refreshTimeline = reactExports.useCallback(() => {
     setTimelineRefreshTrigger((prev) => prev + 1);
   }, []);
-  reactExports.useEffect(() => {
-    const unsubscribe = recordingService.subscribeStatus((status) => {
-      setIsRecording(status);
-      if (status) {
-        const now = /* @__PURE__ */ new Date();
-        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
-        setDateRange((prev) => ({
-          ...prev,
-          latest_date: today
-        }));
-        refreshTimeline();
-      } else {
-        refreshDateRange();
-      }
-    });
-    return unsubscribe;
+  const applyRecordingStatus = reactExports.useCallback((status) => {
+    setIsWarmingUp(status.isWarmup);
+    setIsRecording(status.isLiveRecording);
+    if (status.sessionActive) {
+      const now = /* @__PURE__ */ new Date();
+      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+      setDateRange((prev) => ({
+        ...prev,
+        latest_date: today
+      }));
+      refreshTimeline();
+    } else {
+      refreshDateRange();
+    }
   }, [refreshDateRange, refreshTimeline]);
+  reactExports.useEffect(() => {
+    const unsubscribe = recordingService.subscribeStatus(applyRecordingStatus);
+    return unsubscribe;
+  }, [applyRecordingStatus]);
   const startRecording = reactExports.useCallback(async () => {
     try {
       const modelsStatus = await apiClient.getModelsStatus();
@@ -7804,17 +7958,18 @@ const AppStoreProvider = ({ children }) => {
     return () => clearInterval(interval);
   }, [refreshDateRange]);
   reactExports.useEffect(() => {
-    if (isRecording) {
+    if (isRecording || isWarmingUp) {
       const refreshInterval = setInterval(() => {
         refreshTimeline();
       }, 5e3);
       return () => clearInterval(refreshInterval);
     }
-  }, [isRecording, refreshTimeline]);
+  }, [isRecording, isWarmingUp, refreshTimeline]);
   const value = {
     dateRange,
     refreshDateRange,
     isRecording,
+    isWarmingUp,
     isModelLoading,
     recordingMode,
     startRecording,
@@ -7835,6 +7990,7 @@ const SearchBar = ({ onSearchResult }) => {
   const searchRequestRef = reactExports.useRef(null);
   const {
     isRecording,
+    isWarmingUp,
     isModelLoading,
     startRecording,
     stopRecording,
@@ -7901,7 +8057,7 @@ const SearchBar = ({ onSearchResult }) => {
   };
   const handleToggleRecording = async () => {
     try {
-      if (isRecording) {
+      if (isRecording || isWarmingUp) {
         stopRecording();
       } else {
         await startRecording();
@@ -7962,6 +8118,19 @@ const SearchBar = ({ onSearchResult }) => {
     isModelLoading ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "record-btn-loading", children: [
       /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "loading-spinner", width: "24", height: "24", viewBox: "0 0 24 24", fill: "none", children: /* @__PURE__ */ jsxRuntimeExports.jsx("circle", { cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "2", strokeDasharray: "50 20" }) }),
       /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "loading-text", children: "Loading model" })
+    ] }) : isWarmingUp ? /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "record-btn-loading", style: { gap: "10px" }, children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { className: "loading-spinner", width: "24", height: "24", viewBox: "0 0 24 24", fill: "none", children: /* @__PURE__ */ jsxRuntimeExports.jsx("circle", { cx: "12", cy: "12", r: "10", stroke: "currentColor", strokeWidth: "2", strokeDasharray: "50 20" }) }),
+      /* @__PURE__ */ jsxRuntimeExports.jsx("span", { className: "loading-text", children: "Warming up" }),
+      /* @__PURE__ */ jsxRuntimeExports.jsx(
+        "button",
+        {
+          type: "button",
+          className: `record-btn ${isRecording ? "recording" : ""}`,
+          onClick: () => stopRecording(),
+          title: "Stop",
+          children: /* @__PURE__ */ jsxRuntimeExports.jsx("svg", { width: "20", height: "20", viewBox: "0 0 24 24", fill: "currentColor", children: /* @__PURE__ */ jsxRuntimeExports.jsx("rect", { x: "6", y: "6", width: "12", height: "12" }) })
+        }
+      )
     ] }) : /* @__PURE__ */ jsxRuntimeExports.jsx(
       "button",
       {
@@ -9053,23 +9222,50 @@ function BulletList({ items }) {
 }
 const DailyReportView = () => {
   const [dates, setDates] = reactExports.useState([]);
-  const [selectedDate, setSelectedDate] = reactExports.useState(localISODate);
+  const [listLoaded, setListLoaded] = reactExports.useState(false);
+  const [selectedDate, setSelectedDate] = reactExports.useState(null);
   const [report, setReport] = reactExports.useState(null);
   const [loadError, setLoadError] = reactExports.useState(null);
   const [genLoading, setGenLoading] = reactExports.useState(false);
   const [genError, setGenError] = reactExports.useState(null);
-  const [metricsOpen, setMetricsOpen] = reactExports.useState(false);
-  const [detailLoading, setDetailLoading] = reactExports.useState(true);
-  const refreshList = reactExports.useCallback(async () => {
+  const [detailLoading, setDetailLoading] = reactExports.useState(false);
+  const refreshList = reactExports.useCallback(async (options) => {
     const { dates: d } = await apiClient.listDailyReports();
     setDates(d);
+    if (options?.onlyDates) {
+      return;
+    }
+    const today = localISODate();
+    if (d.includes(today)) {
+      setSelectedDate(today);
+    } else if (d.length > 0) {
+      setSelectedDate(d[0]);
+    } else {
+      setSelectedDate(today);
+    }
+    setListLoaded(true);
   }, []);
   reactExports.useEffect(() => {
     refreshList().catch((e) => console.error("listDailyReports", e));
   }, [refreshList]);
+  const selectedHasReport = reactExports.useMemo(
+    () => selectedDate != null ? dates.includes(selectedDate) : false,
+    [dates, selectedDate]
+  );
   reactExports.useEffect(() => {
     let cancelled = false;
     const run = async () => {
+      if (!listLoaded || selectedDate === null) {
+        return;
+      }
+      if (!dates.includes(selectedDate)) {
+        if (!cancelled) {
+          setReport(null);
+          setLoadError(null);
+          setDetailLoading(false);
+        }
+        return;
+      }
       setDetailLoading(true);
       setLoadError(null);
       setReport(null);
@@ -9088,16 +9284,20 @@ const DailyReportView = () => {
     return () => {
       cancelled = true;
     };
-  }, [selectedDate]);
-  const titleDate = reactExports.useMemo(() => formatDateTitle(selectedDate), [selectedDate]);
+  }, [listLoaded, selectedDate, dates]);
+  const titleDate = reactExports.useMemo(
+    () => selectedDate ? formatDateTitle(selectedDate) : "",
+    [selectedDate]
+  );
   const handleGenerate = async () => {
+    if (!selectedDate) return;
     setGenLoading(true);
     setGenError(null);
     try {
       const data = await apiClient.generateDailyReport(selectedDate);
       setReport(data);
       setLoadError(null);
-      await refreshList();
+      await refreshList({ onlyDates: true });
     } catch (e) {
       setGenError(e instanceof Error ? e.message : "生成失败");
     } finally {
@@ -9139,7 +9339,7 @@ const DailyReportView = () => {
             {
               className: "daily-report-date-input",
               type: "date",
-              value: selectedDate,
+              value: selectedDate ?? "",
               onChange: (e) => setSelectedDate(e.target.value)
             }
           )
@@ -9150,7 +9350,7 @@ const DailyReportView = () => {
             {
               type: "button",
               className: "daily-report-gen-btn",
-              disabled: genLoading,
+              disabled: genLoading || !listLoaded || !selectedDate,
               onClick: handleGenerate,
               children: genLoading ? "生成中…" : "生成日报"
             }
@@ -9158,7 +9358,7 @@ const DailyReportView = () => {
           genError ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-error", children: genError }) : null
         ] })
       ] }),
-      /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-card-wrap", children: detailLoading ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: "加载中…" }) : loadError && !report ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: loadError }) : /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "daily-report-card", children: [
+      /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-card-wrap", children: !listLoaded ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: "加载中…" }) : detailLoading ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: "加载中…" }) : !selectedHasReport ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: "该日尚无日报文件。请从左侧选已有日期，或选日期后点击「生成日报」。" }) : loadError && !report ? /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-empty-state", children: loadError }) : /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "daily-report-card", children: [
         /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { className: "daily-report-card-header", children: [
           /* @__PURE__ */ jsxRuntimeExports.jsxs("div", { children: [
             /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-kicker", children: "Daily Report" }),
@@ -9225,29 +9425,7 @@ const DailyReportView = () => {
         /* @__PURE__ */ jsxRuntimeExports.jsxs("section", { style: { marginTop: "var(--spacing-lg)" }, children: [
           /* @__PURE__ */ jsxRuntimeExports.jsx("h2", { className: "daily-report-section-title", children: "今日小结" }),
           /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-takeaway", children: (report?.report?.today_summary?.length ?? 0) === 0 ? /* @__PURE__ */ jsxRuntimeExports.jsx("p", { className: "daily-report-date-empty", children: "暂无小结" }) : report.report.today_summary.map((para, i) => /* @__PURE__ */ jsxRuntimeExports.jsx("p", { children: para }, i)) })
-        ] }),
-        report?.metrics_semantics ? /* @__PURE__ */ jsxRuntimeExports.jsxs(jsxRuntimeExports.Fragment, { children: [
-          /* @__PURE__ */ jsxRuntimeExports.jsxs(
-            "div",
-            {
-              className: "daily-report-metrics-toggle",
-              onClick: () => setMetricsOpen((v2) => !v2),
-              onKeyDown: (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  setMetricsOpen((v2) => !v2);
-                }
-              },
-              role: "button",
-              tabIndex: 0,
-              children: [
-                metricsOpen ? "▼" : "▶",
-                " 指标说明（折叠）"
-              ]
-            }
-          ),
-          metricsOpen ? /* @__PURE__ */ jsxRuntimeExports.jsx("pre", { className: "daily-report-metrics-pre", children: report.metrics_semantics }) : null
-        ] }) : null
+        ] })
       ] }) })
     ] })
   ] }) });
@@ -9373,14 +9551,7 @@ function AppContent() {
           /* @__PURE__ */ jsxRuntimeExports.jsx("div", { style: { display: currentView === "realtime" ? "contents" : "none" }, children: /* @__PURE__ */ jsxRuntimeExports.jsx(RealTimeTracing, {}) }),
           currentView === "tags" && /* @__PURE__ */ jsxRuntimeExports.jsx(SmartTags, {}),
           currentView === "settings" && /* @__PURE__ */ jsxRuntimeExports.jsx(Settings, {}),
-          /* @__PURE__ */ jsxRuntimeExports.jsx(
-            "div",
-            {
-              className: "daily-report-view-container",
-              style: { display: currentView === "daily" ? void 0 : "none" },
-              children: /* @__PURE__ */ jsxRuntimeExports.jsx(DailyReportView, {})
-            }
-          )
+          currentView === "daily" && /* @__PURE__ */ jsxRuntimeExports.jsx("div", { className: "daily-report-view-container", children: /* @__PURE__ */ jsxRuntimeExports.jsx(DailyReportView, {}) })
         ] })
       ] })
     ] })

@@ -28,6 +28,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
   // 使用全局状态
   const {
     isRecording,
+    isWarmingUp,
     isModelLoading,
     startRecording,
     stopRecording,
@@ -109,7 +110,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
 
   const handleToggleRecording = async () => {
     try {
-      if (isRecording) {
+      if (isRecording || isWarmingUp) {
         stopRecording()
       } else {
         await startRecording()
@@ -201,6 +202,23 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
               <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeDasharray="50 20" />
             </svg>
             <span className="loading-text">Loading model</span>
+          </div>
+        ) : isWarmingUp ? (
+          <div className="record-btn-loading" style={{ gap: '10px' }}>
+            <svg className="loading-spinner" width="24" height="24" viewBox="0 0 24 24" fill="none">
+              <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" strokeDasharray="50 20" />
+            </svg>
+            <span className="loading-text">Warming up</span>
+            <button
+              type="button"
+              className="record-btn recording"
+              onClick={() => stopRecording()}
+              title="Stop warming up"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" />
+              </svg>
+            </button>
           </div>
         ) : (
           <button

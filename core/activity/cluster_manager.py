@@ -22,6 +22,7 @@ import json
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
@@ -110,6 +111,10 @@ class ClusterManager:
         self._last_recalc_time: float = 0.0  # monotonic time
         self._recalc_min_interval: float = 10.0  # seconds between recalcs (normal)
         self._recalc_min_interval_circuit_open: float = 60.0  # seconds when VLM circuit is open
+        self._vlm_executor = ThreadPoolExecutor(
+            max_workers=2,
+            thread_name_prefix="activity_vlm",
+        )
         self._load_centroids()
         self._rebuild_pending_pool_from_db()
 
@@ -328,6 +333,193 @@ class ClusterManager:
             }
         )
         return final_label
+
+    def _schedule_async_vlm_leader(
+        self,
+        leader_entry: PendingEntry,
+        app_name: str,
+        frame_id: str,
+        embedding: np.ndarray,
+        image,
+        ocr_text: str,
+        layout_text: str,
+        window_name: str,
+        timestamp: Optional[str],
+        _ts_display: str,
+        _win: str,
+        best_sim: float,
+    ) -> None:
+        """Run VLM + activity DB finalize off the store_frame hot path."""
+
+        def run():
+            try:
+                self._async_vlm_leader_worker(
+                    leader_entry,
+                    app_name,
+                    frame_id,
+                    embedding,
+                    image,
+                    ocr_text,
+                    layout_text,
+                    window_name,
+                    timestamp,
+                    _ts_display,
+                    _win,
+                    best_sim,
+                )
+            except Exception as e:
+                logger.warning(f"Async VLM finalize failed for {frame_id}: {e}")
+
+        self._vlm_executor.submit(run)
+
+    def _async_vlm_leader_worker(
+        self,
+        leader_entry: PendingEntry,
+        app_name: str,
+        frame_id: str,
+        embedding: np.ndarray,
+        image,
+        ocr_text: str,
+        layout_text: str,
+        window_name: str,
+        timestamp: Optional[str],
+        _ts_display: str,
+        _win: str,
+        best_sim: float,
+    ) -> None:
+        """VLM call (network) then SQLite updates; does not block store_frame."""
+        from core.activity.vlm_labeler import (
+            call_vlm,
+            fuzzy_match_label,
+            is_cluster_vlm_endpoint_configured,
+            log_cluster_labeling_event,
+        )
+
+        if not is_cluster_vlm_endpoint_configured():
+            return
+        if self._is_vlm_circuit_open():
+            return
+
+        conn = self._connect()
+        try:
+            existing_labels = self._get_existing_labels(conn, app_name)
+        finally:
+            conn.close()
+
+        if self._is_vlm_circuit_open():
+            return
+
+        vlm_url = config.CLUSTER_VLM_URL
+        with self._lock:
+            self._vlm_called_frames += 1
+
+        logger.info(
+            f"VLM labeling triggered (async): app={app_name}{_win} time={_ts_display} sim={best_sim:.3f}"
+        )
+        raw_label, meta = call_vlm(
+            vlm_url,
+            app_name,
+            image,
+            existing_labels,
+            ocr_text,
+            layout_text=layout_text,
+            window_name=window_name,
+            return_meta=True,
+        )
+        if not raw_label:
+            log_cluster_labeling_event(
+                {
+                    "source": "realtime",
+                    "app_name": app_name,
+                    "window_name": window_name,
+                    "label": "",
+                    "status": "failed_empty_label",
+                    **meta,
+                }
+            )
+            self._vlm_call_failed()
+            return
+        self._vlm_call_succeeded()
+        matched = fuzzy_match_label(raw_label, existing_labels)
+        final_label = matched or raw_label
+        log_cluster_labeling_event(
+            {
+                "source": "realtime",
+                "app_name": app_name,
+                "window_name": window_name,
+                "label": final_label,
+                "raw_label": raw_label,
+                "status": "merged_existing" if matched else "new_label",
+                "merged_into": matched or "",
+                **meta,
+            }
+        )
+        provisional_label = final_label
+        logger.info(f"VLM label result (async): app={app_name}{_win} -> \"{provisional_label}\"")
+
+        conn = self._connect()
+        try:
+            candidate_id = self._find_matching_candidate_cluster(
+                conn, app_name, provisional_label, embedding
+            )
+            if candidate_id is None:
+                candidate_id = self._create_candidate_cluster(
+                    conn, app_name, provisional_label, frame_id, embedding, timestamp
+                )
+
+            self._assign_sub_frame(
+                conn,
+                frame_id=frame_id,
+                app_name=app_name,
+                timestamp=timestamp,
+                cluster_id=candidate_id,
+                activity_label=provisional_label,
+                provisional_label=provisional_label,
+                cluster_status="candidate",
+                cluster_updated_at=timestamp,
+                pending_group_id=None,
+            )
+
+            self._resolve_pending_group(
+                conn, leader_entry, provisional_label, candidate_id, timestamp
+            )
+
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT cluster_status, label FROM activity_clusters WHERE id = ?",
+                (candidate_id,),
+            )
+            cluster_row = cursor.fetchone()
+            session_status = cluster_row["cluster_status"] if cluster_row else "candidate"
+            session_label = (
+                cluster_row["label"] if cluster_row and cluster_row["label"] else provisional_label
+            )
+            self._upsert_activity_session(
+                conn,
+                app_name=app_name,
+                cluster_id=candidate_id,
+                label=session_label,
+                session_status=session_status,
+                timestamp=timestamp,
+            )
+            self._freeze_old_committed_frames(conn, app_name)
+            conn.commit()
+        except Exception as e:
+            logger.warning(f"Async VLM DB finalize failed for {frame_id}: {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        self._load_centroids_for_apps({app_name})
+        with self._lock:
+            self._cleanup_pending_pool()
 
     def _label_unknown_frame_with_labels(
         self,
@@ -1082,61 +1274,37 @@ class ClusterManager:
                 conn.close()
                 return None
 
-            with self._lock:
-                self._vlm_called_frames += 1
+            from core.activity.vlm_labeler import is_cluster_vlm_endpoint_configured
 
-            logger.info(f"VLM labeling triggered: app={app_name}{_win} time={_ts_display} sim={best_sim:.3f}")
-            provisional_label = self._label_unknown_frame(
-                conn,
-                app_name,
-                image,
-                ocr_text or "",
-                layout_text=layout_text or "",
-                window_name=window_name or "",
-            )
-            if provisional_label:
-                logger.info(f"VLM label result: app={app_name}{_win} -> \"{provisional_label}\"")
-            if not provisional_label:
-                # VLM failed — frame stays pending in its group
+            if not is_cluster_vlm_endpoint_configured():
                 conn.commit()
                 conn.close()
                 return None
 
-            # VLM returned a label — find or create candidate cluster
-            candidate_id = self._find_matching_candidate_cluster(conn, app_name, provisional_label, embedding)
-            if candidate_id is None:
-                candidate_id = self._create_candidate_cluster(conn, app_name, provisional_label, frame_id, embedding, timestamp)
-
-            # Assign leader frame
-            self._assign_sub_frame(
-                conn, frame_id=frame_id, app_name=app_name, timestamp=timestamp,
-                cluster_id=candidate_id, activity_label=provisional_label,
-                provisional_label=provisional_label, cluster_status="candidate",
-                cluster_updated_at=timestamp, pending_group_id=None,
-            )
-
-            # Resolve all followers in the group
-            self._resolve_pending_group(conn, leader_entry, provisional_label, candidate_id, timestamp)
-
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT cluster_status, label FROM activity_clusters WHERE id = ?",
-                (candidate_id,),
-            )
-            cluster_row = cursor.fetchone()
-            session_status = cluster_row["cluster_status"] if cluster_row else "candidate"
-            session_label = cluster_row["label"] if cluster_row and cluster_row["label"] else provisional_label
-            self._upsert_activity_session(
-                conn, app_name=app_name, cluster_id=candidate_id,
-                label=session_label, session_status=session_status, timestamp=timestamp,
-            )
-            self._freeze_old_committed_frames(conn, app_name)
             conn.commit()
             conn.close()
 
-            self._load_centroids_for_apps({app_name})
-            self._cleanup_pending_pool()
-            return provisional_label
+            img_copy = image.copy() if image is not None else None
+            emb_copy = np.copy(embedding)
+            logger.info(
+                f"VLM labeling scheduled (async): app={app_name}{_win} frame={frame_id} "
+                f"time={_ts_display} sim={best_sim:.3f}"
+            )
+            self._schedule_async_vlm_leader(
+                leader_entry=leader_entry,
+                app_name=app_name,
+                frame_id=frame_id,
+                embedding=emb_copy,
+                image=img_copy,
+                ocr_text=ocr_text or "",
+                layout_text=layout_text or "",
+                window_name=window_name or "",
+                timestamp=timestamp,
+                _ts_display=_ts_display,
+                _win=_win,
+                best_sim=best_sim,
+            )
+            return None
         except Exception as e:
             logger.warning(f"Cluster assignment failed for {frame_id}: {e}")
             return None

@@ -135,7 +135,8 @@ def setup_logger(name: str = "visualmem", level: int = None) -> logging.Logger:
 
     # --- Primary handler: direct file write (never blocks on pipe) ---
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(str(_LOG_FILE), encoding='utf-8')
+    # Fresh file each backend process start; append would grow without bound across restarts.
+    file_handler = logging.FileHandler(str(_LOG_FILE), mode="w", encoding="utf-8")
     file_handler.setLevel(log_level)
     force_color = os.environ.get("LOG_COLOR", "").lower() in ("1", "true", "yes")
     if force_color:

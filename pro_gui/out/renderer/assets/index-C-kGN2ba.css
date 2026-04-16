@@ -352,28 +352,6 @@
   text-align: right;
 }
 
-.daily-report-metrics-toggle {
-  margin-top: var(--spacing-lg);
-  font-size: var(--font-size-sm);
-  color: var(--text-secondary);
-  cursor: pointer;
-  user-select: none;
-}
-
-.daily-report-metrics-pre {
-  margin-top: var(--spacing-sm);
-  padding: var(--spacing-md);
-  background-color: var(--bg-input);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-sm);
-  color: var(--text-secondary);
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 240px;
-  overflow-y: auto;
-  border: 1px solid var(--border-dim);
-}
-
 .daily-report-empty-state {
   padding: var(--spacing-xl);
   text-align: center;
