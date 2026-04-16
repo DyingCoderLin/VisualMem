@@ -70,7 +70,7 @@ class QueryWorker(QObject):
         if self._simple_mode_initialized:
             return
         
-        self.progress_signal.emit("📂 正在初始化 Simple 模式存储...")
+        self.progress_signal.emit("正在初始化 Simple 模式存储...")
         from core.storage.simple_storage import SimpleStorage
         from query import FrameCache
         
@@ -91,13 +91,13 @@ class QueryWorker(QObject):
     if self._vector_mode_initialized:
         return
     
-    self.progress_signal.emit(f"🔄 正在加载编码器模型 {config.EMBEDDING_MODEL}... (首次加载较慢)")
+    self.progress_signal.emit(f"正在加载编码器模型 {config.EMBEDDING_MODEL}... (首次加载较慢)")
     from core.encoder import create_encoder
     from core.storage.lancedb_storage import LanceDBStorage
     from core.retrieval.image_retriever import ImageRetriever
     
     self.encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
-    self.progress_signal.emit(f"📦 正在初始化 LanceDB 存储 ({config.LANCEDB_PATH})...")
+    self.progress_signal.emit(f"正在初始化 LanceDB 存储 ({config.LANCEDB_PATH})...")
     self.storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=self.encoder.embedding_dim
@@ -108,7 +108,7 @@ class QueryWorker(QObject):
         top_k=10
     )
     self._vector_mode_initialized = True
-    self.progress_signal.emit(f"✅ 编码器模型 {config.EMBEDDING_MODEL} 加载完成")
+    self.progress_signal.emit(f"编码器模型 {config.EMBEDDING_MODEL} 加载完成")
     
     def _ensure_storage_only(self):
         """只初始化存储（不加载 CLIP 模型，用于不需要向量检索的查询）"""
@@ -118,7 +118,7 @@ class QueryWorker(QObject):
         if self.storage is not None:
             return
         
-        self.progress_signal.emit("📦 正在初始化存储...")
+        self.progress_signal.emit("正在初始化存储...")
         if self.storage_mode == "simple":
             from core.storage.simple_storage import SimpleStorage
             self.storage = SimpleStorage(storage_path=config.IMAGE_STORAGE_PATH)
@@ -132,7 +132,7 @@ class QueryWorker(QObject):
     def query_rag(self, query_text: str, top_k: int = None):
         """RAG 快速检索（全库，支持 Hybrid Search）"""
         try:
-            self.progress_signal.emit("🔍 正在检索相关图片...")
+            self.progress_signal.emit("正在检索相关图片...")
             logger.info(f"RAG查询: '{query_text}'")
             
             # 延迟初始化：只有在真正需要时才加载 CLIP 模型
@@ -212,12 +212,12 @@ class QueryWorker(QObject):
                         return sparse_frames
                     except Exception as e:
                         logger.error(f"Sparse 检索失败: {e}", exc_info=True)
-                        self.progress_signal.emit(f"⚠️ Sparse 检索失败，仅使用 Dense 结果")
+                        self.progress_signal.emit(f"警告: Sparse 检索失败，仅使用 Dense 结果")
                         return []
                 
                 # 并行执行 Dense 和 Sparse 搜索（使用 asyncio）
                 if config.ENABLE_HYBRID:
-                    self.progress_signal.emit("🔍 启用 Hybrid Search，并行执行 Dense 和 Sparse 检索...")
+                    self.progress_signal.emit("启用 Hybrid Search，并行执行 Dense 和 Sparse 检索...")
                     async def _run_parallel_searches():
                         dense_task = asyncio.to_thread(_dense_search_task)
                         sparse_task = asyncio.to_thread(_sparse_search_task)
@@ -270,7 +270,7 @@ class QueryWorker(QObject):
             
             # Rerank 环节（如果启用）
             if config.ENABLE_RERANK:
-                self.progress_signal.emit(f"🔄 正在进行 Rerank（返回 top-{config.RERANK_TOP_K}）...")
+                self.progress_signal.emit(f"正在进行 Rerank（返回 top-{config.RERANK_TOP_K}）...")
                 reranker = Reranker()
                 frames_with_images = reranker.rerank(
                     query=query_text,
@@ -282,7 +282,7 @@ class QueryWorker(QObject):
                     self.result_signal.emit("Rerank 后没有图片，无法进行 VLM 分析。")
                     return
                 
-                self.progress_signal.emit(f"✅ Rerank 完成: 返回 top-{len(frames_with_images)} 张图片")
+                self.progress_signal.emit(f"Rerank 完成: 返回 top-{len(frames_with_images)} 张图片")
             
             # VLM 分析（只使用通过 rerank 的图片）
             response = self._analyze_with_vlm(query_text, frames_with_images)
@@ -307,7 +307,7 @@ class QueryWorker(QObject):
             if end_time and end_time.tzinfo is None:
                 end_time = end_time.astimezone(timezone.utc)
 
-            self.progress_signal.emit(f"🔍 RAG语义检索（时间范围: {start_time.strftime('%m/%d %H:%M')} - {end_time.strftime('%m/%d %H:%M')}）...")
+            self.progress_signal.emit(f"RAG语义检索（时间范围: {start_time.strftime('%m/%d %H:%M')} - {end_time.strftime('%m/%d %H:%M')}）...")
             logger.info(f"RAG时间范围查询: '{query_text}' ({start_time} - {end_time})")
 
             # ---------- Remote GUI 模式 ----------
@@ -318,7 +318,7 @@ class QueryWorker(QObject):
                     self.error_signal.emit(err)
                     return
 
-                self.progress_signal.emit("🌐 正在通过远程后端执行检索...")
+                self.progress_signal.emit("正在通过远程后端执行检索...")
                 try:
                     payload = {
                         "query": query_text,
@@ -372,7 +372,7 @@ class QueryWorker(QObject):
             self._ensure_vector_mode_initialized()
             
             # 进行语义检索（使用 LanceDB Pre-filtering，一步完成向量搜索和时间过滤）
-            self.progress_signal.emit("🔍 正在进行语义检索（LanceDB Pre-filtering）...")
+            self.progress_signal.emit("正在进行语义检索（LanceDB Pre-filtering）...")
             top_k = config.MAX_IMAGES_TO_LOAD
             
             # 支持查询重写
@@ -460,12 +460,12 @@ class QueryWorker(QObject):
                     return sparse_frames
                 except Exception as e:
                     logger.error(f"Sparse 检索失败: {e}", exc_info=True)
-                    self.progress_signal.emit(f"⚠️ Sparse 检索失败，仅使用 Dense 结果")
+                    self.progress_signal.emit(f"警告: Sparse 检索失败，仅使用 Dense 结果")
                     return []
             
             # 并行执行 Dense 和 Sparse 搜索（使用 asyncio）
             if config.ENABLE_HYBRID:
-                self.progress_signal.emit("🔍 启用 Hybrid Search，并行执行 Dense 和 Sparse 检索...")
+                self.progress_signal.emit("启用 Hybrid Search，并行执行 Dense 和 Sparse 检索...")
                 async def _run_parallel_searches():
                     dense_task = asyncio.to_thread(_dense_search_task)
                     sparse_task = asyncio.to_thread(_sparse_search_task)
@@ -503,7 +503,7 @@ class QueryWorker(QObject):
                 self.result_signal.emit("在指定时间范围内未找到相关的屏幕记录。")
                 return
             
-            self.progress_signal.emit(f"📊 检索到 {len(frames)} 张相关图片")
+            self.progress_signal.emit(f"检索到 {len(frames)} 张相关图片")
             
             # 加载图片
             for frame in frames:
@@ -523,7 +523,7 @@ class QueryWorker(QObject):
             
             # Rerank 环节（如果启用）
             if config.ENABLE_RERANK:
-                self.progress_signal.emit(f"🔄 正在进行 Rerank（返回 top-{config.RERANK_TOP_K}）...")
+                self.progress_signal.emit(f"正在进行 Rerank（返回 top-{config.RERANK_TOP_K}）...")
                 reranker = Reranker()
                 frames_with_images = reranker.rerank(
                     query=query_text,
@@ -535,7 +535,7 @@ class QueryWorker(QObject):
                     self.result_signal.emit("Rerank 后没有图片，无法进行 VLM 分析。")
                     return
                 
-                self.progress_signal.emit(f"✅ Rerank 完成: 返回 top-{len(frames_with_images)} 张图片")
+                self.progress_signal.emit(f"Rerank 完成: 返回 top-{len(frames_with_images)} 张图片")
             
             # VLM 分析（只使用通过 rerank 的图片）
             response = self._analyze_with_vlm(query_text, frames_with_images)
@@ -552,17 +552,17 @@ class QueryWorker(QObject):
         if top_k is None:
             top_k = config.MAX_IMAGES_TO_LOAD
         
-        self.progress_signal.emit("📂 Simple模式: 更新缓存...")
+        self.progress_signal.emit("Simple模式: 更新缓存...")
         new_frames_count = self.frame_cache.update(self.storage)
         if new_frames_count > 0:
-            self.progress_signal.emit(f"✨ 发现 {new_frames_count} 张新图片")
+            self.progress_signal.emit(f"发现 {new_frames_count} 张新图片")
         
         frames = self.frame_cache.get_frames()
         
         if not frames:
             return []
         
-        self.progress_signal.emit(f"📊 当前缓存: {len(frames)} 张图片")
+        self.progress_signal.emit(f"当前缓存: {len(frames)} 张图片")
         
         if len(frames) > top_k:
             frames = frames[:top_k]
@@ -570,7 +570,7 @@ class QueryWorker(QObject):
         # 帧差过滤
         if config.ENABLE_QUERY_FRAME_DIFF:
             from query import _apply_frame_diff_filter
-            self.progress_signal.emit("🔍 应用帧差过滤...")
+            self.progress_signal.emit("应用帧差过滤...")
             filtered_frames = _apply_frame_diff_filter(frames)
             removed_count = len(frames) - len(filtered_frames)
             if removed_count > 0:
@@ -584,14 +584,14 @@ class QueryWorker(QObject):
         if top_k is None:
             top_k = config.MAX_IMAGES_TO_LOAD
         
-        self.progress_signal.emit(f"🔍 Vector模式: RAG语义检索 top {top_k}...")
+        self.progress_signal.emit(f"Vector模式: RAG语义检索 top {top_k}...")
         
         frames = self.retriever.retrieve_by_text(query_text, top_k=top_k)
         
         if not frames:
             return []
         
-        self.progress_signal.emit(f"✅ 检索到 {len(frames)} 张相关图片")
+        self.progress_signal.emit(f"检索到 {len(frames)} 张相关图片")
         
         # 加载图片
         for frame in frames:
@@ -641,7 +641,7 @@ class QueryWorker(QObject):
     
     def _analyze_with_vlm(self, query_text: str, frames: List[Dict]) -> str:
         """使用VLM分析帧"""
-        self.progress_signal.emit(f"🤖 正在使用VLM分析 {len(frames)} 张图片...")
+        self.progress_signal.emit(f"正在使用VLM分析 {len(frames)} 张图片...")
         
         # System prompt: 定义助手角色
         system_prompt = "You are a helpful visual assistant. You analyze screenshots to answer user questions. Always respond in Chinese (中文回答)."
@@ -669,20 +669,20 @@ Please directly answer the user's question first, then provide supporting eviden
     
     def _format_rag_result(self, response: str, frames: List[Dict]) -> str:
         """格式化RAG结果"""
-        result = f"📝 VLM 回答:\n\n{response}\n\n"
+        result = f"VLM 回答:\n\n{response}\n\n"
         result += "="*60 + "\n"
         result += f"检索信息:\n"
-        result += f"• 模式: {self.storage_mode.upper()}\n"
-        result += f"• 检索方法: {'缓存加载' if self.storage_mode == 'simple' else 'RAG语义检索'}\n"
-        result += f"• 图片数量: {len(frames)}\n"
+        result += f"- 模式: {self.storage_mode.upper()}\n"
+        result += f"- 检索方法: {'缓存加载' if self.storage_mode == 'simple' else 'RAG语义检索'}\n"
+        result += f"- 图片数量: {len(frames)}\n"
         
         if frames:
             oldest = frames[-1]['timestamp']
             newest = frames[0]['timestamp']
-            result += f"• 时间范围: {oldest} 到 {newest}\n"
+            result += f"- 时间范围: {oldest} 到 {newest}\n"
             
             if self.storage_mode == "vector" and frames and '_distance' in frames[0]:
-                result += f"• 最高相似度: {1.0 - frames[0].get('_distance', 0):.3f}\n"
+                result += f"- 最高相似度: {1.0 - frames[0].get('_distance', 0):.3f}\n"
         
         return result
     
@@ -695,7 +695,7 @@ Please directly answer the user's question first, then provide supporting eviden
             if end_time and end_time.tzinfo is None:
                 end_time = end_time.astimezone(timezone.utc)
 
-            self.progress_signal.emit(f"📅 正在加载 {start_time} 到 {end_time} 的截图...")
+            self.progress_signal.emit(f"正在加载 {start_time} 到 {end_time} 的截图...")
             logger.info(f"时间段总结: {start_time} - {end_time}")
             
             # 从 SQLite 获取时间范围内的帧
@@ -757,7 +757,7 @@ Please directly answer the user's question first, then provide supporting eviden
     def _summarize_with_vlm(self, start_time: datetime, end_time: datetime, 
                            frames: List[Dict]) -> str:
         """使用VLM总结时间段"""
-        self.progress_signal.emit(f"🤖 正在使用VLM总结 {len(frames)} 张截图...")
+        self.progress_signal.emit(f"正在使用VLM总结 {len(frames)} 张截图...")
         
         # System prompt: 定义助手角色
         system_prompt = "You are a helpful visual assistant. You analyze screenshots to provide summaries. Always respond in Chinese (中文回答)."
@@ -787,7 +787,7 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
     def _format_summary_result(self, response: str, start_time: datetime, 
                                end_time: datetime, frames: List[Dict]) -> str:
         """格式化总结结果"""
-        result = f"📝 时间段总结:\n\n{response}\n\n"
+        result = f"时间段总结:\n\n{response}\n\n"
         result += "="*60 + "\n"
         result += f"时间范围: {start_time.strftime('%Y-%m-%d %H:%M:%S')} 到 {end_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         result += f"分析了 {len(frames)} 张截图\n"
@@ -796,7 +796,7 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
     def query_realtime(self, question: str):
         """模式3: 实时问答"""
         try:
-            self.progress_signal.emit("📸 正在获取当前屏幕和历史截图...")
+            self.progress_signal.emit("正在获取当前屏幕和历史截图...")
             logger.info(f"实时问答: '{question}'")
             
             # 实时问答不需要初始化 storage 或 CLIP 模型
@@ -832,7 +832,7 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
         timestamps = [current_frame.timestamp]
         
         # 2. 从 SQLite 获取最近5张截图（不依赖 storage 的 load_recent 方法）
-        self.progress_signal.emit("📂 加载最近5张截图...")
+        self.progress_signal.emit("加载最近5张截图...")
         
         try:
             sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
@@ -854,7 +854,7 @@ Please directly provide the summary first, then use the {len(frames)} screenshot
     
     def _analyze_realtime_with_vlm(self, question: str, images: List[PILImage.Image], timestamps: List[datetime]) -> str:
         """使用VLM分析实时问题"""
-        self.progress_signal.emit(f"🤖 正在使用VLM分析 {len(images)} 张图片...")
+        self.progress_signal.emit(f"正在使用VLM分析 {len(images)} 张图片...")
         
         # System prompt: 定义助手角色
         system_prompt = "You are a helpful visual assistant. You analyze screenshots to answer user questions. Always respond in Chinese (中文回答)."
@@ -874,7 +874,7 @@ The first image is the current screen, and the remaining images are recent histo
     
     def _format_realtime_result(self, response: str, images: List[PILImage.Image]) -> str:
         """格式化实时问答结果"""
-        result = f"📝 实时问答结果:\n\n{response}\n\n"
+        result = f"实时问答结果:\n\n{response}\n\n"
         result += "="*60 + "\n"
         result += f"分析了 {len(images)} 张图片 (1张当前 + {len(images)-1}张历史)\n"
         return result
@@ -890,7 +890,7 @@ The first image is the current screen, and the remaining images are recent histo
             if end_time and end_time.tzinfo is None:
                 end_time = end_time.astimezone(timezone.utc)
 
-            self.progress_signal.emit("📝 OCR模式: 正在检索相关文本...")
+            self.progress_signal.emit("OCR模式: 正在检索相关文本...")
             logger.info(f"OCR RAG查询: '{query_text}' ({start_time} - {end_time})")
             
             # 使用 CLIP 对查询文本进行 embedding
@@ -909,14 +909,14 @@ The first image is the current screen, and the remaining images are recent histo
             
             if not frames:
                 # 如果 OCR 表为空，回退到 SQLite 全文搜索
-                self.progress_signal.emit("📂 OCR向量表为空，使用全文搜索...")
+                self.progress_signal.emit("OCR向量表为空，使用全文搜索...")
                 frames = self._search_ocr_fulltext(query_text, start_time, end_time)
             
             if not frames:
                 self.result_signal.emit("在指定时间范围内未找到相关的OCR文本记录。")
                 return
             
-            self.progress_signal.emit(f"📊 找到 {len(frames)} 条相关OCR记录")
+            self.progress_signal.emit(f"找到 {len(frames)} 条相关OCR记录")
             
             # 使用纯文本 VLM 分析
             response = self._analyze_ocr_with_vlm(query_text, frames)
@@ -957,7 +957,7 @@ The first image is the current screen, and the remaining images are recent histo
     
     def _analyze_ocr_with_vlm(self, query_text: str, frames: List[Dict]) -> str:
         """使用 VLM 分析 OCR 文本（纯文本模式）"""
-        self.progress_signal.emit(f"🤖 正在分析 {len(frames)} 条OCR文本...")
+        self.progress_signal.emit(f"正在分析 {len(frames)} 条OCR文本...")
         
         # 构建 OCR 文本上下文
         ocr_context = []
@@ -989,11 +989,11 @@ If relevant content is found, please explain in detail:
     
     def _format_ocr_result(self, response: str, frames: List[Dict]) -> str:
         """格式化 OCR 查询结果"""
-        result = f"📝 OCR文本检索结果:\n\n{response}\n\n"
+        result = f"OCR文本检索结果:\n\n{response}\n\n"
         result += "="*60 + "\n"
         result += f"检索信息:\n"
-        result += f"• 模式: OCR文本检索\n"
-        result += f"• 匹配记录: {len(frames)} 条\n"
+        result += f"- 模式: OCR文本检索\n"
+        result += f"- 匹配记录: {len(frames)} 条\n"
         
         if frames:
             result += f"\n相关时间点:\n"
@@ -1007,7 +1007,7 @@ If relevant content is found, please explain in detail:
     def query_realtime_ocr(self, question: str):
         """OCR 模式实时问答 - 基于当前和历史 OCR 文本"""
         try:
-            self.progress_signal.emit("📝 OCR模式: 获取当前和历史OCR文本...")
+            self.progress_signal.emit("OCR模式: 获取当前和历史OCR文本...")
             logger.info(f"OCR实时问答: '{question}'")
             
             # 获取当前屏幕的 OCR
@@ -1021,7 +1021,7 @@ If relevant content is found, please explain in detail:
             
             if current_frame:
                 # 对当前屏幕进行 OCR
-                self.progress_signal.emit("📸 正在识别当前屏幕文字...")
+                self.progress_signal.emit("正在识别当前屏幕文字...")
                 try:
                     ocr_worker = PaddleOCRWorker()
                     current_ocr = ocr_worker.process(current_frame.image)
@@ -1034,7 +1034,7 @@ If relevant content is found, please explain in detail:
                     logger.warning(f"当前屏幕OCR失败: {e}")
             
             # 获取最近的历史 OCR 文本
-            self.progress_signal.emit("📂 加载最近的OCR记录...")
+            self.progress_signal.emit("加载最近的OCR记录...")
             try:
                 sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
                 recent_frames = sqlite_storage.get_recent_frames(limit=10)
@@ -1071,7 +1071,7 @@ If relevant content is found, please explain in detail:
     
     def _analyze_realtime_ocr_with_vlm(self, question: str, ocr_texts: List[Dict]) -> str:
         """使用 VLM 分析实时 OCR 文本"""
-        self.progress_signal.emit(f"🤖 正在分析 {len(ocr_texts)} 条OCR文本...")
+        self.progress_signal.emit(f"正在分析 {len(ocr_texts)} 条OCR文本...")
         
         context_parts = []
         for item in ocr_texts:
@@ -1095,10 +1095,8 @@ OCR Text Extracted from Screenshots (first is current screen, others are histori
     
     def _format_realtime_ocr_result(self, response: str, ocr_texts: List[Dict]) -> str:
         """格式化实时 OCR 问答结果"""
-        result = f"📝 OCR实时问答结果:\n\n{response}\n\n"
+        result = f"OCR实时问答结果:\n\n{response}\n\n"
         result += "="*60 + "\n"
         result += f"分析了 {len(ocr_texts)} 条OCR文本记录\n"
         return result
-
-
 

@@ -34,7 +34,7 @@ def print_results(results: list, title: str, max_display: int = 5):
     print(f"{'='*70}")
     
     if not results:
-        print("⚠️ 没有找到结果")
+        print("警告: 没有找到结果")
         return
     
     print(f"\n找到 {len(results)} 个结果（显示前 {max_display} 个）：\n")
@@ -125,11 +125,11 @@ def example_hybrid_search(retriever, query: str, reranker: str = "linear"):
     
     print(f"\nReranker 说明:")
     if reranker == "linear":
-        print("  • LinearCombinationReranker: 简单加权组合（默认 70% 语义 + 30% 关键词）")
+        print("  - LinearCombinationReranker: 简单加权组合（默认 70% 语义 + 30% 关键词）")
     elif reranker == "rrf":
-        print("  • RRFReranker: Reciprocal Rank Fusion，基于排名倒数融合")
+        print("  - RRFReranker: Reciprocal Rank Fusion，基于排名倒数融合")
     elif reranker == "cross-encoder":
-        print("  • CrossEncoderReranker: 使用 cross-encoder 模型，最准确但较慢")
+        print("  - CrossEncoderReranker: 使用 cross-encoder 模型，最准确但较慢")
     
     start_time = time.time()
     results = retriever.retrieve_hybrid(query, top_k=10, reranker=reranker)
@@ -224,10 +224,10 @@ def main():
     # 1. 初始化编码器和检索器
     print("\n[1/3] 初始化 TextEncoder（基于 CLIP）...")
     encoder = create_text_encoder(model_name=config.EMBEDDING_MODEL)
-    print(f"  • 底层 CLIP 模型: {config.EMBEDDING_MODEL}")
-    print(f"  • Embedding 维度: {encoder.embedding_dim}")
-    print(f"  • 设备: {encoder.device}")
-    print(f"  • 说明: 与 CLIPEncoder 共享底层模型（控制变量）")
+    print(f"  - 底层 CLIP 模型: {config.EMBEDDING_MODEL}")
+    print(f"  - Embedding 维度: {encoder.embedding_dim}")
+    print(f"  - 设备: {encoder.device}")
+    print(f"  - 说明: 与 CLIPEncoder 共享底层模型（控制变量）")
     
     print("\n[2/3] 初始化文本检索器...")
     retriever = create_text_retriever(
@@ -236,18 +236,18 @@ def main():
         table_name="ocr_texts",
         default_reranker="linear"
     )
-    print("  • 优势：Embedding 与图像检索在同一空间")
+    print("  - 优势：Embedding 与图像检索在同一空间")
     
     # 3. 检查数据
     print("\n[3/3] 检查数据库状态...")
     stats = retriever.get_stats()
     print("\n数据库信息:")
     for k, v in stats.items():
-        print(f"  • {k}: {v}")
+        print(f"  - {k}: {v}")
     
     if stats.get("total_rows", 0) == 0:
         print("\n" + "="*70)
-        print("⚠️ 数据库为空！")
+        print("警告: 数据库为空！")
         print("="*70)
         print("\n请先运行以下命令构建文本索引:")
         print("  python scripts/rebuild_text_index.py")
@@ -289,18 +289,17 @@ def main():
         print("\n\n用户中断")
     except Exception as e:
         logger.error(f"示例运行失败: {e}", exc_info=True)
-        print(f"\n❌ 错误: {e}")
+        print(f"\n错误: {e}")
     
     print("\n" + "="*70)
-    print("✅ 示例完成")
+    print("示例完成")
     print("="*70)
     print("\n提示:")
-    print("  • 修改 demo_query 变量尝试不同查询")
-    print("  • 调整 top_k 参数控制返回结果数量")
-    print("  • 尝试不同的 reranker: linear, rrf, cross-encoder")
+    print("  - 修改 demo_query 变量尝试不同查询")
+    print("  - 调整 top_k 参数控制返回结果数量")
+    print("  - 尝试不同的 reranker: linear, rrf, cross-encoder")
     print("\n" + "="*70)
 
 
 if __name__ == "__main__":
     main()
-

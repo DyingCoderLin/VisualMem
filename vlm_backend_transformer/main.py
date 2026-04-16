@@ -291,9 +291,9 @@ def generate_response():
         # 记录时间统计
         logger.info("="*60)
         logger.info("Generation Timing Breakdown:")
-        logger.info(f"  • Total time: {total_time*1000:.2f} ms")
-        logger.info(f"  • Prefill time: {prefill_time*1000:.2f} ms ({prefill_time/total_time*100:.1f}%)")
-        logger.info(f"  • Decode time: {decode_time*1000:.2f} ms ({decode_time/total_time*100:.1f}%)")
+        logger.info(f"  - Total time: {total_time*1000:.2f} ms")
+        logger.info(f"  - Prefill time: {prefill_time*1000:.2f} ms ({prefill_time/total_time*100:.1f}%)")
+        logger.info(f"  - Decode time: {decode_time*1000:.2f} ms ({decode_time/total_time*100:.1f}%)")
         logger.info("="*60)
 
         # Trim the generated ids to remove input tokens
@@ -319,12 +319,12 @@ def generate_response():
             
             logger.info("="*60)
             logger.info("CUDA Memory Statistics:")
-            logger.info(f"  • Images processed: {len(images)}")
-            logger.info(f"  • Memory before: {mem_before:.2f} GB")
-            logger.info(f"  • Memory after: {mem_after:.2f} GB")
-            logger.info(f"  • Memory used: {mem_after - mem_before:.2f} GB")
-            logger.info(f"  • Peak memory: {mem_peak:.2f} GB")
-            logger.info(f"  • Reserved memory: {mem_reserved:.2f} GB")
+            logger.info(f"  - Images processed: {len(images)}")
+            logger.info(f"  - Memory before: {mem_before:.2f} GB")
+            logger.info(f"  - Memory after: {mem_after:.2f} GB")
+            logger.info(f"  - Memory used: {mem_after - mem_before:.2f} GB")
+            logger.info(f"  - Peak memory: {mem_peak:.2f} GB")
+            logger.info(f"  - Reserved memory: {mem_reserved:.2f} GB")
             logger.info("="*60)
             
             # 保存内存快照
@@ -382,8 +382,8 @@ if __name__ == '__main__':
     if memory_evaluate:
         logger.info("="*60)
         logger.info("CUDA Memory Evaluation Mode ENABLED")
-        logger.info("  • Memory snapshots will be saved to ./memory_snapshots/")
-        logger.info("  • Peak memory usage will be logged for each request")
+        logger.info("  - Memory snapshots will be saved to ./memory_snapshots/")
+        logger.info("  - Peak memory usage will be logged for each request")
         logger.info("="*60)
     
     # Load model on startup

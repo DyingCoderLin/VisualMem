@@ -43,10 +43,10 @@ def clear_database(db_path: str):
                 shutil.rmtree(db_path)
             else:
                 db_path.unlink()
-            logger.info("✓ 数据库已清空")
+            logger.info("数据库已清空")
             return True
         except Exception as e:
-            logger.error(f"✗ 删除数据库失败: {e}")
+            logger.error(f"删除数据库失败: {e}")
             return False
     else:
         logger.info(f"数据库不存在，无需清空: {db_path}")
@@ -180,7 +180,7 @@ def rebuild_index(
     if clear_existing:
         print("\n[1/4] 清空现有数据库...")
         if not clear_database(db_path):
-            print("❌ 清空数据库失败，终止操作")
+            print("清空数据库失败，终止操作")
             return False
     else:
         print("\n[1/4] 跳过清空数据库（追加模式）")
@@ -190,18 +190,18 @@ def rebuild_index(
     image_files = collect_images(image_dir)
     
     if len(image_files) == 0:
-        print("❌ 没有找到图片文件")
+        print("没有找到图片文件")
         return False
     
-    print(f"✓ 找到 {len(image_files)} 张图片")
+    print(f"找到 {len(image_files)} 张图片")
     
     # 步骤3：初始化编码器和存储
     print(f"\n[3/4] 初始化编码器: {model_name}")
     try:
         encoder = create_encoder(model_name=model_name)
-        print(f"✓ 编码器加载成功（embedding 维度: {encoder.embedding_dim}）")
+        print(f"编码器加载成功（embedding 维度: {encoder.embedding_dim}）")
     except Exception as e:
-        print(f"❌ 编码器加载失败: {e}")
+        print(f"编码器加载失败: {e}")
         return False
     
     print(f"\n初始化 LanceDB: {db_path}")
@@ -210,9 +210,9 @@ def rebuild_index(
             db_path=db_path,
             embedding_dim=encoder.embedding_dim
         )
-        print(f"✓ 数据库初始化成功")
+        print(f"数据库初始化成功")
     except Exception as e:
-        print(f"❌ 数据库初始化失败: {e}")
+        print(f"数据库初始化失败: {e}")
         return False
     
     # 步骤4：批量编码和存储（支持小 batch，定期清理旧版本）
@@ -224,9 +224,9 @@ def rebuild_index(
     if rebuild_with_ocr:
         try:
             ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE)
-            print(f"✓ OCR 引擎初始化成功: {config.OCR_ENGINE_TYPE}")
+            print(f"OCR 引擎初始化成功: {config.OCR_ENGINE_TYPE}")
         except Exception as e:
-            print(f"❌ OCR 引擎初始化失败: {e}")
+            print(f"OCR 引擎初始化失败: {e}")
             return False
             
     image_dir_path = Path(image_dir)
@@ -324,16 +324,16 @@ def rebuild_index(
     print("\n" + "="*60)
     print("重建完成！")
     print("="*60)
-    print(f"✓ 成功处理: {success_count} 张")
+    print(f"成功处理: {success_count} 张")
     if error_count > 0:
-        print(f"✗ 失败: {error_count} 张")
+        print(f"失败: {error_count} 张")
     
     # 显示数据库统计
     stats = storage.get_stats()
     print(f"\n数据库统计：")
-    print(f"  • 总帧数: {stats['total_frames']}")
-    print(f"  • Embedding 维度: {stats['embedding_dim']}")
-    print(f"  • 存储模式: {stats['storage_mode']}")
+    print(f"  - 总帧数: {stats['total_frames']}")
+    print(f"  - Embedding 维度: {stats['embedding_dim']}")
+    print(f"  - 存储模式: {stats['storage_mode']}")
     
     return success_count > 0
 
@@ -412,7 +412,7 @@ def main():
     
     # 确认操作
     if not args.no_clear:
-        print("\n⚠️  警告：此操作将清空现有数据库！")
+        print("\n警告：此操作将清空现有数据库！")
         print(f"图片目录: {args.image_dir}")
         print(f"数据库路径: {args.db_path}")
         if args.rebuild_with_ocr:
@@ -434,13 +434,12 @@ def main():
     )
     
     if success:
-        print("\n✅ 索引重建成功！")
+        print("\n索引重建成功！")
         print("\n现在可以使用 query.py 或 example_clip_retrieval.py 进行检索")
     else:
-        print("\n❌ 索引重建失败")
+        print("\n索引重建失败")
         sys.exit(1)
 
 
 if __name__ == "__main__":
     main()
-

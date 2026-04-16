@@ -328,12 +328,12 @@ def search_and_understand(query: str, top_k: int = None) -> str:
             if top_k is None:
                 top_k = config.MAX_IMAGES_TO_LOAD
             
-            print(f"\n📂 使用Simple模式（增量更新）...")
+            print(f"\n使用Simple模式（增量更新）...")
             
             # 增量更新缓存
             new_frames_count = frame_cache.update(storage)
             if new_frames_count > 0:
-                print(f"✨ 发现 {new_frames_count} 张新图片（帧差>0.006）")
+                print(f"发现 {new_frames_count} 张新图片（帧差>0.006）")
             
             # 获取缓存中的帧
             frames = frame_cache.get_frames()
@@ -341,7 +341,7 @@ def search_and_understand(query: str, top_k: int = None) -> str:
             if not frames:
                 return "数据库为空，请先运行 main.py 捕捉一些屏幕帧。"
             
-            print(f"📊 当前缓存: {len(frames)} 张图片 (最多{frame_cache.max_size}张)")
+            print(f"当前缓存: {len(frames)} 张图片 (最多{frame_cache.max_size}张)")
             
             # 如果需要限制数量
             if len(frames) > top_k:
@@ -352,7 +352,7 @@ def search_and_understand(query: str, top_k: int = None) -> str:
             if top_k is None:
                 top_k = 10
             
-            print(f"\n🔍 使用Vector模式：向量检索 top {top_k}...")
+            print(f"\n使用Vector模式：向量检索 top {top_k}...")
             
             dense_queries = [query]
             time_range = None
@@ -425,7 +425,7 @@ def search_and_understand(query: str, top_k: int = None) -> str:
         
         # 在Simple模式下，根据配置决定是否进行帧差过滤
         if config.STORAGE_MODE == "simple" and config.ENABLE_QUERY_FRAME_DIFF:
-            print(f"\n🔍 应用帧差过滤（阈值=0.006）...")
+            print(f"\n应用帧差过滤（阈值=0.006）...")
             filtered_frames = _apply_frame_diff_filter(frames)
             removed_count = len(frames) - len(filtered_frames)
             if removed_count > 0:
@@ -447,7 +447,7 @@ def search_and_understand(query: str, top_k: int = None) -> str:
         
         # 使用VLM深度理解
         print("\n" + "="*60)
-        print("🤖 正在使用VLM分析...")
+        print("正在使用VLM分析...")
         print("="*60)
         
         logger.info("Analyzing with VLM...")
@@ -505,43 +505,43 @@ def interactive_mode():
     # 显示统计
     stats = storage.get_stats()
     print(f"\n数据库状态:")
-    print(f"  • 模式: {config.STORAGE_MODE.upper()}")
-    print(f"  • 截屏的帧数: {stats.get('total_frames', 0)}")
-    print(f"  • VLM模型: {config.VLM_API_MODEL}")
+    print(f"  - 模式: {config.STORAGE_MODE.upper()}")
+    print(f"  - 截屏的帧数: {stats.get('total_frames', 0)}")
+    print(f"  - VLM模型: {config.VLM_API_MODEL}")
     if config.STORAGE_MODE == "simple":
-        print(f"  • 每次查询加载: 最近{config.MAX_IMAGES_TO_LOAD}张图片")
+        print(f"  - 每次查询加载: 最近{config.MAX_IMAGES_TO_LOAD}张图片")
 
         # 初始化缓存并显示状态
         frame_cache.update(storage)
         cache_stats = frame_cache.get_stats()
-        print(f"  • 当前缓存: {cache_stats['cached_frames']}张图片")
+        print(f"  - 当前缓存: {cache_stats['cached_frames']}张图片")
         if cache_stats['last_check_time']:
-            print(f"  • 最后更新: {cache_stats['last_check_time']}")
+            print(f"  - 最后更新: {cache_stats['last_check_time']}")
     print("="*60)
     
     if stats.get('total_frames', 0) == 0:
-        print("\n⚠ 警告: 数据库为空！")
+        print("\n警告: 数据库为空！")
         print("请先运行 python main.py 来捕捉一些屏幕帧。")
         return
     
     print("\n使用说明:")
-    print("  • 输入你的问题，系统会找到相关的屏幕截图并用VLM分析")
+    print("  - 输入你的问题，系统会找到相关的屏幕截图并用VLM分析")
     if config.STORAGE_MODE == "simple":
-        print("  • 每次查询会自动检查新图片（帧差>0.006才会添加到缓存）")
-        print("  • 缓存最多保持50张最新的图片")
+        print("  - 每次查询会自动检查新图片（帧差>0.006才会添加到缓存）")
+        print("  - 缓存最多保持50张最新的图片")
         if config.ENABLE_QUERY_FRAME_DIFF:
-            print("  • 提问VLM时会过滤相似图片（帧差>0.006）")
+            print("  - 提问VLM时会过滤相似图片（帧差>0.006）")
         else:
-            print("  • 提问VLM时不过滤，直接使用所有缓存图片")
-    print("  • 输入 'quit' 或 'exit' 退出")
-    print("  • 输入 'stats' 查看统计信息")
-    print("  • 输入 'recent' 查看最近的记录")
+            print("  - 提问VLM时不过滤，直接使用所有缓存图片")
+    print("  - 输入 'quit' 或 'exit' 退出")
+    print("  - 输入 'stats' 查看统计信息")
+    print("  - 输入 'recent' 查看最近的记录")
     print()
     
     while True:
         try:
             # 获取用户输入
-            query = input("\n🔍 请输入查询 > ").strip()
+            query = input("\n请输入查询 > ").strip()
             
             if not query:
                 continue
@@ -553,22 +553,22 @@ def interactive_mode():
             if query.lower() == 'stats':
                 stats = storage.get_stats()
                 print(f"\n统计信息:")
-                print(f"  • 模式: {config.STORAGE_MODE}")
-                print(f"  • 总帧数: {stats.get('total_frames', 0)}")
+                print(f"  - 模式: {config.STORAGE_MODE}")
+                print(f"  - 总帧数: {stats.get('total_frames', 0)}")
                 if config.STORAGE_MODE == "simple":
-                    print(f"  • 存储路径: {stats.get('storage_path', 'N/A')}")
+                    print(f"  - 存储路径: {stats.get('storage_path', 'N/A')}")
                     # 显示缓存统计
                     cache_stats = frame_cache.get_stats()
-                    print(f"  • 缓存帧数: {cache_stats['cached_frames']}/{cache_stats['max_size']}")
+                    print(f"  - 缓存帧数: {cache_stats['cached_frames']}/{cache_stats['max_size']}")
                     if cache_stats['last_check_time']:
-                        print(f"  • 最后更新: {cache_stats['last_check_time']}")
-                    print(f"  • 查询时帧差过滤: {'开启' if config.ENABLE_QUERY_FRAME_DIFF else '关闭'}")
+                        print(f"  - 最后更新: {cache_stats['last_check_time']}")
+                    print(f"  - 查询时帧差过滤: {'开启' if config.ENABLE_QUERY_FRAME_DIFF else '关闭'}")
                 else:
-                    print(f"  • Embedding维度: {stats.get('embedding_dim', 0)}")
+                    print(f"  - Embedding维度: {stats.get('embedding_dim', 0)}")
                 continue
             
             if query.lower() == 'recent':
-                print("\n📋 最近的记录:")
+                print("\n最近的记录:")
                 frames = storage.load_recent(limit=10)
                 for i, frame in enumerate(frames, 1):
                     print(f"{i}. {frame['timestamp']} - {frame.get('ocr_text', '')[:50]}...")
@@ -580,7 +580,7 @@ def interactive_mode():
             
             # 显示答案
             print("\n" + "="*60)
-            print("📝 VLM的回答:")
+            print("VLM的回答:")
             print("="*60)
             print(answer)
             print("="*60)
@@ -590,7 +590,7 @@ def interactive_mode():
             break
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
-            print(f"\n❌ 错误: {e}")
+            print(f"\n错误: {e}")
 
 # ==================== 命令行模式 ====================
 
@@ -615,4 +615,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

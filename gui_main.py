@@ -58,7 +58,7 @@ class VisualMemApp:
         app_icon = self._load_icon()
         if app_icon:
             self.app.setWindowIcon(app_icon)
-            print("✅ 应用程序图标已设置")
+            print("应用程序图标已设置")
         
         # 创建主窗口
         self.window = VisualMemMainWindow()
@@ -97,18 +97,18 @@ class VisualMemApp:
                         icon.addPixmap(scaled)
                     return icon
                 else:
-                    print(f"⚠️  警告: 无法加载 logo.png 文件 ({logo_path})")
+                    print(f"警告: 无法加载 logo.png 文件 ({logo_path})")
             except Exception as e:
-                print(f"⚠️  警告: 加载图标时出错: {e}")
+                print(f"警告: 加载图标时出错: {e}")
         else:
-            print(f"⚠️  警告: 找不到 logo.png 文件 ({logo_path})")
+            print(f"警告: 找不到 logo.png 文件 ({logo_path})")
         return None
     
     def _setup_tray(self, icon=None):
         """设置系统托盘"""
         # 检查系统托盘是否可用
         if not QSystemTrayIcon.isSystemTrayAvailable():
-            print("⚠️  警告: 系统托盘不可用")
+            print("警告: 系统托盘不可用")
             return
         
         # 创建托盘图标
@@ -133,15 +133,15 @@ class VisualMemApp:
         # 设置托盘图标
         if icon:
             self.tray.setIcon(icon)
-            print("✅ 系统托盘图标已设置")
+            print("系统托盘图标已设置")
         else:
             # 如果没有提供图标，尝试加载
             icon = self._load_icon()
             if icon:
                 self.tray.setIcon(icon)
-                print("✅ 系统托盘图标已加载并设置")
+                print("系统托盘图标已加载并设置")
             else:
-                print("⚠️  警告: 无法加载系统托盘图标")
+                print("警告: 无法加载系统托盘图标")
         
         self.tray.setToolTip("VisualMem - 点击显示")
         self.tray.show()
@@ -179,7 +179,7 @@ class VisualMemApp:
         hide_shortcut.setContext(Qt.ApplicationShortcut)  # 设置为应用级全局快捷键
         hide_shortcut.activated.connect(self._global_hide_window)
         
-        print("✅ 全局快捷键已设置:")
+        print("全局快捷键已设置:")
         print("   - Ctrl+Alt+W: 显示/隐藏窗口")
         print("   - Esc: 隐藏窗口")
     
@@ -270,7 +270,7 @@ class VisualMemApp:
                         
                         # 删除 PID 文件
                         pid_file.unlink(missing_ok=True)
-                        print("✅ backend_server 已停止")
+                        print("backend_server 已停止")
                         return
                     except ProcessLookupError:
                         # 进程不存在，删除 PID 文件
@@ -327,13 +327,13 @@ class VisualMemApp:
                                 except ProcessLookupError:
                                     pass  # 进程已退出
                             
-                            print("✅ backend_server 已停止")
+                            print("backend_server 已停止")
                 except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
                     pass  # pgrep 不可用或没有找到进程
             
         except Exception as e:
             # 停止 backend_server 失败不应该阻止 GUI 退出
-            print(f"⚠️  停止 backend_server 时出错: {e}")
+            print(f"警告: 停止 backend_server 时出错: {e}")
             print("   GUI 将继续退出，但 backend_server 可能仍在运行")
             print("   您可以手动停止它: pkill -f gui_backend_server.py")
     
@@ -374,14 +374,14 @@ def check_backend_availability():
         return True
     
     if not config.GUI_REMOTE_BACKEND_URL:
-        print("❌ 错误: GUI_MODE=remote 但 GUI_REMOTE_BACKEND_URL 未配置")
+        print("错误: GUI_MODE=remote 但 GUI_REMOTE_BACKEND_URL 未配置")
         print("   请在 .env 文件中设置 GUI_REMOTE_BACKEND_URL")
         return False
     
     backend_url = config.GUI_REMOTE_BACKEND_URL.rstrip("/")
     health_url = f"{backend_url}/health"
     
-    print(f"🔍 正在检查后端服务器可用性: {backend_url}")
+    print(f"正在检查后端服务器可用性: {backend_url}")
     
     try:
         response = requests.get(health_url, timeout=5)
@@ -389,25 +389,25 @@ def check_backend_availability():
         # 检查返回的数据格式
         data = response.json()
         if data.get("status") == "ok":
-            print(f"✅ 后端服务器可用 (状态码: {response.status_code})")
+            print(f"后端服务器可用 (状态码: {response.status_code})")
             return True
         else:
-            print(f"⚠️  后端服务器响应异常: {data}")
+            print(f"警告: 后端服务器响应异常: {data}")
             return False
     except requests.exceptions.ConnectionError:
-        print(f"❌ 错误: 无法连接到后端服务器 {backend_url}")
+        print(f"错误: 无法连接到后端服务器 {backend_url}")
         print("   请确认后端服务器是否已启动")
         return False
     except requests.exceptions.Timeout:
-        print(f"❌ 错误: 连接后端服务器超时 ({backend_url})")
+        print(f"错误: 连接后端服务器超时 ({backend_url})")
         print("   请确认后端服务器是否正常运行")
         return False
     except requests.exceptions.HTTPError as e:
-        print(f"❌ 错误: 后端服务器返回错误 (状态码: {e.response.status_code})")
+        print(f"错误: 后端服务器返回错误 (状态码: {e.response.status_code})")
         print(f"   请确认后端服务器是否正常运行")
         return False
     except Exception as e:
-        print(f"❌ 错误: 检查后端服务器时发生未知错误: {e}")
+        print(f"错误: 检查后端服务器时发生未知错误: {e}")
         return False
 
 
@@ -415,7 +415,7 @@ def main():
     """主函数"""
     # 如果是远程模式，先检查后端服务器是否可用
     if not check_backend_availability():
-        print("\n💡 提示: 如果是第一次启动，请先启动后端服务器")
+        print("\n提示: 如果是第一次启动，请先启动后端服务器")
         print("   然后重新运行 GUI")
         sys.exit(1)
     

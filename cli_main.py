@@ -248,15 +248,15 @@ def _ensure_vector_components():
     if _vector_initialized:
         return
     
-    print(f"\n\n🔄 Loading encoder model {config.EMBEDDING_MODEL}... (first load is slow)")
+    print(f"\n\nLoading encoder model {config.EMBEDDING_MODEL}... (first load is slow)")
     _vector_encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
-    print(f"📦 Initializing LanceDB storage at {config.LANCEDB_PATH}...")
+    print(f"Initializing LanceDB storage at {config.LANCEDB_PATH}...")
     _vector_storage = LanceDBStorage(
         db_path=config.LANCEDB_PATH,
         embedding_dim=_vector_encoder.embedding_dim
     )
     _vector_initialized = True
-    print(f"✅ Encoder model {config.EMBEDDING_MODEL} loaded")
+    print(f"Encoder model {config.EMBEDDING_MODEL} loaded")
 
 
 def _vector_rag(
@@ -294,11 +294,21 @@ def _vector_rag(
         print(f"sparse_queries: {sparse_queries}")
         print(f"time_range: {time_range}")
 
+<<<<<<< HEAD
     # Merge explicit time range and LLM time range
     start_time, end_time = _merge_time_range(explicit_start, explicit_end, time_range)
     if start_time or end_time:
         print(f"⏰ Time Range: {start_time} - {end_time}")
         print("🔍 Using LanceDB Pre-filtering for vector retrieval...")
+=======
+    # Extract time range (for LanceDB Pre-filtering)
+    start_time = None
+    end_time = None
+    if time_range:
+        start_time, end_time = time_range
+        print(f"Time Range: {start_time} - {end_time}")
+        print("Using LanceDB Pre-filtering for vector retrieval...")
+>>>>>>> main
 
     # Define helper function: Dense search
     def _dense_search_task():
@@ -371,12 +381,12 @@ def _vector_rag(
             return sparse_frames
         except Exception as e:
             logger.error(f"Sparse retrieval failed: {e}", exc_info=True)
-            print(f"⚠️ Sparse retrieval failed, using Dense results only: {e}")
+            print(f"Warning: Sparse retrieval failed, using Dense results only: {e}")
             return []
     
     # Execute Dense and Sparse searches in parallel (using asyncio)
     if config.ENABLE_HYBRID:
-        print("🔍 Enabling Hybrid Search, executing Dense and Sparse retrieval in parallel...")
+        print("Enabling Hybrid Search, executing Dense and Sparse retrieval in parallel...")
         # Use asyncio to execute in parallel
         async def _run_parallel_searches():
             dense_task = asyncio.to_thread(_dense_search_task)
@@ -440,7 +450,7 @@ def _vector_rag(
     
     # Rerank step (if enabled)
     if config.ENABLE_RERANK:
-        print(f"🔄 Reranking (returning top-{config.RERANK_TOP_K})...")
+        print(f"Reranking (returning top-{config.RERANK_TOP_K})...")
         reranker = Reranker()
         frames_with_images = reranker.rerank(
             query=query,
@@ -449,7 +459,7 @@ def _vector_rag(
         )
         
         if not frames_with_images:
-            print("❌ No images after rerank, cannot perform VLM analysis.")
+            print("Error: No images after rerank, cannot perform VLM analysis.")
             return
     
     images = [f["image"] for f in frames_with_images]
@@ -714,12 +724,12 @@ def main():
     scope_choice = _prompt_binary("Please enter choice")
     
     print("\n" + "=" * 70)
-    print("📝 User Guide:")
+    print("User Guide:")
     print("=" * 70)
-    print("  • Enter your query to search")
-    print("  • Type 'start' to begin recording")
-    print("  • Type 'stop' to stop recording")
-    print("  • Type 'q', 'quit', or 'exit' to exit")
+    print("  - Enter your query to search")
+    print("  - Type 'start' to begin recording")
+    print("  - Type 'stop' to stop recording")
+    print("  - Type 'q', 'quit', or 'exit' to exit")
     print("=" * 70 + "\n")
     try:
         while True:

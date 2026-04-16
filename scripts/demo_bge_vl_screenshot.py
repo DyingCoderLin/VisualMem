@@ -37,17 +37,17 @@ def collect_images(image_dir: Path) -> List[Path]:
 
 
 def confirm(image_dir: Path, output_dir: Path, model_name: str, batch_size: int, device: str = "cuda") -> bool:
-    print("\n⚠️  即将生成 BGE-VL-Screenshot 图像向量")
-    print(f"  • 图片目录: {image_dir}")
-    print(f"  • 输出目录: {output_dir}")
-    print(f"  • 模型: {model_name}")
-    print(f"  • 批大小: {batch_size}")
+    print("\n即将生成 BGE-VL-Screenshot 图像向量")
+    print(f"  - 图片目录: {image_dir}")
+    print(f"  - 输出目录: {output_dir}")
+    print(f"  - 模型: {model_name}")
+    print(f"  - 批大小: {batch_size}")
     if device.startswith("cuda") and torch.cuda.is_available():
         free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
         free_gb = free_mem / (1024**3)
-        print(f"  • GPU 可用内存: {free_gb:.2f} GB")
+        print(f"  - GPU 可用内存: {free_gb:.2f} GB")
         if free_gb < 1.0:
-            print(f"  ⚠️  警告：GPU 内存不足，建议减小 batch_size 到 1-2")
+            print(f"  警告：GPU 内存不足，建议减小 batch_size 到 1-2")
     ans = input("\n确认继续？[y/N]: ").strip().lower()
     return ans in ("y", "yes")
 
@@ -80,7 +80,7 @@ def embed_benchmark(
         try:
             import flash_attn  # noqa: F401
             attn_impl = "flash_attention_2"
-            print("✓ 检测到 flash_attention_2，将使用加速版本")
+            print("检测到 flash_attention_2，将使用加速版本")
         except ImportError:
             logger.warning("flash_attn 模块无法导入，回退到默认注意力实现")
             logger.warning("提示：如果已安装但无法导入，可能是版本不匹配（cxx11abi 或 torch 版本）")
@@ -115,7 +115,7 @@ def embed_benchmark(
         if torch.cuda.is_available():
             free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
             free_gb = free_mem / (1024**3)
-            print(f"✓ 模型已加载，GPU 可用内存: {free_gb:.2f} GB")
+            print(f"模型已加载，GPU 可用内存: {free_gb:.2f} GB")
 
     images = collect_images(image_dir)
     if not images:
@@ -201,4 +201,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

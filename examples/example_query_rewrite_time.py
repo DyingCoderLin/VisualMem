@@ -28,21 +28,21 @@ def print_config():
     print("\n" + "="*60)
     print("当前配置")
     print("="*60)
-    print(f"  • ENABLE_LLM_REWRITE: {config.ENABLE_LLM_REWRITE}")
-    print(f"  • ENABLE_TIME_FILTER: {config.ENABLE_TIME_FILTER}")
-    print(f"  • QUERY_REWRITE_NUM: {config.QUERY_REWRITE_NUM}")
+    print(f"  - ENABLE_LLM_REWRITE: {config.ENABLE_LLM_REWRITE}")
+    print(f"  - ENABLE_TIME_FILTER: {config.ENABLE_TIME_FILTER}")
+    print(f"  - QUERY_REWRITE_NUM: {config.QUERY_REWRITE_NUM}")
     
     # Query Rewrite API 配置
     if config.QUERY_REWRITE_BASE_URL:
         print(f"\n  Query Rewrite API (独立配置):")
-        print(f"    • Base URL: {config.QUERY_REWRITE_BASE_URL}")
-        print(f"    • Model: {config.QUERY_REWRITE_MODEL or config.VLM_API_MODEL}")
-        print(f"    • API Key: {'已设置' if config.QUERY_REWRITE_API_KEY else '未设置'}")
+        print(f"    - Base URL: {config.QUERY_REWRITE_BASE_URL}")
+        print(f"    - Model: {config.QUERY_REWRITE_MODEL or config.VLM_API_MODEL}")
+        print(f"    - API Key: {'已设置' if config.QUERY_REWRITE_API_KEY else '未设置'}")
     else:
         print(f"\n  Query Rewrite API (使用 VLM 配置):")
-        print(f"    • Base URL: {config.VLM_API_URI}")
-        print(f"    • Model: {config.VLM_API_MODEL}")
-        print(f"    • API Key: {'已设置' if config.VLM_API_KEY else '未设置'}")
+        print(f"    - Base URL: {config.VLM_API_URI}")
+        print(f"    - Model: {config.VLM_API_MODEL}")
+        print(f"    - API Key: {'已设置' if config.VLM_API_KEY else '未设置'}")
     print("="*60)
 
 
@@ -60,9 +60,9 @@ def interactive_query():
     print("Query Rewrite & Time Extraction 交互式演示")
     print("="*60)
     print("\n提示：")
-    print("  • 输入查询文本，系统将进行查询重写和时间提取")
-    print("  • 输入 'q' 或 'quit' 退出")
-    print("  • 输入 'config' 查看当前配置")
+    print("  - 输入查询文本，系统将进行查询重写和时间提取")
+    print("  - 输入 'q' 或 'quit' 退出")
+    print("  - 输入 'config' 查看当前配置")
     print("="*60)
     
     while True:
@@ -80,7 +80,7 @@ def interactive_query():
                 print_config()
                 continue
             
-            print(f"\n🔍 处理查询: '{query}'")
+            print(f"\n处理查询: '{query}'")
             print("-" * 60)
             
             # 调用 rewrite_and_time
@@ -92,7 +92,7 @@ def interactive_query():
             )
             
             # 显示结果
-            print("\n📝 结果:")
+            print("\n结果:")
             print(f"\n  Dense Queries ({len(dense_queries)} 条):")
             for i, q in enumerate(dense_queries, 1):
                 print(f"    {i}. {q}")
@@ -116,7 +116,7 @@ def interactive_query():
             break
         except Exception as e:
             logger.error(f"处理查询失败: {e}", exc_info=True)
-            print(f"\n❌ 错误: {e}")
+            print(f"\n错误: {e}")
 
 
 def main():
@@ -130,7 +130,7 @@ def main():
     
     # 检查配置
     if not config.ENABLE_LLM_REWRITE and not config.ENABLE_TIME_FILTER:
-        print("\n⚠️  警告：")
+        print("\n警告：")
         print("  ENABLE_LLM_REWRITE 和 ENABLE_TIME_FILTER 都为 false")
         print("  请在 .env 文件中至少启用其中一个功能")
         print("\n示例配置：")
@@ -143,12 +143,12 @@ def main():
     use_independent_api = config.QUERY_REWRITE_BASE_URL and config.QUERY_REWRITE_BASE_URL.strip()
     if use_independent_api:
         if not config.QUERY_REWRITE_API_KEY:
-            print("\n⚠️  警告：")
+            print("\n警告：")
             print("  已配置 QUERY_REWRITE_BASE_URL，但未设置 QUERY_REWRITE_API_KEY")
             print("  某些 API 可能需要 API Key")
     else:
         if not config.VLM_API_URI:
-            print("\n⚠️  警告：")
+            print("\n警告：")
             print("  未配置 VLM_API_URI，将无法调用 API")
             return
     
@@ -158,4 +158,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

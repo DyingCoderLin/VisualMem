@@ -71,15 +71,15 @@ class SmartQuerySelector:
         print("智能查询选择器")
         print("="*60)
         print(f"\n配置:")
-        print(f"  • Storage Mode: {self.storage_mode}")
-        print(f"  • OCR Enabled: {self.enable_ocr}")
+        print(f"  - Storage Mode: {self.storage_mode}")
+        print(f"  - OCR Enabled: {self.enable_ocr}")
         print(f"\n可用查询方式:")
         if self.lancedb_available:
-            print("  ✅ LanceDB 语义搜索（文本→图像、图像→图像）")
+            print("  - LanceDB 语义搜索（文本→图像、图像→图像）")
         if self.sqlite_available:
-            print("  ✅ SQLite 文本搜索（OCR Fallback）")
+            print("  - SQLite 文本搜索（OCR Fallback）")
         if not self.lancedb_available and not self.sqlite_available:
-            print("  ⚠️  仅支持时间范围查询")
+            print("  警告: 仅支持时间范围查询")
         print("="*60)
     
     def query(
@@ -108,7 +108,7 @@ class SmartQuerySelector:
         # 自动选择策略
         if strategy == "auto":
             strategy = self._select_strategy(query_text, query_image)
-            print(f"\n🎯 自动选择策略: {strategy}")
+            print(f"\n自动选择策略: {strategy}")
         
         # 执行查询
         if strategy == "semantic":
@@ -172,7 +172,7 @@ class SmartQuerySelector:
         if not self.lancedb_available:
             raise ValueError("LanceDB not available")
         
-        print(f"\n🔍 使用 LanceDB 语义搜索")
+        print(f"\n使用 LanceDB 语义搜索")
         
         if query_image:
             results = self.retriever.retrieve_by_image(query_image, top_k=top_k)
@@ -188,7 +188,7 @@ class SmartQuerySelector:
         if not self.sqlite_available:
             raise ValueError("SQLite not available")
         
-        print(f"\n🔍 使用 SQLite 文本搜索")
+        print(f"\n使用 SQLite 文本搜索")
         
         results = self.sqlite_storage.search_by_text(query_text, limit=top_k)
         return results
@@ -198,7 +198,7 @@ class SmartQuerySelector:
         if not (self.lancedb_available and self.sqlite_available):
             raise ValueError("Hybrid search requires both LanceDB and SQLite")
         
-        print(f"\n🔍 使用混合搜索策略")
+        print(f"\n使用混合搜索策略")
         print(f"  Step 1: SQLite 快速过滤候选集...")
         
         # Step 1: SQLite 文本过滤（快速）
@@ -258,7 +258,7 @@ def example_usage():
                 print(f"   文本: {r['ocr_text'][:80]}...")
     
     except Exception as e:
-        print(f"❌ 错误: {e}")
+        print(f"错误: {e}")
     
     print("\n" + "="*60)
     print("示例2：模糊概念查询（自动选择 LanceDB 或混合）")
@@ -278,7 +278,7 @@ def example_usage():
                 print(f"   距离: {r['distance']:.4f}")
     
     except Exception as e:
-        print(f"❌ 错误: {e}")
+        print(f"错误: {e}")
     
     print("\n" + "="*60)
     print("示例3：强制使用特定策略")
@@ -291,9 +291,9 @@ def example_usage():
             top_k=5,
             strategy="semantic"  # 强制语义
         )
-        print(f"✅ 语义搜索返回 {len(results)} 个结果")
+        print(f"语义搜索返回 {len(results)} 个结果")
     except Exception as e:
-        print(f"❌ 语义搜索不可用: {e}")
+        print(f"语义搜索不可用: {e}")
     
     try:
         # 强制使用文本搜索
@@ -302,9 +302,9 @@ def example_usage():
             top_k=5,
             strategy="text"  # 强制文本
         )
-        print(f"✅ 文本搜索返回 {len(results)} 个结果")
+        print(f"文本搜索返回 {len(results)} 个结果")
     except Exception as e:
-        print(f"❌ 文本搜索不可用: {e}")
+        print(f"文本搜索不可用: {e}")
 
 
 def main():
@@ -323,10 +323,8 @@ def main():
         print("\n\n用户中断")
     except Exception as e:
         logger.error(f"示例运行失败: {e}", exc_info=True)
-        print(f"\n❌ 错误: {e}")
+        print(f"\n错误: {e}")
 
 
 if __name__ == "__main__":
     main()
-
-

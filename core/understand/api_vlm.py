@@ -50,10 +50,10 @@ class ApiVLM(AbstractVLM):
             self.api_uri = f"{self.base_url}{self.TRANSFORMER_ENDPOINT}"
         
         logger.debug(f"ApiVLM initialized")
-        logger.debug(f"  • Base URL: {self.base_url}")
-        logger.debug(f"  • Endpoint: {self.api_uri}")
-        logger.debug(f"  • Model: {self.model}")
-        logger.debug(f"  • Backend: {self.backend_type}")
+        logger.debug(f"  - Base URL: {self.base_url}")
+        logger.debug(f"  - Endpoint: {self.api_uri}")
+        logger.debug(f"  - Model: {self.model}")
+        logger.debug(f"  - Backend: {self.backend_type}")
     
     def _image_to_base64(self, image: Image) -> str:
         """
@@ -429,4 +429,3 @@ class ApiVLM(AbstractVLM):
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"]
-

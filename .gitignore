@@ -9,6 +9,7 @@ logs/*
 .env
 .DS_Store
 **/.DS_Store
+<<<<<<< HEAD
 *.json
 screencap_rs/target/
 *.mp4
@@ -33,3 +34,8 @@ claude_features.md
 /docs/clustering_feature.md
 clustering_flow*
 Gemini*
+=======
+/screencap_rs/target/*
+*.json
+*.mp4
+>>>>>>> main

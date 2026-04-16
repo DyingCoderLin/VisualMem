@@ -25,14 +25,14 @@ def example_frame_diff_filter():
     # 1. 加载配置
     print("\n[1/4] 加载配置...")
     from config import config
-    print(f"  • 存储模式: {config.STORAGE_MODE}")
-    print(f"  • 查询时帧差过滤: {config.ENABLE_QUERY_FRAME_DIFF}")
-    print(f"  • 帧差阈值: {config.SIMPLE_FILTER_DIFF_THRESHOLD}")
+    print(f"  - 存储模式: {config.STORAGE_MODE}")
+    print(f"  - 查询时帧差过滤: {config.ENABLE_QUERY_FRAME_DIFF}")
+    print(f"  - 帧差阈值: {config.SIMPLE_FILTER_DIFF_THRESHOLD}")
     
     # 2. 导入帧差过滤函数
     print("\n[2/4] 导入帧差过滤函数...")
     from query import _apply_frame_diff_filter
-    print("  ✓ 导入成功")
+    print("  - 导入成功")
     
     # 3. 创建示例数据
     print("\n[3/4] 创建示例帧（模拟连续截图）...")
@@ -83,17 +83,17 @@ def example_frame_diff_filter():
         'ocr_text': ''
     })
     
-    print(f"  ✓ 创建了 {len(test_frames)} 个模拟帧")
+    print(f"  - 创建了 {len(test_frames)} 个模拟帧")
 
     # 4. 应用帧差过滤
     print("\n[4/4] 应用帧差过滤...")
     threshold = 0.006
     filtered_frames = _apply_frame_diff_filter(test_frames, threshold=threshold)
     
-    print(f"  • 阈值: {threshold}")
-    print(f"  • 过滤前: {len(test_frames)} 帧")
-    print(f"  • 过滤后: {len(filtered_frames)} 帧")
-    print(f"  • 被过滤: {len(test_frames) - len(filtered_frames)} 帧")
+    print(f"  - 阈值: {threshold}")
+    print(f"  - 过滤前: {len(test_frames)} 帧")
+    print(f"  - 过滤后: {len(filtered_frames)} 帧")
+    print(f"  - 被过滤: {len(test_frames) - len(filtered_frames)} 帧")
     
     # 显示保留的帧
     print("\n保留的帧（会被送入 VLM）:")
@@ -105,17 +105,17 @@ def example_frame_diff_filter():
     if filtered_out:
         print("\n被过滤的帧（避免重复信息）:")
         for frame_id in filtered_out:
-            print(f"  • {frame_id}")
+            print(f"  - {frame_id}")
     
     # 结果说明
     print("\n" + "="*60)
-    print("✅ 帧差过滤示例完成")
+    print("帧差过滤示例完成")
     print("="*60)
     print("\n工作原理:")
-    print("  • 帧差过滤通过比较相邻帧的图像差异")
-    print("  • 只保留差异大于阈值的帧")
-    print("  • 避免将相似的连续帧重复喂给 VLM")
-    print("  • 节省 token 成本，提高理解效率")
+    print("  - 帧差过滤通过比较相邻帧的图像差异")
+    print("  - 只保留差异大于阈值的帧")
+    print("  - 避免将相似的连续帧重复喂给 VLM")
+    print("  - 节省 token 成本，提高理解效率")
 
 def main():
     """主函数"""
@@ -135,7 +135,7 @@ def main():
     except KeyboardInterrupt:
         print("\n\n用户中断")
     except Exception as e:
-        print(f"\n❌ 示例运行失败: {e}")
+        print(f"\n示例运行失败: {e}")
         import traceback
         traceback.print_exc()
 

@@ -191,7 +191,7 @@ async function waitForBackend(maxRetries: number = 180, interval: number = 1000)
   while (retries < maxRetries || isDownloading || isLoadingModel) {
     const isReady = await checkBackendHealth()
     if (isReady) {
-      console.log('✅ Backend is ready!')
+      console.log('Backend is ready!')
       return true
     }
     
@@ -218,7 +218,7 @@ async function waitForBackend(maxRetries: number = 180, interval: number = 1000)
     await new Promise(resolve => setTimeout(resolve, interval))
   }
   
-  console.error('❌ Backend failed to start within timeout')
+  console.error('Backend failed to start within timeout')
   return false
 }
 
