@@ -130,7 +130,9 @@ class TextRetriever(TextRetrieverInterface):
         self,
         query: str,
         top_k: int = 10,
-        filter: Optional[str] = None
+        filter: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         Dense 检索（纯向量语义搜索）
@@ -139,6 +141,8 @@ class TextRetriever(TextRetrieverInterface):
             query: 查询文本
             top_k: 返回结果数量
             filter: SQL 风格的过滤条件（可选）
+            related_apps: 相关应用列表（可选）
+            unrelated_apps: 不相关应用列表（可选）
             
         Returns:
             检索结果列表
@@ -161,8 +165,19 @@ class TextRetriever(TextRetrieverInterface):
             search_query = self.table.search(query_embedding, query_type="vector")
             
             # 3. 应用过滤条件
+            conditions = []
             if filter:
-                search_query = search_query.where(filter)
+                conditions.append(filter)
+            
+            if related_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
+            
+            if conditions:
+                search_query = search_query.where(" AND ".join(conditions))
             
             # 4. 限制结果数量并返回
             results = search_query.limit(top_k).to_list()
@@ -179,7 +194,9 @@ class TextRetriever(TextRetrieverInterface):
         query: str,
         top_k: int = 10,
         text_field: str = "text",
-        filter: Optional[str] = None
+        filter: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         Sparse 检索（FTS 全文搜索，BM25）
@@ -189,6 +206,8 @@ class TextRetriever(TextRetrieverInterface):
             top_k: 返回结果数量
             text_field: 要搜索的文本字段
             filter: SQL 风格的过滤条件（可选）
+            related_apps: 相关应用列表（可选）
+            unrelated_apps: 不相关应用列表（可选）
             
         Returns:
             检索结果列表
@@ -207,8 +226,19 @@ class TextRetriever(TextRetrieverInterface):
             search_query = self.table.search(query, query_type="fts")
             
             # 3. 应用过滤条件
+            conditions = []
             if filter:
-                search_query = search_query.where(filter)
+                conditions.append(filter)
+            
+            if related_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
+            
+            if conditions:
+                search_query = search_query.where(" AND ".join(conditions))
             
             # 4. 限制结果数量并返回
             results = search_query.limit(top_k).to_list()
@@ -226,7 +256,9 @@ class TextRetriever(TextRetrieverInterface):
         top_k: int = 10,
         text_field: str = "text",
         reranker: Optional[str] = None,
-        filter: Optional[str] = None
+        filter: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None
     ) -> List[Dict]:
         """
         Hybrid 检索（混合搜索：Dense + Sparse + Reranker）
@@ -237,6 +269,8 @@ class TextRetriever(TextRetrieverInterface):
             text_field: 要搜索的文本字段
             reranker: Reranker 名称 ("linear", "rrf", "cross-encoder")
             filter: SQL 风格的过滤条件（可选）
+            related_apps: 相关应用列表（可选）
+            unrelated_apps: 不相关应用列表（可选）
             
         Returns:
             检索结果列表
@@ -274,8 +308,19 @@ class TextRetriever(TextRetrieverInterface):
             )
             
             # 5. 应用过滤条件
+            conditions = []
             if filter:
-                search_query = search_query.where(filter)
+                conditions.append(filter)
+            
+            if related_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in related_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps:
+                app_list_str = ", ".join([f"'{app.replace("'", "''")}'" for app in unrelated_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
+            
+            if conditions:
+                search_query = search_query.where(" AND ".join(conditions))
             
             # 6. Rerank 并限制结果数量
             results = (

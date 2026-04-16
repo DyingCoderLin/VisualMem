@@ -13,6 +13,8 @@ __all__ = [
     'OCRResult',
     'PytesseractOCR',
     'DummyOCR',
-    'create_ocr_engine'
+    'create_ocr_engine',
 ]
+
+# platform_ocr classes are imported lazily by create_ocr_engine
 

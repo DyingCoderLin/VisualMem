@@ -1,4 +1,10 @@
-const API_BASE_URL = 'http://localhost:8080'
+import type {
+  DailyReportListResponse,
+  DailyReportPayload,
+  GenerateDailyReportResponse
+} from '../types/dailyReport'
+
+const API_BASE_URL = 'http://localhost:18080'
 
 interface QueryRagRequest {
   query: string
@@ -8,6 +14,14 @@ interface QueryRagRequest {
   ocr_mode?: boolean
 }
 
+export interface SubFrameResult {
+  sub_frame_id: string
+  timestamp: string
+  app_name: string
+  window_name: string
+  image_path: string | null
+}
+
 export interface FrameResult {
   frame_id: string
   timestamp: string
@@ -15,6 +29,7 @@ export interface FrameResult {
   image_path?: string
   ocr_text?: string
   relevance?: number
+  sub_frames?: SubFrameResult[]
 }
 
 interface QueryRagResponse {
@@ -42,13 +57,14 @@ class ApiClient {
 
   private async request<T>(
     endpoint: string,
-    options: RequestInit = {}
+    options: RequestInit = {},
+    timeoutMs: number = 30000  // 默认 30 秒超时
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`
     
-    // 为所有请求设置默认超时（例如 30 秒），防止请求无限挂起
+    // 为所有请求设置超时，防止请求无限挂起
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 30000)
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs)
 
     try {
       const response = await fetch(url, {
@@ -61,7 +77,23 @@ class ApiClient {
       })
 
       if (!response.ok) {
-        throw new Error(`API request failed: ${response.statusText}`)
+        const text = await response.text()
+        let message = response.statusText || 'Request failed'
+        try {
+          const errBody = JSON.parse(text) as { detail?: unknown }
+          const d = errBody?.detail
+          if (typeof d === 'string') {
+            message = d
+          } else if (Array.isArray(d) && d.length > 0) {
+            message = d
+              .map((x: { msg?: string }) => x?.msg || '')
+              .filter(Boolean)
+              .join('; ')
+          }
+        } catch {
+          if (text) message = text.slice(0, 500)
+        }
+        throw new Error(message)
       }
 
       return response.json()
@@ -72,6 +104,17 @@ class ApiClient {
 
   async getStats(): Promise<StatsResponse> {
     return this.request<StatsResponse>('/api/stats')
+  }
+
+  async loadModels(): Promise<{ status: string; message: string }> {
+    // Load heavy ML models on demand. Uses long timeout since model loading takes time.
+    return this.request<{ status: string; message: string }>('/api/load_models', {
+      method: 'POST'
+    }, 300000)  // 5 min timeout for model loading
+  }
+
+  async getModelsStatus(): Promise<{ loaded: boolean; loading: boolean }> {
+    return this.request<{ loaded: boolean; loading: boolean }>('/api/models_status')
   }
 
   async getRecentFrames(minutes: number = 5): Promise<{ frames: FrameResult[] }> {
@@ -157,23 +200,85 @@ class ApiClient {
   }
 
   async stopRecording(): Promise<{ status: string }> {
-    // 仅通知后端刷新缓冲区
-    return this.request<{ status: string }>('/api/recording/stop', {
-      method: 'POST'
-    })
+    // 刷新视频缓冲 + BatchWriteBuffer 可能很慢（积压帧多时），必须长于默认 30s，否则会 AbortError
+    return this.request<{ status: string }>(
+      '/api/recording/stop',
+      { method: 'POST' },
+      300000
+    )
   }
 
   async storeFrame(req: {
     frame_id: string
     timestamp: string
     image_base64: string
+    monitor_id?: number
     metadata?: Record<string, any>
-  }): Promise<{ status: string }> {
-    // 存储帧到后端
-    return this.request<{ status: string }>('/api/store_frame', {
-      method: 'POST',
-      body: JSON.stringify(req)
-    })
+    windows?: Array<{
+      app_name: string
+      window_name: string
+      image_base64: string
+    }>
+  }): Promise<{
+    status: string
+    frame_id?: string
+    sub_frame_count?: number
+    today_count?: number
+    frame_summary?: FrameResult
+  }> {
+    // 存储帧到后端（支持窗口信息）
+    // 使用更长的超时（120秒），因为后端需要做 embedding + OCR
+    return this.request<{
+      status: string; frame_id?: string; sub_frame_count?: number
+      today_count?: number; frame_summary?: FrameResult
+    }>(
+      '/api/store_frame',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...req,
+          monitor_id: req.monitor_id ?? 0
+        })
+      },
+      120000  // 120 秒超时
+    )
+  }
+
+  async extractVideoFrame(videoPath: string, frameIndex: number = 0, fps: number = 1.0): Promise<{ image_base64: string; width: number; height: number }> {
+    // 从视频中提取单帧
+    return this.request<{ image_base64: string; width: number; height: number }>(
+      `/api/video/extract_frame?video_path=${encodeURIComponent(videoPath)}&frame_index=${frameIndex}&fps=${fps}`
+    )
+  }
+
+  getVideoFrameImageUrl(videoPath: string, frameIndex: number = 0, fps: number = 1.0): string {
+    // 获取视频帧图片URL（用于img标签）
+    return `${this.baseUrl}/api/video/frame_image?video_path=${encodeURIComponent(videoPath)}&frame_index=${frameIndex}&fps=${fps}`
+  }
+
+  /** List ISO dates (YYYY-MM-DD) that have a saved daily report, newest first. */
+  async listDailyReports(): Promise<DailyReportListResponse> {
+    return this.request<DailyReportListResponse>('/api/daily-reports')
+  }
+
+  /** Full daily report JSON for one calendar day. */
+  async getDailyReport(date: string): Promise<DailyReportPayload> {
+    return this.request<DailyReportPayload>(`/api/daily-reports/${encodeURIComponent(date)}`)
+  }
+
+  /**
+   * Run the same pipeline as `python scripts/daily_report.py --date <date>`.
+   * Long-running (minutes); uses an extended timeout.
+   */
+  async generateDailyReport(date: string): Promise<GenerateDailyReportResponse> {
+    return this.request<GenerateDailyReportResponse>(
+      '/api/daily-reports/generate',
+      {
+        method: 'POST',
+        body: JSON.stringify({ date })
+      },
+      900000
+    )
   }
 }
 

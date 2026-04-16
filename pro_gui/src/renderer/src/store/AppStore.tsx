@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 import { apiClient } from '../services/api'
-import { recordingService, RecordingMode } from '../services/recording'
+import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
 
-export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings'
+export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings' | 'daily'
 
 export interface SearchResult {
   answer: string
@@ -24,14 +24,17 @@ interface AppStoreContextType {
   // Date range state
   dateRange: DateRange
   refreshDateRange: () => Promise<void>
-  
+
   // Recording state
   isRecording: boolean
+  /** 首次截图 + store_frame drain，尚未进入稳态 interval */
+  isWarmingUp: boolean
+  isModelLoading: boolean
   recordingMode: RecordingMode
   startRecording: () => Promise<void>
   stopRecording: () => Promise<void>
   setRecordingMode: (mode: RecordingMode) => void
-  
+
   // Refresh timeline
   refreshTimeline: () => void
   timelineRefreshTrigger: number
@@ -65,6 +68,8 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     latest_date: null
   })
   const [isRecording, setIsRecording] = useState(false)
+  const [isWarmingUp, setIsWarmingUp] = useState(false)
+  const [isModelLoading, setIsModelLoading] = useState(false)
   const [recordingMode, setRecordingModeState] = useState<RecordingMode>(recordingService.getMode())
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = useState(0)
   const [currentView, setCurrentView] = useState<ViewType>('timeline')
@@ -86,6 +91,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
       })
       // console.log('Date range updated:', range)
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       console.error('Failed to fetch date range:', error)
     }
   }, [])
@@ -95,32 +101,45 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     setTimelineRefreshTrigger(prev => prev + 1)
   }, [])
 
-  // 监听录制服务的状态变化
-  useEffect(() => {
-    const unsubscribe = recordingService.subscribeStatus((status) => {
-      setIsRecording(status)
-      if (status) {
-        // 如果录制开启，确保日期范围包含今天
-        const now = new Date()
-        const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-        setDateRange(prev => ({
-          ...prev,
-          latest_date: today
-        }))
-        refreshTimeline()
-      } else {
-        refreshDateRange()
-      }
-    })
-    return unsubscribe
+  const applyRecordingStatus = useCallback((status: RecordingStatus) => {
+    setIsWarmingUp(status.isWarmup)
+    setIsRecording(status.isLiveRecording)
+    if (status.sessionActive) {
+      const now = new Date()
+      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
+      setDateRange((prev) => ({
+        ...prev,
+        latest_date: today,
+      }))
+      refreshTimeline()
+    } else {
+      refreshDateRange()
+    }
   }, [refreshDateRange, refreshTimeline])
 
-  // 开始录制
+  // 监听录制服务的状态变化
+  useEffect(() => {
+    const unsubscribe = recordingService.subscribeStatus(applyRecordingStatus)
+    return unsubscribe
+  }, [applyRecordingStatus])
+
+  // 开始录制（先确保模型已加载）
   const startRecording = useCallback(async () => {
     try {
+      // Check if models are loaded, if not, load them first
+      const modelsStatus = await apiClient.getModelsStatus()
+      if (!modelsStatus.loaded) {
+        setIsModelLoading(true)
+        try {
+          await apiClient.loadModels()
+        } finally {
+          setIsModelLoading(false)
+        }
+      }
       await recordingService.start()
       // setIsRecording 将通过 subscribeStatus 自动更新
     } catch (error) {
+      setIsModelLoading(false)
       console.error('Failed to start recording:', error)
     }
   }, [])
@@ -146,20 +165,20 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
 
   // 监听录制服务的新帧事件（如果 recordingService 支持）
   useEffect(() => {
-    // 如果录制中，定期刷新时间轴以显示新录制的帧
-    if (isRecording) {
+    if (isRecording || isWarmingUp) {
       const refreshInterval = setInterval(() => {
         refreshTimeline()
-      }, 5000) // 每5秒刷新一次
-      
+      }, 5000)
       return () => clearInterval(refreshInterval)
     }
-  }, [isRecording, refreshTimeline])
+  }, [isRecording, isWarmingUp, refreshTimeline])
 
   const value: AppStoreContextType = {
     dateRange,
     refreshDateRange,
     isRecording,
+    isWarmingUp,
+    isModelLoading,
     recordingMode,
     startRecording,
     stopRecording,

@@ -15,7 +15,22 @@ import io
 
 import requests
 
-from PySide6.QtCore import QObject, Signal
+try:
+    from PySide6.QtCore import QObject, Signal
+except Exception:
+    class Signal:  # type: ignore
+        """Fallback signal for non-GUI environments."""
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def emit(self, *args, **kwargs):
+            pass
+
+    class QObject:  # type: ignore
+        """Fallback QObject for non-GUI environments."""
+
+        pass
 from PIL import Image as PILImage
 import numpy as np
 
@@ -453,3 +468,7 @@ class RecordWorker(QObject):
             self.ocr_thread.join(timeout=5.0)
         
         self.status_signal.emit("录制已停止")
+<<<<<<< HEAD
+
+=======
+>>>>>>> main

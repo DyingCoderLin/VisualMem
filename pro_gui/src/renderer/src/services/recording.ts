@@ -7,6 +7,13 @@ import { apiClient } from './api'
 
 export type RecordingMode = 'primary' | 'all'
 
+/** sessionActive: capture+send allowed; isWarmup: first-tick drain; isLiveRecording: steady interval (UI red button) */
+export interface RecordingStatus {
+  sessionActive: boolean
+  isWarmup: boolean
+  isLiveRecording: boolean
+}
+
 interface RecordingOptions {
   interval?: number // 截屏间隔（毫秒），默认 3000ms
   diffThreshold?: number // 帧差阈值，默认 0.006
@@ -21,9 +28,32 @@ class RecordingService {
   private diffCanvas: HTMLCanvasElement | null = null
   private diffCtx: CanvasRenderingContext2D | null = null
   private options: Required<RecordingOptions>
-  private isRecording: boolean = false
+  /** 会话进行中（含 warmup 与稳态录屏） */
+  private sessionActive: boolean = false
+  /** 首次截图 + store_frame drain 阶段 */
+  private warmupPhase: boolean = false
+  /** 稳态录屏（setInterval 已启动），对应 UI「正在录制」 */
+  private liveRecording: boolean = false
   private frameCounter: number = 0 // 计数器：0-10，每成功发送 10 帧后刷新数据
-  private statusListeners: ((status: boolean) => void)[] = []
+  private statusListeners: ((status: RecordingStatus) => void)[] = []
+  private pendingRequests: Set<AbortController> = new Set() // 跟踪正在进行的请求
+
+  // 发送队列：截屏照常进行，发送排队执行，避免 HTTP 连接堆积
+  private sendQueue: Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number }> = []
+  private isSending: boolean = false
+  private readonly maxQueueSize: number = 20  // 队列超过此大小时丢弃最旧的帧
+  /** 发送积压 ≥ 此值时进入背压（暂停新截屏） */
+  private readonly sendQueueBackpressureThreshold: number = 12
+  /**
+   * 背压解除：队列长度 ≤ 此值时才恢复截屏（滞回，避免在 11↔13 之间因多显示器/重叠 tick 反复抖动）
+   */
+  private readonly sendQueueBackpressureResumeThreshold: number = 8
+  /** setInterval 不等待 async，防止上一 tick 仍在 await captureScreen 时又开一轮截屏 */
+  private captureTickInFlight: boolean = false
+  /** 背压锁存：进入后备压一直生效直到队列充分下降 */
+  private backpressureLatched: boolean = false
+  private lastBackpressureLogMs: number = 0
+  private lastQueueDropLogMs: number = 0
 
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
@@ -42,17 +72,20 @@ class RecordingService {
     const savedState = sessionStorage.getItem('vlm_is_recording')
     if (savedState === 'true') {
       console.log('[RecordingService] Restoring recording state from sessionStorage after refresh')
-      // 立即设置内部状态
-      this.isRecording = true
-      // 延迟启动录制循环，确保环境已就绪
+      this.sessionActive = true
+      this.warmupPhase = true
+      this.liveRecording = false
+      queueMicrotask(() => this.notifyStatusListeners())
       setTimeout(() => {
-        if (this.isRecording) {
-          this.startLoop().catch(err => {
-            console.error('Failed to auto-resume recording loop:', err)
-            this.isRecording = false
-            this.notifyStatusListeners()
-          })
-        }
+        if (!this.sessionActive) return
+        this.resumeAfterPageReload().catch((err) => {
+          console.error('Failed to auto-resume recording:', err)
+          this.sessionActive = false
+          this.warmupPhase = false
+          this.liveRecording = false
+          sessionStorage.removeItem('vlm_is_recording')
+          this.notifyStatusListeners()
+        })
       }, 1000)
     }
 
@@ -63,17 +96,25 @@ class RecordingService {
   /**
    * 状态监听
    */
-  subscribeStatus(listener: (status: boolean) => void): () => void {
+  subscribeStatus(listener: (status: RecordingStatus) => void): () => void {
     this.statusListeners.push(listener)
-    // 立即通知当前状态
-    listener(this.isRecording)
+    listener(this.getRecordingStatus())
     return () => {
       this.statusListeners = this.statusListeners.filter(l => l !== listener)
     }
   }
 
+  private getRecordingStatus(): RecordingStatus {
+    return {
+      sessionActive: this.sessionActive,
+      isWarmup: this.warmupPhase,
+      isLiveRecording: this.liveRecording,
+    }
+  }
+
   private notifyStatusListeners(): void {
-    this.statusListeners.forEach(listener => listener(this.isRecording))
+    const s = this.getRecordingStatus()
+    this.statusListeners.forEach((listener) => listener(s))
   }
 
   /**
@@ -98,7 +139,7 @@ class RecordingService {
           this.options.interval = newInterval
           
           // 如果正在录制，重启定时器以应用新间隔
-          if (this.isRecording && this.intervalId !== null) {
+          if (this.liveRecording && this.intervalId !== null) {
             clearInterval(this.intervalId)
             this.intervalId = window.setInterval(() => this.captureAndProcessLoop(), this.options.interval)
           }
@@ -154,6 +195,26 @@ class RecordingService {
     const mse = sumSquaredDiff / (pixelCount * 3) // 3 个通道
     const rms = Math.sqrt(mse)
     return rms / 255.0 // 归一化到 0-1
+  }
+
+  /**
+   * Check if a frame is solid-color (black screen, white screen, etc.)
+   * Uses the standard deviation of grayscale pixel values from the low-res diff image.
+   */
+  private isSolidColorFrame(diffData: ImageData): boolean {
+    const data = diffData.data
+    const pixelCount = diffData.width * diffData.height
+    let sum = 0
+    let sumSq = 0
+    for (let i = 0; i < data.length; i += 4) {
+      // Convert to grayscale: 0.299*R + 0.587*G + 0.114*B
+      const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+      sum += gray
+      sumSq += gray * gray
+    }
+    const mean = sum / pixelCount
+    const std = Math.sqrt(sumSq / pixelCount - mean * mean)
+    return std < 5.0
   }
 
   /**
@@ -316,109 +377,208 @@ class RecordingService {
   }
 
   /**
-   * 刷新数据（每 10 帧后调用）
-   * - 获取今天的图片 count（轻量级，只更新数量，不加载实际数据）
-   * - 获取 stats 更新左下角的数据
+   * 轻量级 stats 刷新（每 10 帧后调用）
+   * 仅获取 stats 用于 SystemStatus 组件，不再请求 count/frames
+   * （帧数据已通过 store_frame 响应直接推送给 TimelineView）
    */
-  private async refreshData(): Promise<void> {
+  private async refreshStatsOnly(): Promise<void> {
     try {
-      // 获取今天的本地日期字符串，避免 UTC 导致的时间差问题
-      const now = new Date()
-      const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
-      
-      // 并行获取今天的图片 count 和 stats
-      const [countResult, statsResult] = await Promise.all([
-        apiClient.getFramesCountByDate(today).catch(err => {
-          console.error('Failed to get today\'s frame count:', err)
-          return { date: today, total_count: 0 }
-        }),
-        apiClient.getStats().catch(err => {
-          console.error('Failed to get stats:', err)
-          return null
-        })
-      ])
-      
-      console.log(`Refreshed data after 10 frames: today's count=${countResult.total_count}, stats=`, statsResult)
-      
-      // 触发全局刷新事件，通知 SystemStatus 和 TimelineView 更新
-      if (typeof window !== 'undefined') {
-        // 事件1：通知 SystemStatus 更新 stats
+      const statsResult = await apiClient.getStats()
+      if (typeof window !== 'undefined' && statsResult) {
         window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
-          detail: {
-            todayCount: countResult.total_count,
-            stats: statsResult
-          }
-        }))
-        
-        // 事件2：通知 TimelineView 只更新今天的 totalCount（轻量级，不加载实际数据）
-        window.dispatchEvent(new CustomEvent('recording-timeline-refresh', {
-          detail: {
-            date: today,
-            totalCount: countResult.total_count  // 只传递总数量
-          }
+          detail: { stats: statsResult }
         }))
       }
     } catch (error) {
-      console.error('Error refreshing data:', error)
+      console.error('Error refreshing stats:', error)
     }
   }
 
   /**
-   * 开始录制
+   * 开始录制：warmup（第一次截图 + 全部 store_frame 返回）→ 稳态 interval
    */
   async start(): Promise<void> {
-    if (this.isRecording && this.intervalId !== null) {
-      console.warn('Recording is already in progress')
+    if (this.sessionActive) {
+      console.warn('Recording session already active')
       return
     }
 
-    this.isRecording = true
+    this.sessionActive = true
+    this.warmupPhase = true
+    this.liveRecording = false
+    this.lastImageDataArray = []
+    this.frameCounter = 0
+    this.isSending = false
     sessionStorage.setItem('vlm_is_recording', 'true')
     this.notifyStatusListeners()
-    
-    await this.startLoop()
+
+    try {
+      await this.runFirstScreenshotWarmup()
+    } catch (err) {
+      this.sessionActive = false
+      this.warmupPhase = false
+      this.liveRecording = false
+      sessionStorage.removeItem('vlm_is_recording')
+      this.notifyStatusListeners()
+      throw err
+    }
+
+    if (!this.sessionActive) {
+      return
+    }
+
+    this.warmupPhase = false
+    this.liveRecording = true
+    this.notifyStatusListeners()
+
+    this.startLoopSteady()
+  }
+
+  /** 页面刷新后恢复：与手动开始相同，先 warmup 再 interval */
+  private async resumeAfterPageReload(): Promise<void> {
+    this.lastImageDataArray = []
+    this.frameCounter = 0
+    this.isSending = false
+    await this.runFirstScreenshotWarmup()
+    if (!this.sessionActive) return
+    this.warmupPhase = false
+    this.liveRecording = true
+    this.notifyStatusListeners()
+    this.startLoopSteady()
   }
 
   /**
-   * 启动录制循环
+   * 第一次截图产生的全部 store_frame 请求完成后再进入稳态
    */
-  private async startLoop(): Promise<void> {
-    this.lastImageDataArray = []
-    this.frameCounter = 0 // 重置计数器
+  private async runFirstScreenshotWarmup(): Promise<void> {
+    console.log('[RecordingService] Warmup: first capture tick + drain send queue')
+    await this.runSingleCaptureTick()
+    await this.drainSendQueue()
+    console.log('[RecordingService] Warmup complete')
+  }
 
-    console.log(`[RecordingService] Starting capture loop with interval: ${this.options.interval}ms, mode: ${this.options.mode}`)
+  private async drainSendQueue(): Promise<void> {
+    const maxWaitMs = 30 * 60 * 1000
+    const t0 = Date.now()
+    while (this.sendQueue.length > 0 || this.isSending) {
+      if (!this.sessionActive) {
+        break
+      }
+      if (Date.now() - t0 > maxWaitMs) {
+        console.warn('[RecordingService] drainSendQueue: timeout waiting for queue (30m)')
+        break
+      }
+      await new Promise((r) => setTimeout(r, 50))
+    }
+  }
 
-    // 立即执行一次
-    this.captureAndProcessLoop()
+  /**
+   * 仅启动定时间隔，不立即再截一帧（首帧已在 warmup 完成）
+   */
+  private startLoopSteady(): void {
+    console.log(
+      `[RecordingService] Steady capture loop interval: ${this.options.interval}ms, mode: ${this.options.mode}`
+    )
 
-    // 设置定时器
     if (this.intervalId !== null) {
       clearInterval(this.intervalId)
     }
     this.intervalId = window.setInterval(() => this.captureAndProcessLoop(), this.options.interval)
   }
 
-  /**
-   * 核心捕获和处理逻辑
-   */
-  private async captureAndProcessLoop(): Promise<void> {
-    // 在函数开始处检查录制状态
-    if (!this.isRecording) {
+  /** 单次截屏 + 入队（与 captureAndProcessLoop 主体一致） */
+  private async runSingleCaptureTick(): Promise<void> {
+    if (this.captureTickInFlight) {
       return
     }
-
+    this.captureTickInFlight = true
     try {
-      // 截屏（可能包含多个屏幕）
       const captureResults = await this.captureScreen()
-      
-      // 再次检查录制状态（可能在截屏过程中停止了）
-      if (!this.isRecording || captureResults.length === 0) {
+      if (!this.sessionActive || captureResults.length === 0) {
         return
       }
 
       const now = new Date()
       const timestamp = now.toISOString()
-      
+      const year = now.getFullYear()
+      const month = String(now.getMonth() + 1).padStart(2, '0')
+      const day = String(now.getDate()).padStart(2, '0')
+      const hours = String(now.getHours()).padStart(2, '0')
+      const minutes = String(now.getMinutes()).padStart(2, '0')
+      const seconds = String(now.getSeconds()).padStart(2, '0')
+      const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`
+
+      for (const { base64Data, diffData, index, width, height } of captureResults) {
+        if (!this.sessionActive) {
+          break
+        }
+        this.lastImageDataArray[index] = diffData
+        if (!base64Data) {
+          continue
+        }
+        if (this.isSolidColorFrame(diffData)) {
+          continue
+        }
+        const microSeconds = String(index).padStart(6, '0')
+        const frameId = `${frameIdPrefix}${microSeconds}`
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index)
+      }
+    } catch (error) {
+      if (!this.sessionActive) {
+        return
+      }
+      console.error('Error in warmup capture tick:', error)
+    } finally {
+      this.captureTickInFlight = false
+    }
+  }
+
+  /**
+   * 核心捕获和处理逻辑
+   */
+  private async captureAndProcessLoop(): Promise<void> {
+    if (!this.sessionActive || !this.liveRecording) {
+      return
+    }
+
+    // Warmup 阶段不背压，保证第一次截图全部入队并可被 drain
+    // 背压（带滞回）：队列冲高后暂停截屏，降到 resume 以下才恢复，避免 12/13 边界来回跳
+    if (!this.warmupPhase) {
+      if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
+        this.backpressureLatched = true
+      }
+      if (this.sendQueue.length <= this.sendQueueBackpressureResumeThreshold) {
+        this.backpressureLatched = false
+      }
+      if (this.backpressureLatched) {
+        const now = Date.now()
+        if (now - this.lastBackpressureLogMs > 8000) {
+          console.warn(
+            `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), ` +
+              `skipping capture until queue ≤ ${this.sendQueueBackpressureResumeThreshold}`
+          )
+          this.lastBackpressureLogMs = now
+        }
+        return
+      }
+    }
+
+    if (this.captureTickInFlight) {
+      return
+    }
+    this.captureTickInFlight = true
+    try {
+      // 截屏（可能包含多个屏幕）
+      const captureResults = await this.captureScreen()
+
+      // 再次检查录制状态（可能在截屏过程中停止了）
+      if (!this.sessionActive || !this.liveRecording || captureResults.length === 0) {
+        return
+      }
+
+      const now = new Date()
+      const timestamp = now.toISOString()
+
       // 生成时间戳格式的 frame_id 前缀：YYYYMMDD_HHMMSS_
       const year = now.getFullYear()
       const month = String(now.getMonth() + 1).padStart(2, '0')
@@ -430,7 +590,7 @@ class RecordingService {
 
       for (const { base64Data, diffData, index, width, height } of captureResults) {
         // 再次检查录制状态
-        if (!this.isRecording) {
+        if (!this.sessionActive || !this.liveRecording) {
           break
         }
 
@@ -442,57 +602,127 @@ class RecordingService {
           continue
         }
 
+        // Skip solid-color / black-screen frames (std of grayscale pixels < 5)
+        if (this.isSolidColorFrame(diffData)) {
+          continue
+        }
+
         // 生成 frame_id：YYYYMMDD_HHMMSS_00000X
         // 微秒部分使用 index 区分不同屏幕
         const microSeconds = String(index).padStart(6, '0')
         const frameId = `${frameIdPrefix}${microSeconds}`
 
-        // 发送到后端（异步，不阻塞）
-        this.sendFrameToBackendDirectly(base64Data, frameId, timestamp, width, height).catch(err => {
-          console.error(`Error sending frame for screen ${index}:`, err)
-        })
+        // 加入发送队列（截屏不等发送，发送逐个排队避免 HTTP 堆积）
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index)
       }
     } catch (error) {
       // 如果已经停止录制，忽略错误
-      if (!this.isRecording) {
+      if (!this.sessionActive) {
         return
       }
       console.error('Error in capture loop:', error)
+    } finally {
+      this.captureTickInFlight = false
+    }
+  }
+
+  /**
+   * 将帧加入发送队列。截屏不受影响，发送逐个执行避免 HTTP 连接堆积。
+   */
+  private enqueueFrame(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number): void {
+    // 队列满时丢弃最旧的帧（保留最新的截屏）
+    if (this.sendQueue.length >= this.maxQueueSize) {
+      const dropped = this.sendQueue.shift()
+      const now = Date.now()
+      if (now - this.lastQueueDropLogMs > 3000) {
+        console.warn(
+          `[RecordingService] Send queue full (${this.maxQueueSize}), dropped oldest frame ${dropped?.frameId}`
+        )
+        this.lastQueueDropLogMs = now
+      }
+    }
+    this.sendQueue.push({ base64Data, frameId, timestamp, width, height, monitorId })
+    // 启动队列处理（如果没在运行）
+    this.processSendQueue()
+  }
+
+  /**
+   * 逐个发送队列中的帧，一次只有一个 HTTP 请求在飞。
+   * 这样浏览器的 6 个连接中只有 1 个被 store_frame 占用，
+   * 剩余 5 个可以服务 getStats/getFramesByDate 等轻量请求。
+   */
+  private async processSendQueue(): Promise<void> {
+    if (this.isSending) return  // 已经在处理中
+    this.isSending = true
+
+    try {
+      while (this.sendQueue.length > 0 && this.sessionActive) {
+        const frame = this.sendQueue.shift()!
+        try {
+          await this.sendFrameToBackendDirectly(
+            frame.base64Data, frame.frameId, frame.timestamp,
+            frame.width, frame.height, frame.monitorId
+          )
+        } catch (err) {
+          console.error(`Error sending frame ${frame.frameId}:`, err)
+        }
+      }
+    } finally {
+      this.isSending = false
     }
   }
 
   /**
    * 直接发送 Base64 帧到后端
    */
-  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number): Promise<void> {
-    // 发送到后端
+  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number = 0): Promise<void> {
+    // 再次检查录制状态
+    if (!this.sessionActive) {
+      return
+    }
+    
     try {
-      // 再次检查录制状态
-      if (!this.isRecording) {
-        return
-      }
-      
-      await apiClient.storeFrame({
+      const result = await apiClient.storeFrame({
         frame_id: frameId,
         timestamp: timestamp,
         image_base64: base64Data,
+        monitor_id: monitorId,
         metadata: {
           width: width,
-          height: height
+          height: height,
+          monitor_id: monitorId
         }
       })
-      
+
+      // Dispatch frame data directly to TimelineView (no extra HTTP round-trips)
+      if (result.status === 'ok' && result.frame_summary && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('recording-frame-stored', {
+          detail: {
+            frame: result.frame_summary,
+            todayCount: result.today_count || 0,
+          }
+        }))
+      }
+
       // 递增计数器（0-10）
       this.frameCounter = (this.frameCounter + 1) % 10
-      
-      // 每 10 次成功发送后刷新数据
+
+      // 每 10 次成功发送后刷新 stats（仅用于 SystemStatus 组件）
       if (this.frameCounter === 0) {
-        this.refreshData().catch(err => {
-          console.error('Error in refreshData:', err)
+        this.refreshStatsOnly().catch(err => {
+          console.error('Error in refreshStatsOnly:', err)
         })
       }
     } catch (error) {
-      console.error('Failed to send frame to backend:', error)
+      // 忽略因停止录制导致的请求取消错误
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        // 请求被取消，这是正常的（停止录制时）
+        return
+      }
+      // 只在录制状态下打印错误
+      if (this.sessionActive) {
+        console.error('Failed to send frame to backend:', error)
+      }
     }
   }
 
@@ -500,8 +730,9 @@ class RecordingService {
    * 停止录制
    */
   async stop(): Promise<void> {
-    // 立即设置停止标志
-    this.isRecording = false
+    this.sessionActive = false
+    this.warmupPhase = false
+    this.liveRecording = false
     sessionStorage.removeItem('vlm_is_recording')
     this.notifyStatusListeners()
     
@@ -513,14 +744,28 @@ class RecordingService {
 
     // 重置状态
     this.lastImageDataArray = []
+    this.sendQueue = []
+    this.backpressureLatched = false
+    this.captureTickInFlight = false
+    this.isSending = false  // 释放发送锁，防止残留的 inflight 请求阻塞下次录制
     console.log('Recording stopped')
 
-    // 通知后端刷新缓冲区
+    // 通知后端刷新缓冲区（与 store_frame 可能并行；慢时勿用短超时误判为「后端卡死」）
     try {
       await apiClient.stopRecording()
       console.log('Backend buffer flushed on stop')
     } catch (error) {
-      console.warn('Failed to notify backend to flush buffer:', error)
+      const aborted =
+        error instanceof DOMException &&
+        (error.name === 'AbortError' || error.message?.includes('aborted'))
+      if (aborted) {
+        console.warn(
+          '[RecordingService] stopRecording timed out or was aborted before response; ' +
+            'backend may still be flushing. Check logs/backend_server.log if data looks incomplete.'
+        )
+      } else {
+        console.warn('Failed to notify backend to flush buffer:', error)
+      }
     }
   }
 
@@ -528,7 +773,7 @@ class RecordingService {
    * 获取录制状态
    */
   getStatus(): boolean {
-    return this.isRecording
+    return this.liveRecording
   }
 
   /**

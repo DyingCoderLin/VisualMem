@@ -27,6 +27,7 @@ const SystemStatus: React.FC = () => {
           vlm: stats.vlm_model || '—'
         })
       } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return
         console.error('Failed to fetch system status:', error)
       }
     }

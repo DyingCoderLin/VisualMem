@@ -356,9 +356,11 @@ def search_and_understand(query: str, top_k: int = None) -> str:
             
             dense_queries = [query]
             time_range = None
+            related_apps = None
+            unrelated_apps = None
             if config.ENABLE_LLM_REWRITE or config.ENABLE_TIME_FILTER:
-                print(f"   正在重写查询并提取时间范围...")
-                dense_queries, _, time_range = rewrite_and_time(
+                print(f"   正在重写查询并提取时间范围与相关应用...")
+                dense_queries, _, time_range, related_apps, unrelated_apps = rewrite_and_time(
                     query,
                     enable_rewrite=config.ENABLE_LLM_REWRITE,
                     enable_time=config.ENABLE_TIME_FILTER,
@@ -370,7 +372,23 @@ def search_and_understand(query: str, top_k: int = None) -> str:
             end_time = None
             if time_range:
                 start_time, end_time = time_range
-                print(f"   时间范围: {start_time} - {end_time}")
+            
+            # Log search parameters
+            logger.info(f"Search parameters:")
+            if start_time or end_time:
+                logger.info(f"  • Time range: {start_time} - {end_time}")
+            else:
+                logger.info(f"  • Time range: Global (None)")
+            
+            if related_apps:
+                logger.info(f"  • Related apps: {', '.join(related_apps)}")
+            else:
+                logger.info(f"  • Related apps: None")
+                
+            if unrelated_apps:
+                logger.info(f"  • Unrelated apps: {', '.join(unrelated_apps)}")
+            else:
+                logger.info(f"  • Unrelated apps: None")
 
             # 执行检索
             frames = []
@@ -380,9 +398,14 @@ def search_and_understand(query: str, top_k: int = None) -> str:
                     query_embedding, 
                     top_k=top_k,
                     start_time=start_time,
-                    end_time=end_time
+                    end_time=end_time,
+                    related_apps=related_apps,
+                    unrelated_apps=unrelated_apps
                 )
                 frames.extend(res)
+            
+            # TODO: Sparse search in CLI query.py currently doesn't exist or is handled differently
+            # If hybrid search is added to query.py, app filters should be applied there too.
             
             # 如果有多个查询，去重并重新排序
             if len(dense_queries) > 1:

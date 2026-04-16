@@ -1,7 +1,6 @@
 import React from 'react'
 import SystemStatus from './SystemStatus'
-
-type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings'
+import type { ViewType } from '../store/AppStore'
 
 interface SidebarProps {
   currentView: ViewType
@@ -28,6 +27,14 @@ const Sidebar: React.FC<SidebarProps> = ({ currentView, onViewChange }) => {
             onClick={() => onViewChange('realtime')}
           >
             Real-time Tracing
+          </div>
+        </li>
+        <li>
+          <div
+            className={`nav-item ${currentView === 'daily' ? 'active' : ''}`}
+            onClick={() => onViewChange('daily')}
+          >
+            日报
           </div>
         </li>
         {/* <li>

@@ -265,6 +265,30 @@
   animation: pulse 2s ease-in-out infinite;
 }
 
+/* Model loading state for record button */
+.record-btn-loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent-primary);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+}
+
+.record-btn-loading .loading-spinner {
+  animation: spin 1s linear infinite;
+}
+
+.record-btn-loading .loading-text {
+  font-size: 12px;
+  opacity: 0.9;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 @keyframes pulse {
   0%, 100% {
     box-shadow: 0 0 10px var(--accent-glow);

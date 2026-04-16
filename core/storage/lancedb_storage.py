@@ -36,6 +36,7 @@ class LanceDBStorage:
         self.db_path = db_path
         self.embedding_dim = embedding_dim
         self.image_storage_path = Path(image_storage_path)
+        self._sqlite_storage = None
         
         # 创建图片存储目录
         self.image_storage_path.mkdir(parents=True, exist_ok=True)
@@ -109,12 +110,66 @@ class LanceDBStorage:
         return str(image_path.resolve())
     
     def _load_image(self, image_path: str) -> Optional[Image.Image]:
-        """从路径加载图片"""
+        """从路径加载图片。失败时仅打 DEBUG，因上层可能通过 fallback（SQLite/视频帧）再次加载。"""
         try:
             return Image.open(image_path)
         except Exception as e:
-            logger.error(f"Failed to load image from {image_path}: {e}")
+            logger.debug(f"Load image failed (may retry via fallback): {image_path}: {e}")
             return None
+
+    def _get_sqlite_storage(self):
+        """Lazy-load SQLite storage for resolving video-backed frames."""
+        if self._sqlite_storage is None:
+            from .sqlite_storage import SQLiteStorage
+            self._sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
+        return self._sqlite_storage
+
+    def _load_image_for_frame(self, frame_id: str, image_path: str) -> tuple[Optional[Image.Image], str]:
+        """
+        Load an image while tolerating stale temp-frame paths.
+
+        LanceDB may still contain a temp PNG path even after the authoritative
+        SQLite record has been updated to video_chunk/window_chunk storage.
+        """
+        resolved_path = image_path
+
+        if image_path.startswith("video_chunk:") or image_path.startswith("window_chunk:"):
+            sqlite_storage = self._get_sqlite_storage()
+            image = sqlite_storage.extract_frame_image(frame_id)
+            if image is not None:
+                return image, resolved_path
+
+        if os.path.exists(image_path):
+            try:
+                return Image.open(image_path), resolved_path
+            except Exception as e:
+                logger.error(f"Failed to load image from {image_path}: {e}")
+                return None, resolved_path
+
+        sqlite_storage = self._get_sqlite_storage()
+        try:
+            with sqlite_storage._connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT image_path FROM frames WHERE frame_id = ?", (frame_id,))
+                row = cursor.fetchone()
+
+            if row and row["image_path"]:
+                resolved_path = row["image_path"]
+                image = sqlite_storage.extract_frame_image(frame_id)
+                if image is not None:
+                    return image, resolved_path
+
+            sub_info = sqlite_storage.get_sub_frame_video_info(frame_id)
+            if sub_info and sub_info.get("window_chunk_id") is not None and sub_info.get("offset_index") is not None:
+                image = sqlite_storage.extract_sub_frame_image(frame_id)
+                if image is not None:
+                    resolved_path = f"window_chunk:{sub_info['window_chunk_id']}:{sub_info['offset_index']}"
+                    return image, resolved_path
+        except Exception as e:
+            logger.debug(f"Failed to resolve image path for {frame_id}: {e}")
+
+        logger.debug(f"Image path is stale or unavailable for {frame_id}: {image_path}")
+        return None, resolved_path
     
     def store_frame(
         self, 
@@ -123,26 +178,40 @@ class LanceDBStorage:
         image: Image.Image,
         embedding: List[float],
         ocr_text: str = "",
-        metadata: dict = None
+        metadata: dict = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
         存储一帧：图片 + embedding + 元数据
         
         注意：如果 frame_id 已存在，会先删除旧记录再插入新记录（避免重复）
         注意：建议使用 store_frames_batch 进行批量插入以提高性能并减少版本数量
+        
+        Args:
+            frame_id: 帧ID
+            timestamp: 时间戳
+            image: 图片
+            embedding: 向量
+            ocr_text: OCR文本
+            metadata: 元数据
+            app_name: 应用名称（frame 为 None，sub_frame 填写）
+            window_name: 窗口名称（frame 为 None，sub_frame 填写）
         """
         try:
             # 保存图片
             image_path = self._save_image(image, frame_id)
             
-            # 准备数据
+            # 准备数据（包含 app_name 和 window_name）
             data = [{
                 "frame_id": frame_id,
                 "timestamp": timestamp.isoformat(),
                 "image_path": image_path,
                 "vector": embedding,  # LanceDB的embedding列
                 "ocr_text": ocr_text or "",
-                "metadata": str(metadata or {})
+                "metadata": str(metadata or {}),
+                "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
             }]
             
             # 插入到LanceDB
@@ -187,6 +256,8 @@ class LanceDBStorage:
                 - embedding: List[float]
                 - ocr_text: str (可选)
                 - metadata: dict (可选)
+                - app_name: str (可选，frame 为 None，sub_frame 填写)
+                - window_name: str (可选，frame 为 None，sub_frame 填写)
         
         Returns:
             bool: 是否成功
@@ -214,14 +285,19 @@ class LanceDBStorage:
                 else:
                     image_path = self._save_image(image, frame_id)
                 
-                # 准备数据
+                # 准备数据（包含 app_name 和 window_name 用于筛选）
+                app_name = frame.get("app_name")  # frame 为 None，sub_frame 填写
+                window_name = frame.get("window_name")  # frame 为 None，sub_frame 填写
+                
                 data_list.append({
                     "frame_id": frame_id,
                     "timestamp": timestamp.isoformat(),
                     "image_path": image_path,
                     "vector": embedding,
                     "ocr_text": ocr_text or "",
-                    "metadata": str(metadata or {})
+                    "metadata": str(metadata or {}),
+                    "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                    "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
                 })
                 frame_ids_to_check.append(frame_id)
             
@@ -272,22 +348,31 @@ class LanceDBStorage:
         query_embedding: List[float], 
         top_k: int = 5,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None,
+        window_filters: Optional[Dict[str, Dict[str, List[str]]]] = None,
     ) -> List[Dict]:
         """
-        向量搜索：根据query embedding找到最相关的图片（支持时间范围过滤）
+        向量搜索：根据query embedding找到最相关的图片（支持时间范围和应用/窗口过滤）
         
         Args:
             query_embedding: 查询向量
             top_k: 返回数量
             start_time: 开始时间（可选，用于 Pre-filtering）
             end_time: 结束时间（可选，用于 Pre-filtering）
+            app_name: 应用名称过滤（可选，精确匹配）
+            window_name: 窗口名称过滤（可选，精确匹配）
+            related_apps: 相关应用列表（可选，用于过滤）
+            unrelated_apps: 不相关应用列表（可选，用于排除）
         
         Returns:
-            List of dicts containing: frame_id, timestamp, image_path, similarity, ocr_text
+            List of dicts containing: frame_id, timestamp, image_path, similarity, ocr_text, app_name, window_name
         
         Note:
-            使用 LanceDB 的 Pre-filtering 功能，在向量搜索时直接过滤时间范围，
+            使用 LanceDB 的 Pre-filtering 功能，在向量搜索时直接过滤条件，
             比先搜索再过滤或先过滤再搜索更高效。
         """
         try:
@@ -298,21 +383,93 @@ class LanceDBStorage:
             # 构建搜索查询
             search_query = self.table.search(query_embedding)
             
-            # 如果有时间范围，使用 Pre-filtering（LanceDB 原生支持）
-            if start_time is not None or end_time is not None:
-                # 构建 where 条件（timestamp 存储为 ISO 格式字符串）
-                conditions = []
-                if start_time is not None:
-                    start_iso = start_time.isoformat()
-                    conditions.append(f"timestamp >= '{start_iso}'")
-                if end_time is not None:
-                    end_iso = end_time.isoformat()
-                    conditions.append(f"timestamp <= '{end_iso}'")
-                
-                if conditions:
-                    where_clause = " AND ".join(conditions)
-                    search_query = search_query.where(where_clause)
-                    logger.debug(f"Applying time filter: {where_clause}")
+            # 构建 where 条件（支持时间、app_name、window_name 过滤）
+            conditions = []
+            
+            # 时间范围过滤
+            if start_time is not None:
+                start_iso = start_time.isoformat()
+                conditions.append(f"timestamp >= '{start_iso}'")
+            if end_time is not None:
+                end_iso = end_time.isoformat()
+                conditions.append(f"timestamp <= '{end_iso}'")
+            
+            # 应用名称过滤
+            if app_name is not None and app_name != "":
+                # 转义单引号，防止 SQL 注入
+                app_name_escaped = app_name.replace("'", "''")
+                conditions.append(f"app_name = '{app_name_escaped}'")
+            
+            # 窗口名称过滤
+            if window_name is not None and window_name != "":
+                # 转义单引号，防止 SQL 注入
+                window_name_escaped = window_name.replace("'", "''")
+                conditions.append(f"window_name = '{window_name_escaped}'")
+
+            # 处理 related_apps 和 unrelated_apps 过滤逻辑
+            has_include_windows = bool(window_filters and window_filters.get("include"))
+            if related_apps and not has_include_windows:
+                # 如果有相关应用且没有窗口级 include，只搜索这些应用
+                escaped_apps = [app.replace("'", "''") for app in related_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps and not has_include_windows:
+                # 如果没有相关应用但有不相关应用，且没有窗口级 include，排除掉不相关应用
+                escaped_apps = [app.replace("'", "''") for app in unrelated_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
+
+            # 处理窗口级 include/exclude 过滤逻辑
+            if window_filters:
+                include_map = window_filters.get("include") or {}
+                exclude_map = window_filters.get("exclude") or {}
+
+                window_clauses = []
+
+                # 1) 如果有 include，则只保留这些 (app, window) 组合
+                if include_map:
+                    include_parts = []
+                    for app, wins in include_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            # 只有 app，没有指定 window，则表示该 app 下所有窗口
+                            include_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            include_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if include_parts:
+                        window_clauses.append("(" + " OR ".join(include_parts) + ")")
+
+                # 2) 如果没有 include 但有 exclude，则排除这些 (app, window) 组合
+                elif exclude_map:
+                    exclude_parts = []
+                    for app, wins in exclude_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            # 只有 app，没有指定 window，则排除该 app 下所有窗口
+                            exclude_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            exclude_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if exclude_parts:
+                        window_clauses.append("NOT (" + " OR ".join(exclude_parts) + ")")
+
+                if window_clauses:
+                    conditions.append(" AND ".join(window_clauses))
+            
+            # 应用 Pre-filtering
+            if conditions:
+                where_clause = " AND ".join(conditions)
+                search_query = search_query.where(where_clause)
+                logger.debug(f"Applying filters: {where_clause}")
             
             # 执行搜索
             results = search_query.limit(top_k).to_list()
@@ -320,14 +477,20 @@ class LanceDBStorage:
             # 解析结果
             found_frames = []
             for result in results:
+                image, resolved_path = self._load_image_for_frame(
+                    result["frame_id"],
+                    result["image_path"],
+                )
                 frame_data = {
                     "frame_id": result["frame_id"],
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
-                    "image_path": result["image_path"],
+                    "image_path": resolved_path,
                     "distance": result.get("_distance", 0),  # LanceDB的距离（越小越相似）
-                    "ocr_text": result["ocr_text"],
-                    "image": self._load_image(result["image_path"]),
-                    "metadata": result.get("metadata", {})
+                    "ocr_text": result.get("ocr_text", ""),
+                    "image": image,
+                    "metadata": result.get("metadata", {}),
+                    "app_name": result.get("app_name", ""),  # 应用名称
+                    "window_name": result.get("window_name", ""),  # 窗口名称
                 }
                 found_frames.append(frame_data)
             
@@ -344,7 +507,9 @@ class LanceDBStorage:
         timestamp: datetime,
         image_path: str,
         ocr_text: str,
-        text_embedding: List[float]
+        text_embedding: List[float],
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None
     ) -> bool:
         """
         存储 OCR 文本的 embedding
@@ -355,6 +520,8 @@ class LanceDBStorage:
             image_path: 图片路径
             ocr_text: OCR 文本内容
             text_embedding: OCR 文本的 CLIP embedding
+            app_name: 应用名称（可选，用于筛选）
+            window_name: 窗口名称（可选，用于筛选）
         """
         try:
             if not ocr_text or not ocr_text.strip():
@@ -366,7 +533,9 @@ class LanceDBStorage:
                 "timestamp": timestamp.isoformat(),
                 "image_path": image_path,
                 "ocr_text": ocr_text,
-                "vector": text_embedding
+                "vector": text_embedding,
+                "app_name": app_name if app_name is not None else "",  # 标量字段，支持筛选
+                "window_name": window_name if window_name is not None else "",  # 标量字段，支持筛选
             }]
             
             if self.ocr_table is None:
@@ -387,19 +556,28 @@ class LanceDBStorage:
         query_embedding: List[float], 
         top_k: int = 10,
         start_time: Optional[datetime] = None,
-        end_time: Optional[datetime] = None
+        end_time: Optional[datetime] = None,
+        app_name: Optional[str] = None,
+        window_name: Optional[str] = None,
+        related_apps: Optional[List[str]] = None,
+        unrelated_apps: Optional[List[str]] = None,
+        window_filters: Optional[Dict[str, Dict[str, List[str]]]] = None,
     ) -> List[Dict]:
         """
-        搜索 OCR 文本 embedding（支持时间范围过滤）
+        搜索 OCR 文本 embedding（支持时间范围和应用/窗口过滤）
         
         Args:
             query_embedding: 查询文本的 CLIP embedding
             top_k: 返回数量
             start_time: 开始时间（可选，用于 Pre-filtering）
             end_time: 结束时间（可选，用于 Pre-filtering）
+            app_name: 应用名称过滤（可选，精确匹配）
+            window_name: 窗口名称过滤（可选，精确匹配）
+            related_apps: 相关应用列表（可选）
+            unrelated_apps: 不相关应用列表（可选）
             
         Returns:
-            相关帧列表，包含 frame_id, timestamp, image_path, ocr_text, distance
+            相关帧列表，包含 frame_id, timestamp, image_path, ocr_text, distance, app_name, window_name
         """
         try:
             if self.ocr_table is None:
@@ -409,32 +587,104 @@ class LanceDBStorage:
             # 构建搜索查询
             search_query = self.ocr_table.search(query_embedding)
             
-            # 如果有时间范围，使用 Pre-filtering
-            if start_time is not None or end_time is not None:
-                conditions = []
-                if start_time is not None:
-                    start_iso = start_time.isoformat()
-                    conditions.append(f"timestamp >= '{start_iso}'")
-                if end_time is not None:
-                    end_iso = end_time.isoformat()
-                    conditions.append(f"timestamp <= '{end_iso}'")
-                
-                if conditions:
-                    where_clause = " AND ".join(conditions)
-                    search_query = search_query.where(where_clause)
-                    logger.debug(f"Applying time filter to OCR search: {where_clause}")
+            # 构建 where 条件（支持时间、app_name、window_name 过滤）
+            conditions = []
+            
+            # 时间范围过滤
+            if start_time is not None:
+                start_iso = start_time.isoformat()
+                conditions.append(f"timestamp >= '{start_iso}'")
+            if end_time is not None:
+                end_iso = end_time.isoformat()
+                conditions.append(f"timestamp <= '{end_iso}'")
+            
+            # 应用名称过滤（如果 OCR 表有该字段）
+            if app_name is not None and app_name != "":
+                app_name_escaped = app_name.replace("'", "''")
+                conditions.append(f"app_name = '{app_name_escaped}'")
+            
+            # 窗口名称过滤（如果 OCR 表有该字段）
+            if window_name is not None and window_name != "":
+                window_name_escaped = window_name.replace("'", "''")
+                conditions.append(f"window_name = '{window_name_escaped}'")
+
+            # 处理 related_apps 和 unrelated_apps 过滤逻辑
+            has_include_windows = bool(window_filters and window_filters.get("include"))
+            if related_apps and not has_include_windows:
+                escaped_apps = [app.replace("'", "''") for app in related_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
+                conditions.append(f"app_name IN ({app_list_str})")
+            elif unrelated_apps and not has_include_windows:
+                escaped_apps = [app.replace("'", "''") for app in unrelated_apps]
+                app_list_str = ", ".join([f"'{app}'" for app in escaped_apps])
+                conditions.append(f"app_name NOT IN ({app_list_str})")
+
+            # 处理窗口级 include/exclude 过滤逻辑
+            if window_filters:
+                include_map = window_filters.get("include") or {}
+                exclude_map = window_filters.get("exclude") or {}
+
+                window_clauses = []
+
+                # 1) 如果有 include，则只保留这些 (app, window) 组合
+                if include_map:
+                    include_parts = []
+                    for app, wins in include_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            include_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            include_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if include_parts:
+                        window_clauses.append("(" + " OR ".join(include_parts) + ")")
+
+                # 2) 如果没有 include 但有 exclude，则排除这些 (app, window) 组合
+                elif exclude_map:
+                    exclude_parts = []
+                    for app, wins in exclude_map.items():
+                        if not app:
+                            continue
+                        app_escaped = app.replace("'", "''")
+                        wins = [w for w in (wins or []) if w]
+                        if not wins:
+                            exclude_parts.append(f"(app_name = '{app_escaped}')")
+                        else:
+                            escaped_wins = [w.replace("'", "''") for w in wins]
+                            win_list_str = ", ".join([f"'{w}'" for w in escaped_wins])
+                            exclude_parts.append(f"(app_name = '{app_escaped}' AND window_name IN ({win_list_str}))")
+                    if exclude_parts:
+                        window_clauses.append("NOT (" + " OR ".join(exclude_parts) + ")")
+
+                if window_clauses:
+                    conditions.append(" AND ".join(window_clauses))
+            
+            if conditions:
+                where_clause = " AND ".join(conditions)
+                search_query = search_query.where(where_clause)
+                logger.debug(f"Applying filters to OCR search: {where_clause}")
             
             results = search_query.limit(top_k).to_list()
             
             found_frames = []
             for result in results:
+                image, resolved_path = self._load_image_for_frame(
+                    result["frame_id"],
+                    result["image_path"],
+                )
                 frame_data = {
                     "frame_id": result["frame_id"],
                     "timestamp": datetime.fromisoformat(result["timestamp"]),
-                    "image_path": result["image_path"],
-                    "ocr_text": result["ocr_text"],
+                    "image_path": resolved_path,
+                    "ocr_text": result.get("ocr_text", ""),
                     "distance": result.get("_distance", 0),
-                    "image": self._load_image(result["image_path"])
+                    "image": image,
+                    "app_name": result.get("app_name", ""),  # 应用名称
+                    "window_name": result.get("window_name", ""),  # 窗口名称
                 }
                 found_frames.append(frame_data)
             

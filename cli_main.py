@@ -5,7 +5,7 @@ VisualMem Command Line Interface (for remote/no-GUI scenarios)
 
 Interactive steps:
 1) Select retrieval source: 0=Semantic/Vector retrieval, 1=OCR full-text retrieval
-2) Select work mode: 0=RAG (full database retrieval), 1=Real-time Q&A
+2) Select query scope: 0=Global query (full database), 1=Last 5 minutes query
 3) Enter query text
 
 System resource status will be displayed at startup for remote machine monitoring.
@@ -16,15 +16,36 @@ import sys
 import shutil
 import threading
 import asyncio
+import argparse
+import importlib.util
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+
+def _bootstrap_env_from_cli() -> str:
+    """
+    Parse --env-file before importing config.
+    This ensures config.py loads the intended env file.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--env-file",
+        default=".env",
+        help="Path to environment file (default: .env)",
+    )
+    args, remaining = parser.parse_known_args()
+    os.environ["VISUALMEM_ENV_FILE"] = args.env_file
+    sys.argv = [sys.argv[0], *remaining]
+    return args.env_file
+
+
+_SELECTED_ENV_FILE = _bootstrap_env_from_cli()
 
 from config import config
 from utils.logger import setup_logger
 from core.understand.api_vlm import ApiVLM
 from core.storage.sqlite_storage import SQLiteStorage
-from gui.workers.record_worker import RecordWorker
 from core.retrieval.query_llm_utils import (
     rewrite_and_time,
     filter_by_time,
@@ -58,6 +79,22 @@ try:
     from core.ocr.paddleocr_worker import PaddleOCRWorker
 except Exception:
     PaddleOCRWorker = None  # type: ignore
+
+try:
+    from gui.workers.record_worker import RecordWorker
+except Exception:
+    # Fallback: load record_worker.py directly to avoid package-level import errors.
+    try:
+        _record_worker_path = Path(__file__).resolve().parent / "gui" / "workers" / "record_worker.py"
+        _record_spec = importlib.util.spec_from_file_location("cli_record_worker_module", _record_worker_path)
+        if _record_spec and _record_spec.loader:
+            _record_module = importlib.util.module_from_spec(_record_spec)
+            _record_spec.loader.exec_module(_record_module)
+            RecordWorker = getattr(_record_module, "RecordWorker", None)  # type: ignore
+        else:
+            RecordWorker = None  # type: ignore
+    except Exception:
+        RecordWorker = None  # type: ignore
 
 # Recording state
 _record_worker: Optional[RecordWorker] = None
@@ -120,6 +157,7 @@ def _print_system_status():
     print("=" * 60)
     print("System Status:")
     print("-" * 60)
+    print(f"Env File: {_SELECTED_ENV_FILE}")
     # Actually don't need to print CPU status, it's not the heaviest load
     # if psutil:
     #     cpu = psutil.cpu_percent(interval=0.2)
@@ -152,6 +190,47 @@ def _prompt_binary(msg: str) -> int:
         print("Please enter 0 or 1")
 
 
+def _get_recent_time_range(minutes: int = 5) -> Tuple[datetime, datetime]:
+    """Get UTC time range for recent N minutes"""
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=minutes)
+    return start_time, end_time
+
+
+def _merge_time_range(
+    explicit_start: Optional[datetime],
+    explicit_end: Optional[datetime],
+    llm_time_range: Optional[Tuple[datetime, datetime]],
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    Merge explicit time range and LLM-inferred time range.
+    Rule mirrors backend: intersection when both exist.
+    """
+    start_time = explicit_start
+    end_time = explicit_end
+
+    if llm_time_range is None:
+        return start_time, end_time
+
+    llm_start, llm_end = llm_time_range
+
+    if explicit_start and llm_start:
+        start_time = max(explicit_start, llm_start)
+    elif llm_start:
+        start_time = llm_start
+
+    if explicit_end and llm_end:
+        end_time = min(explicit_end, llm_end)
+    elif llm_end:
+        end_time = llm_end
+
+    if start_time and end_time and start_time > end_time:
+        if explicit_start or explicit_end:
+            return explicit_start, explicit_end
+        return llm_start, llm_end
+    return start_time, end_time
+
+
 def _prompt_query() -> str:
     """Read a query, empty line continues waiting, q/quit/exit exits loop; supports start/stop to control recording"""
     query = input("Please enter your query : ").strip()
@@ -180,12 +259,18 @@ def _ensure_vector_components():
     print(f"Encoder model {config.EMBEDDING_MODEL} loaded")
 
 
-def _vector_rag(query: str, top_k: int = None):
+def _vector_rag(
+    query: str,
+    top_k: int = None,
+    explicit_start: Optional[datetime] = None,
+    explicit_end: Optional[datetime] = None,
+    mode_label: str = "Semantic Retrieval -> Global Query (Full Database)",
+):
     """Semantic/Vector RAG: Full database retrieval (reuses GUI's time filtering logic)"""
     _ensure_vector_components()
     if top_k is None:
         top_k = config.MAX_IMAGES_TO_LOAD
-    print("Mode: Semantic Retrieval -> RAG (Full Database Vector Retrieval)")
+    print(f"Mode: {mode_label}")
 
     # Reuse initialized encoder and storage
     if _vector_encoder is None or _vector_storage is None:
@@ -209,6 +294,13 @@ def _vector_rag(query: str, top_k: int = None):
         print(f"sparse_queries: {sparse_queries}")
         print(f"time_range: {time_range}")
 
+<<<<<<< HEAD
+    # Merge explicit time range and LLM time range
+    start_time, end_time = _merge_time_range(explicit_start, explicit_end, time_range)
+    if start_time or end_time:
+        print(f"⏰ Time Range: {start_time} - {end_time}")
+        print("🔍 Using LanceDB Pre-filtering for vector retrieval...")
+=======
     # Extract time range (for LanceDB Pre-filtering)
     start_time = None
     end_time = None
@@ -216,6 +308,7 @@ def _vector_rag(query: str, top_k: int = None):
         start_time, end_time = time_range
         print(f"Time Range: {start_time} - {end_time}")
         print("Using LanceDB Pre-filtering for vector retrieval...")
+>>>>>>> main
 
     # Define helper function: Dense search
     def _dense_search_task():
@@ -398,9 +491,15 @@ Please directly answer the user's question first, then provide supporting eviden
     print(response)
 
 
-def _ocr_rag(query: str, limit: int = 20):
+def _ocr_rag(
+    query: str,
+    limit: int = 20,
+    explicit_start: Optional[datetime] = None,
+    explicit_end: Optional[datetime] = None,
+    mode_label: str = "OCR Full-text Retrieval -> Global Query",
+):
     """OCR Full-text RAG: Default full database, no time range filtering"""
-    print("Mode: OCR Full-text Retrieval -> Text Understanding")
+    print(f"Mode: {mode_label}")
     sqlite_storage = SQLiteStorage(db_path=config.OCR_DB_PATH)
 
     time_range = None
@@ -413,9 +512,14 @@ def _ocr_rag(query: str, limit: int = 20):
             expand_n=config.QUERY_REWRITE_NUM,
         )
 
+    merged_start, merged_end = _merge_time_range(explicit_start, explicit_end, time_range)
+
     results = sqlite_storage.search_text(query, limit=limit)
-    if time_range:
-        results = filter_by_time(results, time_range)
+    if merged_start or merged_end:
+        # filter_by_time requires a tuple; fill missing bound if needed
+        lower = merged_start or datetime.min.replace(tzinfo=timezone.utc)
+        upper = merged_end or datetime.max.replace(tzinfo=timezone.utc)
+        results = filter_by_time(results, (lower, upper))
     if not results:
         print("No relevant OCR text found.")
         return
@@ -572,6 +676,9 @@ Current and Historical Screen OCR Text:
 def _start_recording():
     """Start background recording thread"""
     global _record_worker, _record_thread
+    if RecordWorker is None:
+        print("Recording module unavailable in current environment (missing GUI dependencies).")
+        return
     with _record_lock:
         if _record_thread and _record_thread.is_alive():
             print("Recording is already in progress, enter stop to stop.")
@@ -613,8 +720,8 @@ def main():
     print("Select retrieval source: 0=Semantic/Vector retrieval  1=OCR full-text retrieval")
     source_choice = _prompt_binary("Please enter choice")
     
-    print("Select work mode: 0=RAG (full database)  1=Real-time Q&A")
-    mode_choice = _prompt_binary("Please enter choice")
+    print("Select query scope: 0=Global query (full database)  1=Last 5 minutes query")
+    scope_choice = _prompt_binary("Please enter choice")
     
     print("\n" + "=" * 70)
     print("User Guide:")
@@ -639,15 +746,28 @@ def main():
             if query.lower() == "stop":
                 _stop_recording()
                 continue
-            
-            if source_choice == 0 and mode_choice == 0:
-                _vector_rag(query)
-            elif source_choice == 0 and mode_choice == 1:
-                _realtime_visual(query)
-            elif source_choice == 1 and mode_choice == 0:
-                _ocr_rag(query)
+
+            explicit_start = None
+            explicit_end = None
+            mode_label = "Global Query (Full Database)"
+            if scope_choice == 1:
+                explicit_start, explicit_end = _get_recent_time_range(minutes=5)
+                mode_label = "Last 5 Minutes Query"
+
+            if source_choice == 0:
+                _vector_rag(
+                    query,
+                    explicit_start=explicit_start,
+                    explicit_end=explicit_end,
+                    mode_label=f"Semantic Retrieval -> {mode_label}",
+                )
             else:
-                _realtime_ocr(query)
+                _ocr_rag(
+                    query,
+                    explicit_start=explicit_start,
+                    explicit_end=explicit_end,
+                    mode_label=f"OCR Full-text Retrieval -> {mode_label}",
+                )
             print(f"="*70)
             print("query answered, you can continue asking other questions")
             print(f"="*70)

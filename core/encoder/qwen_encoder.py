@@ -82,3 +82,27 @@ class QwenEncoder(MultiModalEncoderInterface):
         embeddings = self.model.process(inputs)
         embeddings = embeddings / embeddings.norm(dim=-1, keepdim=True)
         return embeddings.detach().cpu().to(torch.float32).numpy().tolist()
+
+    def clear(self):
+        """释放模型资源"""
+        logger.info(f"Releasing QwenEncoder model: {self.model_name}")
+        # 释放内部 embedder
+        if hasattr(self.model, 'model'):
+            self.model.model = None
+        if hasattr(self.model, 'processor'):
+            self.model.processor = None
+        self.model = None
+        
+        import gc
+        gc.collect()
+        
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                if hasattr(torch.mps, 'empty_cache'):
+                    torch.mps.empty_cache()
+        except Exception:
+            pass
+        logger.info("QwenEncoder released.")

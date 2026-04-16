@@ -1,6 +1,6 @@
 /venv/*
 *.pyc
-logs/*.log
+logs/*
 *.db
 *.tnx
 /visualmem_storage/*
@@ -9,6 +9,33 @@ logs/*.log
 .env
 .DS_Store
 **/.DS_Store
+<<<<<<< HEAD
+*.json
+screencap_rs/target/
+*.mp4
+.codex/*
+benchmark_output/*
+.env-test
+AGENTS.md
+findings.md
+task_plan.md
+progress.md
+agent-sync.md
+
+/graduate_design_docs/*
+/ocr_compare_output/*
+*.pt
+/cluster_output/*
+db_browser_*
+/.claude/*
+CLAUDE.md
+claude_features.md
+/docs/data_platform_api_design.md
+/docs/clustering_feature.md
+clustering_flow*
+Gemini*
+=======
 /screencap_rs/target/*
 *.json
 *.mp4
+>>>>>>> main
