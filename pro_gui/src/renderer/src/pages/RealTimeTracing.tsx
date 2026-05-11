@@ -1,8 +1,10 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { apiClient, FrameResult } from '../services/api'
 import { useAppStore } from '../store/AppStore'
 import ImagePreview from '../components/ImagePreview'
 import MarkdownRenderer from '../components/MarkdownRenderer'
+
+const FIVE_MINUTES_MS = 5 * 60 * 1000
 
 const ITEM_WIDTH = 200
 
@@ -52,7 +54,7 @@ const FrameGroupItem = ({
           src={getImageUrl(mainFrame.image_path)}
           alt={`Frame ${mainFrame.frame_id}`}
           loading="lazy"
-          style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer', backgroundColor: '#1a1a1a', border: '1px solid var(--border-dim)' }}
+          style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer', backgroundColor: 'var(--image-placeholder)', border: '1px solid var(--border-dim)' }}
           onClick={() => onPreview(getImageUrl(mainFrame.image_path), formatTimestamp(mainFrame.timestamp))}
         />
       )}
@@ -66,7 +68,7 @@ const FrameGroupItem = ({
           display: 'flex', 
           gap: '4px',
           padding: '4px',
-          background: 'rgba(0,0,0,0.6)',
+          background: 'var(--thumb-strip-bg)',
           borderRadius: '4px',
           backdropFilter: 'blur(4px)',
           maxWidth: '90%',
@@ -85,8 +87,8 @@ const FrameGroupItem = ({
                   objectFit: 'cover', 
                   borderRadius: '2px', 
                   cursor: 'pointer', 
-                  border: '1px solid rgba(255,255,255,0.8)',
-                  boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+                  border: '1px solid var(--thumb-border)',
+                  boxShadow: 'var(--shadow-thumbnail)',
                   flexShrink: 0
                 }}
                 onClick={(e) => {
@@ -108,24 +110,35 @@ const FrameGroupItem = ({
 };
 
 const RealTimeTracing: React.FC = () => {
-  const [frames, setFrames] = useState<FrameResult[]>([])
-  const [projectRoot, setProjectRoot] = useState<string | null>(null)
+  // 两条数据源合并：
+  // 1. `/api/recent_frames` 轮询（SQLite 里的已持久化帧，含完整 sub_frames）
+  // 2. `recording-frame-stored` 实时事件（刚捕获、尚未落库的快路径帧）
+  // 合并后去重并按 5 分钟窗口裁剪。没有这一条 live bus，录制初期或者
+  // BatchWriteBuffer 尚未 flush 时，整个面板会一张图都没有。
+  const [dbFrames, setDbFrames] = useState<FrameResult[]>([])
+  const [liveFrames, setLiveFrames] = useState<FrameResult[]>([])
+  const [, setProjectRoot] = useState<string | null>(null)
   const [previewImage, setPreviewImage] = useState<{ url: string; timestamp: string } | null>(null)
-  
+
   const { realtimeSearchResult, currentView } = useAppStore()
 
-  const fetchRecentFrames = async () => {
+  const liveFramesRef = useRef<FrameResult[]>([])
+  useEffect(() => {
+    liveFramesRef.current = liveFrames
+  }, [liveFrames])
+
+  const fetchRecentFrames = useCallback(async () => {
     try {
       const data = await apiClient.getRecentFrames(5)
       const sortedFrames = (data.frames || []).sort((a: any, b: any) =>
         new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       )
-      setFrames(sortedFrames)
+      setDbFrames(sortedFrames)
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       console.error('Failed to fetch recent frames:', error)
     }
-  }
+  }, [])
 
   const formatTimestamp = (timestamp: string): string => {
     try {
@@ -162,12 +175,58 @@ const RealTimeTracing: React.FC = () => {
     }
     window.addEventListener('recording-data-refreshed', handleRecordingRefreshed)
 
+    // 实时追加：快路径每 3s 派发一次，把这些帧加进 liveFrames（5 分钟窗口内）。
+    // 这样录制刚开始、BatchWriteBuffer 还没 flush 的几十秒也不会空白。
+    const handleFrameStored = (event: Event) => {
+      const custom = event as CustomEvent
+      const frame = custom.detail?.frame as FrameResult | undefined
+      if (!frame || !frame.image_path) return
+      const cutoff = Date.now() - FIVE_MINUTES_MS
+      setLiveFrames(prev => {
+        if (prev.some(f => f.frame_id === frame.frame_id)) return prev
+        const next = [...prev, frame].filter(f => {
+          const t = new Date(f.timestamp).getTime()
+          return !Number.isNaN(t) && t >= cutoff
+        })
+        return next
+      })
+    }
+    window.addEventListener('recording-frame-stored', handleFrameStored)
+
+    // 每秒修剪一次 5 分钟外的 live 帧，防止停止录制后一直留在面板上
+    const trimInterval = setInterval(() => {
+      const cutoff = Date.now() - FIVE_MINUTES_MS
+      if (liveFramesRef.current.length === 0) return
+      const trimmed = liveFramesRef.current.filter(f => {
+        const t = new Date(f.timestamp).getTime()
+        return !Number.isNaN(t) && t >= cutoff
+      })
+      if (trimmed.length !== liveFramesRef.current.length) {
+        setLiveFrames(trimmed)
+      }
+    }, 1000)
+
     return () => {
       clearInterval(interval)
+      clearInterval(trimInterval)
       window.removeEventListener('recording-data-refreshed', handleRecordingRefreshed)
+      window.removeEventListener('recording-frame-stored', handleFrameStored)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [fetchRecentFrames])
+
+  // 合并两条来源并去重；以 frame_id 为主键，优先取 dbFrames（有完整 sub_frames）
+  const frames: FrameResult[] = React.useMemo(() => {
+    const map = new Map<string, FrameResult>()
+    for (const f of liveFrames) {
+      if (f.frame_id) map.set(f.frame_id, f)
+    }
+    for (const f of dbFrames) {
+      if (f.frame_id) map.set(f.frame_id, f)
+    }
+    return Array.from(map.values()).sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    )
+  }, [dbFrames, liveFrames])
 
   const getImageUrl = (path?: string) => {
     if (!path) return ''

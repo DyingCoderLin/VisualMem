@@ -1,45 +1,137 @@
 /* theme.css - VisualMem 设计系统 */
 
-:root {
-  /* ---------- Color Palette (基于设计稿) ---------- */
-  /* 背景色 */
-  --bg-app: #121212;          /* 整个应用的最底层背景 */
-  --bg-panel: #1A1A1A;        /* 侧边栏、顶部栏、卡片的背景 */
-  --bg-panel-hover: #252525;  /* 卡片悬停时的背景 */
-  --bg-input: #2A2A2A;        /* 搜索框背景 */
-  --bg-scrollbar-track: #1a1a1a; /* 滚动条轨道背景 */
-  --bg-scrollbar-thumb: #333333; /* 滚动条滑块背景 */
-  
-  /* 强调色 (赛博黄) */
-  --accent-primary: #FFD700;  /* 核心高亮色：Logo，按钮，选中状态，边框 */
-  --accent-glow: rgba(255, 215, 0, 0.15); /* AI面板的辉光效果 */
-  
-  /* 文本色 */
-  --text-primary: #FFFFFF;    /* 主要文字 */
-  --text-secondary: #A0A0A0;  /* 次要文字、未选中状态 */
-  --text-accent: var(--accent-primary); /* 强调文字 */
-  --text-placeholder: #555555; /* 输入框占位符 */
-  
-  /* 边框色 */
-  --border-dim: #333333;      /* 分割线，普通边框 */
-  --border-accent: var(--accent-primary); /* 高亮边框 */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* ---------- Color Palette: dark / black-yellow ---------- */
+  --bg-app: #121212;
+  --bg-panel: #1a1a1a;
+  --bg-panel-hover: #252525;
+  --bg-input: #2a2a2a;
+  --bg-primary: var(--bg-panel);
+  --bg-secondary: #161616;
+  --bg-accent: #ffd700;
+  --bg-scrollbar-track: #1a1a1a;
+  --bg-scrollbar-thumb: #333333;
+
+  --accent-primary: #ffd700;
+  --accent-primary-hover: #ffc700;
+  --accent-glow: rgba(255, 215, 0, 0.15);
+  --accent-soft: rgba(255, 215, 0, 0.07);
+  --accent-hover-bg: rgba(255, 215, 0, 0.1);
+  --accent-hover-border: rgba(255, 215, 0, 0.5);
+  --accent-gradient-end: rgba(255, 215, 0, 0.75);
+
+  --text-primary: #ffffff;
+  --text-secondary: #a0a0a0;
+  --text-accent: var(--accent-primary);
+  --text-placeholder: #555555;
+  --text-on-accent: #121212;
+
+  --border-dim: #333333;
+  --border-accent: var(--accent-primary);
+  --focus-ring: rgba(255, 215, 0, 0.28);
+
+  --panel-highlight-border: var(--accent-primary);
+  --panel-highlight-shadow: 0 0 20px var(--accent-glow) inset, 0 0 10px var(--accent-glow);
+  --shadow-elevated: 0 4px 20px rgba(0, 0, 0, 0.5);
+  --shadow-card-hover: 0 4px 12px rgba(0, 0, 0, 0.2);
+  --shadow-thumbnail: 0 2px 4px rgba(0, 0, 0, 0.5);
+
+  --overlay-preview: rgba(0, 0, 0, 0.85);
+  --overlay-control-bg: rgba(0, 0, 0, 0.5);
+  --overlay-control-hover: rgba(255, 255, 255, 0.2);
+  --overlay-control-border: rgba(255, 255, 255, 0.2);
+  --overlay-timestamp-bg: rgba(0, 0, 0, 0.6);
+  --overlay-loading: rgba(0, 0, 0, 0.3);
+  --overlay-text: #ffffff;
+
+  --image-placeholder: #1a1a1a;
+  --thumb-strip-bg: rgba(0, 0, 0, 0.6);
+  --thumb-border: rgba(255, 255, 255, 0.8);
+  --spinner-track: #333333;
+  --spinner-accent: var(--accent-primary);
+  --daily-panel-bg: rgba(0, 0, 0, 0.15);
+  --warning-border: rgba(255, 180, 0, 0.35);
+  --danger: #f87171;
+  --calendar-icon-filter: invert(0.8);
   
   /* ---------- Typography ---------- */
   --font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --font-size-sm: 12px;
   --font-size-base: 14px;
+  --font-size-md: 14px;
   --font-size-lg: 16px;
   --font-size-xl: 20px;
   
   /* ---------- Spacing & Radius ---------- */
-  --radius-sm: 8px;           /* 小组件圆角（如时间戳标签） */
-  --radius-md: 12px;          /* 标准组件圆角（如图片缩略图） */
-  --radius-lg: 16px;          /* 大容器圆角（如侧边栏、AI面板） */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 8px;
   
   --spacing-xs: 4px;
   --spacing-sm: 8px;
   --spacing-md: 16px;
   --spacing-lg: 24px;
+  --spacing-xl: 32px;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* ---------- Color Palette: light / Codex-inspired ---------- */
+  --bg-app: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-panel-hover: #f2f4f7;
+  --bg-input: #f7f8fb;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f7f8fb;
+  --bg-accent: #2563eb;
+  --bg-scrollbar-track: #eef1f5;
+  --bg-scrollbar-thumb: #c5ccd6;
+
+  --accent-primary: #2563eb;
+  --accent-primary-hover: #1d4ed8;
+  --accent-glow: rgba(37, 99, 235, 0.1);
+  --accent-soft: rgba(37, 99, 235, 0.08);
+  --accent-hover-bg: rgba(37, 99, 235, 0.1);
+  --accent-hover-border: rgba(37, 99, 235, 0.42);
+  --accent-gradient-end: rgba(96, 165, 250, 0.82);
+
+  --text-primary: #111827;
+  --text-secondary: #5f6b7a;
+  --text-accent: #1d4ed8;
+  --text-placeholder: #9aa4b2;
+  --text-on-accent: #ffffff;
+
+  --border-dim: #dfe3ea;
+  --border-accent: #93b4f4;
+  --focus-ring: rgba(37, 99, 235, 0.22);
+
+  --panel-highlight-border: #dfe3ea;
+  --panel-highlight-shadow: 0 16px 40px rgba(17, 24, 39, 0.08), 0 1px 2px rgba(17, 24, 39, 0.06);
+  --shadow-elevated: 0 16px 40px rgba(17, 24, 39, 0.08), 0 1px 2px rgba(17, 24, 39, 0.06);
+  --shadow-card-hover: 0 10px 24px rgba(17, 24, 39, 0.1);
+  --shadow-thumbnail: 0 8px 22px rgba(17, 24, 39, 0.16);
+
+  --overlay-preview: rgba(17, 24, 39, 0.72);
+  --overlay-control-bg: rgba(255, 255, 255, 0.88);
+  --overlay-control-hover: rgba(255, 255, 255, 1);
+  --overlay-control-border: rgba(17, 24, 39, 0.14);
+  --overlay-timestamp-bg: rgba(255, 255, 255, 0.9);
+  --overlay-loading: rgba(255, 255, 255, 0.68);
+  --overlay-text: #111827;
+
+  --image-placeholder: #eef1f5;
+  --thumb-strip-bg: rgba(255, 255, 255, 0.88);
+  --thumb-border: rgba(17, 24, 39, 0.18);
+  --spinner-track: #d9dee7;
+  --spinner-accent: var(--accent-primary);
+  --daily-panel-bg: #f8fafc;
+  --warning-border: rgba(217, 119, 6, 0.35);
+  --danger: #dc2626;
+  --calendar-icon-filter: none;
 }
 
 /* 全局 Reset */
@@ -82,9 +174,9 @@ body {
   color: var(--text-primary);
 }
 
-/* 选中状态：黄色文字 + 黄色左侧边条 */
+/* 选中状态：强调色文字 + 左侧边条 */
 .nav-item.active {
-  background-color: rgba(255, 215, 0, 0.05);
+  background-color: var(--accent-soft);
   color: var(--text-accent);
   border-left: 3px solid var(--accent-primary);
   padding-left: calc(var(--spacing-md) - 3px);
@@ -105,6 +197,7 @@ body {
 
 .search-input:focus {
   border-color: var(--accent-primary);
+  box-shadow: 0 0 0 3px var(--focus-ring);
 }
 
 .search-input::placeholder {
@@ -114,9 +207,8 @@ body {
 /* 3. AI 提取结果面板 (AI Extraction Panel) - 核心亮点 */
 .ai-panel-glow {
   background-color: var(--bg-panel);
-  border: 2px solid var(--accent-primary);
-  /* 关键：利用 box-shadow 实现辉光感 */
-  box-shadow: 0 0 20px var(--accent-glow) inset, 0 0 10px var(--accent-glow);
+  border: 1px solid var(--panel-highlight-border);
+  box-shadow: var(--panel-highlight-shadow);
   border-radius: var(--radius-lg);
   padding: var(--spacing-lg);
   margin-bottom: var(--spacing-lg);
@@ -154,7 +246,7 @@ body {
 
 /* 鼠标 hover 图片高亮 */
 .scroll-item img:hover {
-  border-color: rgba(255, 215, 0, 0.5);
+  border-color: var(--accent-hover-border);
 }
 
 .scroll-item.active img {
@@ -198,12 +290,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #555555;
+  background: var(--text-secondary);
 }
 
 /* AI 面板内的高亮滚动条 */
 .ai-panel-glow ::-webkit-scrollbar-thumb {
-  background: var(--accent-primary); /* 使用黄色滑块强调 */
+  background: var(--accent-primary);
 }
 
 /* 按钮样式 */
@@ -225,12 +317,13 @@ body {
 
 .btn-primary {
   background-color: var(--accent-primary);
-  color: var(--bg-app);
+  color: var(--text-on-accent);
   border-color: var(--accent-primary);
 }
 
 .btn-primary:hover {
-  background-color: #FFC700;
+  background-color: var(--accent-primary-hover);
+  border-color: var(--accent-primary-hover);
 }
 
 /* 切换按钮组 */
@@ -252,7 +345,6 @@ body {
 
 .toggle-btn.active {
   background-color: var(--accent-primary);
-  color: var(--bg-app);
+  color: var(--text-on-accent);
   border-color: var(--accent-primary);
 }
-

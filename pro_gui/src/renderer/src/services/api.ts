@@ -37,6 +37,12 @@ interface QueryRagResponse {
   frames: FrameResult[]
 }
 
+export type FrontendTheme = 'dark' | 'light'
+
+export interface FrontendConfigResponse {
+  theme: FrontendTheme
+}
+
 interface StatsResponse {
   total_frames: number
   disk_usage?: string
@@ -46,6 +52,13 @@ interface StatsResponse {
   capture_interval_seconds?: number  // 截屏间隔（秒）
   max_image_width?: number  // 最大图片宽度
   image_quality?: number  // 图片质量（1-100）
+  /** FrameEnrichmentWorker backlog (remote GUI throttling) */
+  enrichment_queue_depth?: number
+  enrichment_inflight?: number
+  /** queue_depth + inflight — preferred signal for capture backpressure */
+  enrichment_pipeline_depth?: number
+  enrichment_backpressure_high?: number
+  enrichment_backpressure_low?: number
 }
 
 class ApiClient {
@@ -58,7 +71,10 @@ class ApiClient {
   private async request<T>(
     endpoint: string,
     options: RequestInit = {},
-    timeoutMs: number = 30000  // 默认 30 秒超时
+    // 默认 60 秒超时。录制期间后端可能正在 drain enrichment worker + flush
+    // video / BatchWriteBuffer（上限 STOP_FLUSH_MAX_SECONDS，默认 30s），
+    // 期间其它 API 也会被轻度阻塞，30s 偏紧会触发 AbortError；60s 是安全冗余。
+    timeoutMs: number = 60000
   ): Promise<T> {
     const url = `${this.baseUrl}${endpoint}`
     
@@ -102,8 +118,14 @@ class ApiClient {
     }
   }
 
-  async getStats(): Promise<StatsResponse> {
-    return this.request<StatsResponse>('/api/stats')
+  async getStats(timeoutMs: number = 60000): Promise<StatsResponse> {
+    return this.request<StatsResponse>('/api/stats', {}, timeoutMs)
+  }
+
+  async getFrontendConfig(): Promise<FrontendConfigResponse> {
+    return this.request<FrontendConfigResponse>('/api/frontend_config', {
+      method: 'GET'
+    })
   }
 
   async loadModels(): Promise<{ status: string; message: string }> {
@@ -186,7 +208,8 @@ class ApiClient {
   async getFramesByDate(
     date: string,
     offset: number = 0,
-    limit: number = 50  // 可调整参数：每次加载的照片数量
+    limit: number = 50,  // 可调整参数：每次加载的照片数量
+    timeoutMs: number = 60000
   ): Promise<FrameResult[]> {
     // 获取某一天的照片（支持分页）
     return this.request<FrameResult[]>('/api/frames/date', {
@@ -196,7 +219,7 @@ class ApiClient {
         offset,
         limit
       })
-    })
+    }, timeoutMs)
   }
 
   async stopRecording(): Promise<{ status: string }> {
@@ -214,6 +237,7 @@ class ApiClient {
     image_base64: string
     monitor_id?: number
     metadata?: Record<string, any>
+    client_capture_ms?: number
     windows?: Array<{
       app_name: string
       window_name: string
@@ -225,12 +249,22 @@ class ApiClient {
     sub_frame_count?: number
     today_count?: number
     frame_summary?: FrameResult
+    enrichment_queue_depth?: number
+    enrichment_inflight?: number
+    enrichment_pipeline_depth?: number
+    enrichment_backpressure_high?: number
+    enrichment_backpressure_low?: number
   }> {
     // 存储帧到后端（支持窗口信息）
     // 使用更长的超时（120秒），因为后端需要做 embedding + OCR
     return this.request<{
       status: string; frame_id?: string; sub_frame_count?: number
       today_count?: number; frame_summary?: FrameResult
+      enrichment_queue_depth?: number
+      enrichment_inflight?: number
+      enrichment_pipeline_depth?: number
+      enrichment_backpressure_high?: number
+      enrichment_backpressure_low?: number
     }>(
       '/api/store_frame',
       {
@@ -283,4 +317,3 @@ class ApiClient {
 }
 
 export const apiClient = new ApiClient()
-

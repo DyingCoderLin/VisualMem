@@ -9,12 +9,14 @@ logs/*
 .env
 .DS_Store
 **/.DS_Store
-<<<<<<< HEAD
 *.json
 screencap_rs/target/
 *.mp4
 .codex/*
 benchmark_output/*
+test_storage/
+scripts/eval/output/
+logs/eval_*.jsonl
 .env-test
 AGENTS.md
 findings.md
@@ -34,8 +36,7 @@ claude_features.md
 /docs/clustering_feature.md
 clustering_flow*
 Gemini*
-=======
-/screencap_rs/target/*
-*.json
-*.mp4
->>>>>>> main
+/.cursor/*
+/visualmem_storage_exp52/*
+/visualmem_storage_exp54/*
+/scripts/eval/*

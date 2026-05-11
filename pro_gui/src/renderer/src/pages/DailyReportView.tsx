@@ -78,7 +78,15 @@ const DailyReportView: React.FC = () => {
   }, [])
 
   useEffect(() => {
-    refreshList().catch((e) => console.error('listDailyReports', e))
+    refreshList().catch((e) => {
+      // 录制停止时后端会阻塞 drain/flush，期间 listDailyReports 可能超时被 abort。
+      // 这是预期行为，UI 下次 focus 会再刷一次，不要把 AbortError 当成真实错误弹出。
+      if (e instanceof DOMException && e.name === 'AbortError') {
+        console.warn('[DailyReportView] listDailyReports aborted (likely during recording stop flush)')
+        return
+      }
+      console.error('listDailyReports', e)
+    })
   }, [refreshList])
 
   /** 仅当该日在列表中（磁盘上确有 JSON）时才请求详情，避免对「今天」无脑 GET 导致 404 */
@@ -109,6 +117,10 @@ const DailyReportView: React.FC = () => {
         if (!cancelled) setReport(data)
       } catch (e) {
         if (cancelled) return
+        if (e instanceof DOMException && e.name === 'AbortError') {
+          // 同 refreshList：录制停止期间后端短暂繁忙，静默即可
+          return
+        }
         setReport(null)
         setLoadError(e instanceof Error ? e.message : '加载失败')
       } finally {

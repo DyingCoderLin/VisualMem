@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React from 'react'
 import SearchBar, { SearchResult } from './SearchBar'
 
 interface TopBarProps {
@@ -14,4 +14,3 @@ const TopBar: React.FC<TopBarProps> = ({ onSearchResult }) => {
 }
 
 export default TopBar
-

@@ -7,13 +7,28 @@ connected component analysis, and contour hierarchy.
 """
 from typing import List, Tuple
 
-import cv2
 import numpy as np
 from PIL import Image
 
 from utils.logger import setup_logger
 
 logger = setup_logger(__name__)
+
+try:
+    import cv2
+except ImportError as e:
+    cv2 = None
+    _CV2_IMPORT_ERROR = e
+else:
+    _CV2_IMPORT_ERROR = None
+
+
+def _require_cv2() -> None:
+    if cv2 is None:
+        raise RuntimeError(
+            "UIED region detection requires OpenCV. Install `opencv-python-headless` "
+            "or disable ENABLE_UIED."
+        ) from _CV2_IMPORT_ERROR
 
 
 def _gradient_binarization(gray: np.ndarray, min_grad: int = 10) -> np.ndarray:
@@ -97,6 +112,7 @@ def _detect_regions(
     Returns:
         List of (x1, y1, x2, y2) bounding boxes
     """
+    _require_cv2()
     gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
     h, w = gray.shape
 
@@ -146,6 +162,7 @@ class UIEDRegionDetector:
         min_height: int = 20,
         merge_overlap_threshold: float = 0.5,
     ):
+        _require_cv2()
         self.min_grad = min_grad
         self.block_size = block_size
         self.min_area = min_area

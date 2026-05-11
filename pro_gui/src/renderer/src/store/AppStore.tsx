@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 import { apiClient } from '../services/api'
+import type { FrontendTheme } from '../services/api'
 import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
 
 export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings' | 'daily'
@@ -21,6 +22,9 @@ interface DateRange {
 }
 
 interface AppStoreContextType {
+  // Frontend theme
+  themeMode: FrontendTheme
+
   // Date range state
   dateRange: DateRange
   refreshDateRange: () => Promise<void>
@@ -50,6 +54,11 @@ interface AppStoreContextType {
 
 const AppStoreContext = createContext<AppStoreContextType | undefined>(undefined)
 
+function normalizeFrontendTheme(theme: unknown): FrontendTheme {
+  const normalized = typeof theme === 'string' ? theme.trim().toLowerCase() : ''
+  return normalized === 'light' ? 'light' : 'dark'
+}
+
 export const useAppStore = () => {
   const context = useContext(AppStoreContext)
   if (!context) {
@@ -63,6 +72,9 @@ interface AppStoreProviderProps {
 }
 
 export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) => {
+  const [themeMode, setThemeMode] = useState<FrontendTheme>(() =>
+    normalizeFrontendTheme(import.meta.env.VITE_VISUALMEM_THEME)
+  )
   const [dateRange, setDateRange] = useState<DateRange>({
     earliest_date: null,
     latest_date: null
@@ -74,6 +86,30 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = useState(0)
   const [currentView, setCurrentView] = useState<ViewType>('timeline')
   const [realtimeSearchResult, setRealtimeSearchResult] = useState<SearchResult | null>(null)
+
+  useEffect(() => {
+    const root = document.documentElement
+    root.dataset.theme = themeMode
+    root.style.colorScheme = themeMode
+  }, [themeMode])
+
+  useEffect(() => {
+    let cancelled = false
+    apiClient.getFrontendConfig()
+      .then((frontendConfig) => {
+        if (!cancelled) {
+          setThemeMode(normalizeFrontendTheme(frontendConfig.theme))
+        }
+      })
+      .catch((error) => {
+        if (error instanceof DOMException && error.name === 'AbortError') return
+        console.warn('Failed to fetch frontend config, using bundled theme fallback:', error)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // 设置录制模式
   const setRecordingMode = useCallback((mode: RecordingMode) => {
@@ -99,6 +135,18 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   // 刷新时间轴
   const refreshTimeline = useCallback(() => {
     setTimelineRefreshTrigger(prev => prev + 1)
+  }, [])
+
+  const waitForModelsReady = useCallback(async (timeoutMs: number = 300000) => {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const status = await apiClient.getModelsStatus()
+      if (status.loaded) {
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+    throw new Error('Timed out waiting for models to finish loading')
   }, [])
 
   const applyRecordingStatus = useCallback((status: RecordingStatus) => {
@@ -131,7 +179,10 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
       if (!modelsStatus.loaded) {
         setIsModelLoading(true)
         try {
-          await apiClient.loadModels()
+          const result = await apiClient.loadModels()
+          if (result.status === 'loading') {
+            await waitForModelsReady()
+          }
         } finally {
           setIsModelLoading(false)
         }
@@ -142,7 +193,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
       setIsModelLoading(false)
       console.error('Failed to start recording:', error)
     }
-  }, [])
+  }, [waitForModelsReady])
 
   // 停止录制
   const stopRecording = useCallback(async () => {
@@ -174,6 +225,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   }, [isRecording, isWarmingUp, refreshTimeline])
 
   const value: AppStoreContextType = {
+    themeMode,
     dateRange,
     refreshDateRange,
     isRecording,
@@ -197,4 +249,3 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     </AppStoreContext.Provider>
   )
 }
-

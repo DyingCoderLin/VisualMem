@@ -45,8 +45,7 @@ const SearchResults: React.FC<SearchResultsProps> = ({ result }) => {
   }
 
   const validFrames = result.frames.filter(frame => frame.image_path || frame.image_base64)
-  
-  // 按时间戳排序：从早到晚
+
   const sortedFrames = [...validFrames].sort((a, b) => {
     const timeA = new Date(a.timestamp).getTime()
     const timeB = new Date(b.timestamp).getTime()
@@ -55,11 +54,10 @@ const SearchResults: React.FC<SearchResultsProps> = ({ result }) => {
 
   return (
     <div className={`rag-results-container ${isMinimized ? 'rag-results-minimized' : ''}`}>
-      {/* 最小化时的标题栏 */}
       {isMinimized && (
         <div className="rag-minimized-header">
           <span className="rag-minimized-title">RAG Search Results</span>
-          <button 
+          <button
             className="rag-toggle-button"
             onClick={() => setIsMinimized(false)}
             title="展开"
@@ -68,50 +66,47 @@ const SearchResults: React.FC<SearchResultsProps> = ({ result }) => {
           </button>
         </div>
       )}
-      
-      {/* 展开时的内容 */}
+
       {!isMinimized && (
         <div className="rag-content-wrapper">
-          {/* 左侧：图片滚动列表（2/3 宽度，网格布局，从左到右、从上到下） */}
           <div className="rag-images-panel">
             <div className="rag-section-title">RAG 提取证据</div>
-              <div className="rag-images-scroll">
-                {sortedFrames.map((frame) => {
-                  const imageUrl = getImageUrl(frame)
-                  if (!imageUrl) return null
-                  
-                  return (
-                    <div key={frame.frame_id} className="rag-image-item">
-                      <img
-                        src={imageUrl}
-                        alt={`Frame ${frame.frame_id}`}
-                        loading="lazy"
-                        onClick={() => setPreviewImage({ url: imageUrl, timestamp: formatTimestamp(frame.timestamp) })}
-                        style={{ cursor: 'pointer' }}
-                        onError={(e) => {
-                          const item = (e.target as HTMLImageElement).closest('.rag-image-item') as HTMLElement
-                          if (item) item.style.display = 'none'
-                        }}
-                      />
-                      <div className="timestamp-label">
-                        {formatTimestamp(frame.timestamp)}
-                        {frame.relevance !== undefined && (
-                          <div style={{ fontSize: '10px', color: 'var(--text-secondary)' }}>
-                            相关度: {Math.round(frame.relevance * 100)}%
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </div>
+            <div className="rag-images-scroll">
+              {sortedFrames.map((frame) => {
+                const imageUrl = getImageUrl(frame)
+                if (!imageUrl) return null
 
-          {/* 右侧：AI 回答（1/3 宽度，上下滚动） */}
+                return (
+                  <div key={frame.frame_id} className="rag-image-item">
+                    <img
+                      src={imageUrl}
+                      alt={`Frame ${frame.frame_id}`}
+                      loading="lazy"
+                      onClick={() => setPreviewImage({ url: imageUrl, timestamp: formatTimestamp(frame.timestamp) })}
+                      style={{ cursor: 'pointer' }}
+                      onError={(e) => {
+                        const item = (e.target as HTMLImageElement).closest('.rag-image-item') as HTMLElement
+                        if (item) item.style.display = 'none'
+                      }}
+                    />
+                    <div className="timestamp-label">
+                      {formatTimestamp(frame.timestamp)}
+                      {frame.relevance !== undefined && (
+                        <div style={{ fontSize: '10px', color: 'var(--text-secondary)' }}>
+                          相关度: {Math.round(frame.relevance * 100)}%
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
           <div className="rag-answer-panel">
             <div className="rag-section-title-with-button">
               <span>AI Answer</span>
-              <button 
+              <button
                 className="rag-toggle-button-small"
                 onClick={() => setIsMinimized(true)}
                 title="Minimize"
@@ -119,16 +114,15 @@ const SearchResults: React.FC<SearchResultsProps> = ({ result }) => {
                 ▼
               </button>
             </div>
-              <div className="rag-answer-scroll">
-                <div className="rag-answer-text">
-                  <MarkdownRenderer content={result.answer} />
-                </div>
+            <div className="rag-answer-scroll">
+              <div className="rag-answer-text">
+                <MarkdownRenderer content={result.answer} />
               </div>
+            </div>
           </div>
         </div>
       )}
-      
-      {/* 图片预览模态框 */}
+
       {previewImage && (
         <ImagePreview
           imageUrl={previewImage.url}
