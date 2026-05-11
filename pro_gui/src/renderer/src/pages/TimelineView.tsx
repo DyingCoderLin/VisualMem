@@ -26,6 +26,7 @@ interface DateGroup {
   groupedFrames?: Frame[][]
   totalCount: number
   loadedCount: number
+  dbLoadedCount: number
   isLoading: boolean
 }
 
@@ -35,6 +36,8 @@ const LOAD_MORE_BATCH_SIZE = 50
 const LOAD_MORE_THRESHOLD = 5  // 距离末尾 5 个 item 宽度时触发加载（约 1040px）
 const DAYS_TO_LOAD_PER_BATCH = 4  // 每次希望能找出多少天的数据（初始加载更多，让用户能看到更多内容）
 const MAX_EMPTY_CHECKS = 30       // 关键参数：如果连着查了30天都没数据，先暂停，防止瞬间请求过多
+const TIMELINE_PAGE_TIMEOUT_MS = 12000
+const LIVE_TAIL_BACKOFF_MS = 8000
 
 // 样式常量
 const ITEM_WIDTH = 200
@@ -64,6 +67,25 @@ function groupFramesByTime(frames: Frame[]): Frame[][] {
   return groups;
 }
 
+function sortFramesByTimestamp(frames: Frame[]): Frame[] {
+  return [...frames].sort((a, b) => {
+    const timeA = new Date(a.timestamp).getTime()
+    const timeB = new Date(b.timestamp).getTime()
+    return timeA - timeB
+  })
+}
+
+function mergeFramesPreferIncoming(existing: Frame[], incoming: Frame[]): Frame[] {
+  const byId = new Map<string, Frame>()
+  for (const frame of existing) {
+    if (frame.frame_id) byId.set(frame.frame_id, frame)
+  }
+  for (const frame of incoming) {
+    if (frame.frame_id) byId.set(frame.frame_id, frame)
+  }
+  return sortFramesByTimestamp(Array.from(byId.values()))
+}
+
 const FrameGroupItem = ({ 
   frames, 
   onPreview, 
@@ -87,7 +109,7 @@ const FrameGroupItem = ({
           src={getImageUrl(mainFrame)}
           alt={`Frame ${mainFrame.frame_id}`}
           loading="lazy"
-          style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer', backgroundColor: '#1a1a1a' }}
+          style={{ width: '100%', height: '150px', objectFit: 'cover', borderRadius: '4px', cursor: 'pointer', backgroundColor: 'var(--image-placeholder)' }}
           onClick={() => onPreview(getImageUrl(mainFrame), formatTimestamp(mainFrame.timestamp))}
         />
       )}
@@ -101,7 +123,7 @@ const FrameGroupItem = ({
           display: 'flex', 
           gap: '4px',
           padding: '4px',
-          background: 'rgba(0,0,0,0.6)',
+          background: 'var(--thumb-strip-bg)',
           borderRadius: '4px',
           backdropFilter: 'blur(4px)',
           maxWidth: '90%',
@@ -120,8 +142,8 @@ const FrameGroupItem = ({
                   objectFit: 'cover', 
                   borderRadius: '2px', 
                   cursor: 'pointer', 
-                  border: '1px solid rgba(255,255,255,0.8)',
-                  boxShadow: '0 2px 4px rgba(0,0,0,0.5)',
+                  border: '1px solid var(--thumb-border)',
+                  boxShadow: 'var(--shadow-thumbnail)',
                   flexShrink: 0
                 }}
                 onClick={(e) => {
@@ -135,7 +157,7 @@ const FrameGroupItem = ({
         </div>
       )}
       
-      <div className="timestamp-label" style={{ fontSize: '12px', color: '#666', marginTop: '4px', paddingBottom: '4px' }}>
+      <div className="timestamp-label" style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px', paddingBottom: '4px' }}>
         {mainFrame ? formatTimestamp(mainFrame.timestamp) : ''}
       </div>
     </div>
@@ -219,18 +241,16 @@ const TimelineView: React.FC = () => {
           const todayGroup = currentGroups.find(g => g.date === today)
           
           if (todayGroup) {
-            // 如果已存在，且有新数据，则更新总数并加载新帧（绝不减少 totalCount）
+            // 已存在：只把 totalCount 对齐到 SQLite 最新值（绝不减少）。
+            // **不再自动 loadMoreFramesForDate**——让 loadedCount 严格由用户
+            // 右滑触发的分页增长，跟其它日期完全一致。系统主动调 loadMore 会
+            // 让 "X / Y" 里的 X 在用户没翻的情况下自己往上跳，违反
+            // "X = 用户翻到哪里" 的语义。
             const safeTotalCount = Math.max(todayGroup.totalCount, totalCount)
-            if (safeTotalCount > todayGroup.loadedCount) {
+            if (safeTotalCount !== todayGroup.totalCount) {
               setDateGroups(prev => prev.map(g =>
                 g.date === today ? { ...g, totalCount: safeTotalCount } : g
               ))
-              // 触发加载（使用 setTimeout 确保 state 已更新到 ref）
-              setTimeout(() => {
-                if (loadMoreFramesForDateRef.current) {
-                  loadMoreFramesForDateRef.current(today)
-                }
-              }, 100)
             }
           } else {
             // 如果今天不在列表中，且有数据，则只加载今天的第一批数据并插入到最前面
@@ -238,11 +258,7 @@ const TimelineView: React.FC = () => {
             // console.log(`[TimelineView] Today's group not found during refresh, fetching first batch for ${today}`)
             const frames = await apiClient.getFramesByDate(today, 0, INITIAL_LOAD_BATCH_SIZE)
             const validFrames = frames.filter(f => f.image_path || f.image_base64)
-            const sortedFrames = validFrames.sort((a, b) => {
-              const timeA = new Date(a.timestamp).getTime()
-              const timeB = new Date(b.timestamp).getTime()
-              return timeA - timeB
-            })
+            const sortedFrames = sortFramesByTimestamp(validFrames)
             
             if (sortedFrames.length > 0) {
               const newGroup: DateGroup = {
@@ -251,6 +267,7 @@ const TimelineView: React.FC = () => {
                 groupedFrames: groupFramesByTime(sortedFrames),
                 totalCount: totalCount,
                 loadedCount: sortedFrames.length,
+                dbLoadedCount: sortedFrames.length,
                 isLoading: false
               }
               setDateGroups(prev => {
@@ -271,12 +288,25 @@ const TimelineView: React.FC = () => {
   }, [timelineRefreshTrigger])
 
   // 监听录制服务的帧存储事件（每帧实时推送，无需额外 HTTP 请求）
+  //
+  // 【语义】"X / Y"：X = 用户主动翻到/已加载进卡片的帧数（paginated in），
+  //                 Y = 当日总帧数（含尚未落库的 live 帧）。
+  //   - live 事件到来 → 如果用户已经跟到尾部，就 append fast-path frame；
+  //     否则只涨 totalCount，避免用户浏览历史中段时系统替用户翻页。
+  //   - 用户右滑末尾触发 `loadMoreFramesForDate` 时才从 SQLite 按 offset 拉，
+  //     loadedCount 这时候才涨，跟其它日期的行为完全一致。
+  //
+  // 为什么不是无条件 append？快路径每 3s × N 屏立即派发事件，而后端
+  // today_count 反映的是已 enrichment + BatchWriteBuffer flush 到 SQLite 的那部分。
+  // 当 enrichment worker 吞吐跟不上进队速度（一帧 full-screen embedding +
+  // 每窗口 OCR/embedding 要 5–15s）时 queue 会堆几百帧，之前版本盲目 append
+  // 就出现了 loaded=689 / total=471 的倒挂。现在 append 仅限跟尾状态，并把
+  // total 对齐到可见帧数。
   useEffect(() => {
     const handleFrameStored = (event: CustomEvent) => {
       const { frame, todayCount } = event.detail
       if (!frame || !frame.image_path) return
 
-      // 从 timestamp 推导日期
       const frameDate = new Date(frame.timestamp)
       const dateStr = `${frameDate.getFullYear()}-${String(frameDate.getMonth() + 1).padStart(2, '0')}-${String(frameDate.getDate()).padStart(2, '0')}`
 
@@ -284,36 +314,57 @@ const TimelineView: React.FC = () => {
         const existingGroup = prev.find(g => g.date === dateStr)
 
         if (existingGroup) {
-          // 去重
+          // 已经被 loadMoreFramesForDate 从 SQLite 拉回数组的（罕见，仅当
+          // enrichment 恰好完成 + flush + 分页命中）：只刷 totalCount 保底，
+          // 不重复计数。
           if (existingGroup.frames.some(f => f.frame_id === frame.frame_id)) {
-            const safeTotalCount = Math.max(existingGroup.totalCount, todayCount)
-            if (safeTotalCount !== existingGroup.totalCount) {
-              return prev.map(g => g.date === dateStr ? { ...g, totalCount: safeTotalCount } : g)
-            }
-            return prev
+            const safeTotalCount = Math.max(
+              existingGroup.totalCount,
+              todayCount,
+              existingGroup.frames.length
+            )
+            if (safeTotalCount === existingGroup.totalCount) return prev
+            return prev.map(g =>
+              g.date === dateStr ? { ...g, totalCount: safeTotalCount } : g
+            )
           }
 
-          // 直接 append 新帧
+          // 新的 live 帧：如果用户已经跟到当前已加载尾部，就直接把
+          // fast-path frame 并入可见列表。这样最新帧不用等 SQLite/batch
+          // flush；如果用户在浏览历史中段，则只推进 total，避免系统替用户
+          // 跳到末尾。
           return prev.map(g => {
             if (g.date !== dateStr) return g
-            const newFrames = [...g.frames, frame]
-            const safeTotalCount = Math.max(g.totalCount, todayCount)
+            const followsTail =
+              g.loadedCount >= g.totalCount ||
+              g.frames.length >= g.totalCount ||
+              g.dbLoadedCount === 0
+            const frames = followsTail ? mergeFramesPreferIncoming(g.frames, [frame]) : g.frames
+            const nextTotal = Math.max(
+              g.totalCount + 1,
+              todayCount,
+              frames.length
+            )
             return {
               ...g,
-              frames: newFrames,
-              groupedFrames: groupFramesByTime(newFrames),
-              totalCount: safeTotalCount,
-              loadedCount: newFrames.length,
+              frames,
+              groupedFrames: followsTail ? groupFramesByTime(frames) : g.groupedFrames,
+              totalCount: nextTotal,
+              loadedCount: followsTail ? frames.length : g.loadedCount,
             }
           })
-        } else if (todayCount > 0) {
-          // 新日期组
+        }
+
+        // 今日组尚不存在：把这一帧作为首批初始化（loaded=1），避免出现
+        // loaded=0 空卡片、用户没有可滚的内容也拉不到下一批。
+        if (todayCount > 0 || frame.image_path) {
           const newGroup: DateGroup = {
             date: dateStr,
             frames: [frame],
             groupedFrames: groupFramesByTime([frame]),
-            totalCount: todayCount,
+            totalCount: Math.max(todayCount, 1),
             loadedCount: 1,
+            dbLoadedCount: 0,
             isLoading: false,
           }
           return [newGroup, ...prev]
@@ -409,11 +460,7 @@ const TimelineView: React.FC = () => {
             const validFrames = frames.filter(f => f.image_path || f.image_base64)
             
             // 确保按时间戳升序排序（从最早到最晚）
-            const sortedFrames = validFrames.sort((a, b) => {
-              const timeA = new Date(a.timestamp).getTime()
-              const timeB = new Date(b.timestamp).getTime()
-              return timeA - timeB
-            })
+            const sortedFrames = sortFramesByTimestamp(validFrames)
             
             if (sortedFrames.length > 0) {
               newGroups.push({
@@ -422,6 +469,7 @@ const TimelineView: React.FC = () => {
                 groupedFrames: groupFramesByTime(sortedFrames),
                 totalCount: countResponse.total_count,
                 loadedCount: sortedFrames.length,
+                dbLoadedCount: sortedFrames.length,
                 isLoading: false
               })
             }
@@ -512,9 +560,20 @@ const TimelineView: React.FC = () => {
     ))
 
     try {
-      const offset = dateGroup.loadedCount
-      const frames = await apiClient.getFramesByDate(date, offset, LOAD_MORE_BATCH_SIZE)
+      const offset = dateGroup.dbLoadedCount
+      const frames = await apiClient.getFramesByDate(date, offset, LOAD_MORE_BATCH_SIZE, TIMELINE_PAGE_TIMEOUT_MS)
       const validFrames = frames.filter(f => f.image_path || f.image_base64)
+
+      if (validFrames.length === 0) {
+        // totalCount can include fast-path live frames that SQLite has not
+        // flushed yet. Treat an empty tail page as "not ready" and back off
+        // instead of immediately re-triggering from the scroll effect.
+        failedDateBackoffRef.current.set(date, Date.now() + LIVE_TAIL_BACKOFF_MS)
+        setDateGroups(prev => prev.map(g =>
+          g.date === date ? { ...g, isLoading: false } : g
+        ))
+        return
+      }
 
       // 成功：清除退避
       failedDateBackoffRef.current.delete(date)
@@ -522,32 +581,26 @@ const TimelineView: React.FC = () => {
       setDateGroups(prev => prev.map(g => {
         if (g.date !== date) return g
 
-        const existingIds = new Set(g.frames.map(f => f.frame_id))
-        const uniqueNewFrames = validFrames.filter(f => !existingIds.has(f.frame_id))
-
-        const mergedFrames = [...g.frames, ...uniqueNewFrames]
-        const sortedFrames = mergedFrames.sort((a, b) => {
-          const timeA = new Date(a.timestamp).getTime()
-          const timeB = new Date(b.timestamp).getTime()
-          return timeA - timeB
-        })
+        const sortedFrames = mergeFramesPreferIncoming(g.frames, validFrames)
+        const dbLoadedCount = g.dbLoadedCount + validFrames.length
 
         return {
           ...g,
           frames: sortedFrames,
           groupedFrames: groupFramesByTime(sortedFrames),
           loadedCount: sortedFrames.length,
+          dbLoadedCount,
+          totalCount: Math.max(g.totalCount, sortedFrames.length, dbLoadedCount),
           isLoading: false
         }
       }))
     } catch (error) {
       // AbortError（超时）不打日志刷屏，只静默退避
       if (error instanceof DOMException && error.name === 'AbortError') {
-        // 超时：退避 5 秒后再允许重试
-        failedDateBackoffRef.current.set(date, Date.now() + 5000)
+        failedDateBackoffRef.current.set(date, Date.now() + LIVE_TAIL_BACKOFF_MS)
       } else {
         console.error(`[TimelineView] Failed to load more frames for date ${date}:`, error)
-        failedDateBackoffRef.current.set(date, Date.now() + 5000)
+        failedDateBackoffRef.current.set(date, Date.now() + LIVE_TAIL_BACKOFF_MS)
       }
       setDateGroups(prev => prev.map(g =>
         g.date === date ? { ...g, isLoading: false } : g
@@ -872,8 +925,8 @@ const TimelineView: React.FC = () => {
         .loading-spinner { display: flex; justify-content: center; padding: 20px; }
         .spinner-icon { 
           width: 30px; height: 30px; 
-          border: 3px solid #f3f3f3; 
-          border-top: 3px solid #3498db; 
+          border: 3px solid var(--spinner-track);
+          border-top: 3px solid var(--spinner-accent);
           border-radius: 50%; 
           animation: spin 1s linear infinite; 
         }
@@ -937,7 +990,7 @@ const TimelineView: React.FC = () => {
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
-                    color: '#666',
+                    color: 'var(--text-secondary)',
                     fontSize: '12px',
                     cursor: 'default'
                   }}
@@ -953,7 +1006,7 @@ const TimelineView: React.FC = () => {
       {loading && <LoadingSpinner />}
       
       {!hasMore && dateGroups.length > 0 && (
-        <div style={{ textAlign: 'center', padding: '20px', color: '#888' }}>
+        <div style={{ textAlign: 'center', padding: '20px', color: 'var(--text-secondary)' }}>
           已加载全部记录
         </div>
       )}

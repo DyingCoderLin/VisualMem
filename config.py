@@ -12,6 +12,13 @@ def _resolve_path(path: str) -> str:
     return os.path.normpath(os.path.join(_PROJECT_ROOT, path))
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 _default_env = os.path.join(_PROJECT_ROOT, ".env")
 ENV_FILE = os.environ.get("VISUALMEM_ENV_FILE", _default_env)
 # If user specified a relative path via env var, resolve it relative to project root
@@ -121,6 +128,13 @@ class Config:
     GUI_MODE = os.environ.get("GUI_MODE", "local").lower()
     # When GUI_MODE="remote", GUI will send HTTP requests to this backend
     GUI_REMOTE_BACKEND_URL = os.environ.get("GUI_REMOTE_BACKEND_URL", "").strip()
+
+    # Frontend visual theme. Options:
+    #   - "dark": existing black/yellow UI (default)
+    #   - "light": white Codex-inspired UI
+    _frontend_theme = os.environ.get("FRONTEND_THEME", "dark").strip().lower()
+    FRONTEND_THEME = _frontend_theme if _frontend_theme in {"dark", "light"} else "dark"
+
     # ============================================
     # Hybrid Search Configuration
     # ============================================
@@ -184,6 +198,79 @@ class Config:
     # Runtime Parameters
     # ============================================
     CAPTURE_INTERVAL_SECONDS = int(os.environ.get("CAPTURE_INTERVAL_SECONDS", "3"))
+
+    # Long-lived thread pool that handles heavy per-frame work
+    # (full-screen embedding, per-window embedding + OCR, sub_frame persistence,
+    # cluster assignment, batch_write_buffer.add_frame) off the
+    # /api/store_frame HTTP request path. Must be >= 1.
+    # 2 is a good default for a single GPU: one worker feeds the encoder while
+    # the other runs OCR / SQLite writes. Raise to 3-4 on CPU-only machines
+    # with lots of OCR work.
+    FRAME_ENRICHMENT_WORKERS = max(1, int(os.environ.get("FRAME_ENRICHMENT_WORKERS", "2")))
+
+    # Remote GUI: when enrichment backlog (queue_depth + inflight) stays at or
+    # above HIGH, the frontend pauses capture ticks until it drops to LOW.
+    # Exposed via /api/stats for the recording service; tune if machines differ.
+    _epbh = int(os.environ.get("ENRICHMENT_PIPELINE_BACKPRESS_HIGH", "14"))
+    _epbl = int(os.environ.get("ENRICHMENT_PIPELINE_BACKPRESS_LOW", "6"))
+    ENRICHMENT_PIPELINE_BACKPRESS_HIGH = max(2, _epbh)
+    ENRICHMENT_PIPELINE_BACKPRESS_LOW = max(
+        0,
+        min(_epbl, ENRICHMENT_PIPELINE_BACKPRESS_HIGH - 1),
+    )
+
+    # Max seconds /api/recording/stop will wait for the enrichment worker
+    # queue to drain before proceeding to flush video/batch buffers. After
+    # this timeout the handler logs a warning and forcibly flushes anyway.
+    STOP_FLUSH_MAX_SECONDS = float(os.environ.get("STOP_FLUSH_MAX_SECONDS", "30.0"))
+
+    # BatchWriteBuffer: accumulates enriched frames before flushing to
+    # LanceDB + SQLite. After the fast-path refactor, ``today_count`` and
+    # ``/api/recent_frames`` both read from SQLite, so a slow flush makes the
+    # frontend counters and real-time view look empty even though frames are
+    # being captured. Keep both values small (≈ one capture tick apart) so
+    # the DB never lags behind the fast path by more than a few seconds.
+    BATCH_WRITE_BUFFER_SIZE = max(1, int(os.environ.get("BATCH_WRITE_BUFFER_SIZE", "3")))
+    BATCH_WRITE_FLUSH_INTERVAL_SECONDS = float(
+        os.environ.get("BATCH_WRITE_FLUSH_INTERVAL_SECONDS", "5.0")
+    )
+
+    # ============================================
+    # Diagnostics / Evaluation Instrumentation
+    # ============================================
+    # Master switch for temporary diagnostic/evaluation instrumentation used
+    # during debugging and graduation-design experiments. Defaults OFF so a
+    # normal backend start does not create test JSONL logs, heartbeat logs, or
+    # thread dumps. Individual flags below can still enable only one channel.
+    ENABLE_DIAGNOSTIC_INSTRUMENTATION = _env_bool("ENABLE_DIAGNOSTIC_INSTRUMENTATION", False)
+
+    # Verbose operational diagnostics: per-frame step logs and BatchWriteBuffer
+    # idle heartbeat. Keep disabled in normal use to avoid noisy logs.
+    ENABLE_RUNTIME_DIAGNOSTIC_LOGS = _env_bool(
+        "ENABLE_RUNTIME_DIAGNOSTIC_LOGS",
+        ENABLE_DIAGNOSTIC_INSTRUMENTATION,
+    )
+
+    # Enrichment worker stuck-job diagnostics. When enabled, a heartbeat thread
+    # logs queue stats and dumps all Python thread stacks after a job exceeds
+    # ENRICH_STUCK_SECONDS.
+    ENABLE_ENRICHMENT_STACK_DUMPS = _env_bool(
+        "ENABLE_ENRICHMENT_STACK_DUMPS",
+        ENABLE_DIAGNOSTIC_INSTRUMENTATION,
+    )
+    ENRICH_HEARTBEAT_SECONDS = float(os.environ.get("ENRICH_HEARTBEAT_SECONDS", "30"))
+    ENRICH_STUCK_SECONDS = float(os.environ.get("ENRICH_STUCK_SECONDS", "60"))
+
+    # JSONL metrics used by scripts/eval/*. Each defaults to the master switch
+    # but can be toggled independently for targeted experiments.
+    EVAL_LAYER_STATS = _env_bool("EVAL_LAYER_STATS", ENABLE_DIAGNOSTIC_INSTRUMENTATION)
+    EVAL_LATENCY_STATS = _env_bool("EVAL_LATENCY_STATS", ENABLE_DIAGNOSTIC_INSTRUMENTATION)
+    EVAL_STABILITY_MONITOR = _env_bool("EVAL_STABILITY_MONITOR", ENABLE_DIAGNOSTIC_INSTRUMENTATION)
+    EVAL_STABILITY_INTERVAL_S = float(os.environ.get("EVAL_STABILITY_INTERVAL_S", "30"))
+    EVAL_CLUSTER_LABEL_STATS = _env_bool(
+        "EVAL_CLUSTER_LABEL_STATS",
+        ENABLE_DIAGNOSTIC_INSTRUMENTATION,
+    )
     
     # ============================================
     # Activity Clustering

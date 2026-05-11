@@ -15,13 +15,18 @@ import multiprocessing
 import os
 import tempfile
 import time
-from typing import List, Optional
+import threading
+from typing import Any, List, Optional, TYPE_CHECKING
 
 from PIL import Image
 
 from core.ocr.ocr_engine import OCRResult, OCREngine
-from core.ocr.region_detector import UIEDRegionDetector
 from utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from core.ocr.region_detector import UIEDRegionDetector
+else:
+    UIEDRegionDetector = Any
 
 logger = setup_logger(__name__)
 
@@ -105,6 +110,7 @@ def _persistent_ocr_worker(req_conn, res_conn, engine_type: str, use_region_dete
     engine.region_detector = detector
     engine._last_timeout_ts = 0.0
     engine._worker_proc = None
+    engine.last_timing = {"total_ms": 0.0, "detector_ms": 0.0, "ocr_ms": 0.0}
 
     while True:
         try:
@@ -113,7 +119,7 @@ def _persistent_ocr_worker(req_conn, res_conn, engine_type: str, use_region_dete
                 break
             img = _Image.open(tmp_path)
             results = engine._recognize_regions_inner(img)
-            res_conn.send(results)
+            res_conn.send({"regions": results, "timing": getattr(engine, "last_timing", {})})
         except EOFError:
             break
         except Exception:
@@ -137,6 +143,12 @@ class RegionOCREngine:
         self._worker_proc = None
         self._parent_req_conn = None
         self._parent_res_conn = None
+        # Single persistent subprocess + shared Pipe pair are not safe for
+        # concurrent request/response from multiple caller threads. Without
+        # serialization, two enrichment threads can race on poll()/recv() and
+        # block forever in recv(), exactly matching the observed stuck stacks.
+        self._ipc_lock = threading.Lock()
+        self.last_timing = {"total_ms": 0.0, "detector_ms": 0.0, "ocr_ms": 0.0}
 
     _OCR_TIMEOUT_SECONDS = 15
     _COOLDOWN_AFTER_TIMEOUT = 90
@@ -171,56 +183,62 @@ class RegionOCREngine:
         (Queue.get(timeout) is unreliable on macOS).
         Circuit breaker skips OCR for a cooldown period after a timeout.
         """
-        if self._last_timeout_ts > 0:
-            elapsed_since_timeout = time.monotonic() - self._last_timeout_ts
-            if elapsed_since_timeout < self._COOLDOWN_AFTER_TIMEOUT:
-                logger.warning(
-                    f"RegionOCR circuit breaker OPEN — skipping OCR "
-                    f"({elapsed_since_timeout:.0f}s / {self._COOLDOWN_AFTER_TIMEOUT}s cooldown)"
-                )
-                return []
-            else:
-                logger.info("RegionOCR circuit breaker CLOSED — resuming OCR")
-                self._last_timeout_ts = 0.0
-
-        self._ensure_worker()
-        tmp_fd, tmp_path = tempfile.mkstemp(suffix='.png')
-        try:
-            os.close(tmp_fd)
-            image.save(tmp_path, format="PNG")
-            self._parent_req_conn.send(tmp_path)
-
-            # watchdog loop: do short polls, and enforce wall-clock deadline ourselves
-            # (avoids relying on a single long poll(timeout) call).
-            deadline = time.monotonic() + self._OCR_TIMEOUT_SECONDS
-            while time.monotonic() < deadline:
-                if self._parent_res_conn.poll(0.2):
-                    return self._parent_res_conn.recv()
-                if self._worker_proc is None or (not self._worker_proc.is_alive()):
-                    logger.error("RegionOCR: worker exited unexpectedly; restarting")
-                    self._activate_circuit_breaker()
+        with self._ipc_lock:
+            if self._last_timeout_ts > 0:
+                elapsed_since_timeout = time.monotonic() - self._last_timeout_ts
+                if elapsed_since_timeout < self._COOLDOWN_AFTER_TIMEOUT:
+                    logger.warning(
+                        f"RegionOCR circuit breaker OPEN — skipping OCR "
+                        f"({elapsed_since_timeout:.0f}s / {self._COOLDOWN_AFTER_TIMEOUT}s cooldown)"
+                    )
                     return []
+                else:
+                    logger.info("RegionOCR circuit breaker CLOSED — resuming OCR")
+                    self._last_timeout_ts = 0.0
 
-            img_w, img_h = image.size
-            logger.error(
-                f"RegionOCR: timeout after {self._OCR_TIMEOUT_SECONDS}s "
-                f"(image={img_w}x{img_h}), killing worker and activating circuit breaker"
-            )
-            self._activate_circuit_breaker()
-            return []
-        except (BrokenPipeError, OSError, EOFError) as e:
-            logger.error(f"RegionOCR: pipe/process error ({e}), activating circuit breaker")
-            self._activate_circuit_breaker()
-            return []
-        except Exception as e:
-            logger.error(f"RegionOCR: unexpected error ({e}), activating circuit breaker")
-            self._activate_circuit_breaker()
-            return []
-        finally:
+            self._ensure_worker()
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix='.png')
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                os.close(tmp_fd)
+                image.save(tmp_path, format="PNG")
+                self._parent_req_conn.send(tmp_path)
+
+                # watchdog loop: do short polls, and enforce wall-clock deadline ourselves
+                # (avoids relying on a single long poll(timeout) call).
+                deadline = time.monotonic() + self._OCR_TIMEOUT_SECONDS
+                while time.monotonic() < deadline:
+                    if self._parent_res_conn.poll(0.2):
+                        payload = self._parent_res_conn.recv()
+                        if isinstance(payload, dict) and "regions" in payload:
+                            self.last_timing = payload.get("timing", {}) or {}
+                            return payload.get("regions", []) or []
+                        self.last_timing = {"total_ms": 0.0, "detector_ms": 0.0, "ocr_ms": 0.0}
+                        return payload if isinstance(payload, list) else []
+                    if self._worker_proc is None or (not self._worker_proc.is_alive()):
+                        logger.error("RegionOCR: worker exited unexpectedly; restarting")
+                        self._activate_circuit_breaker()
+                        return []
+
+                img_w, img_h = image.size
+                logger.error(
+                    f"RegionOCR: timeout after {self._OCR_TIMEOUT_SECONDS}s "
+                    f"(image={img_w}x{img_h}), killing worker and activating circuit breaker"
+                )
+                self._activate_circuit_breaker()
+                return []
+            except (BrokenPipeError, OSError, EOFError) as e:
+                logger.error(f"RegionOCR: pipe/process error ({e}), activating circuit breaker")
+                self._activate_circuit_breaker()
+                return []
+            except Exception as e:
+                logger.error(f"RegionOCR: unexpected error ({e}), activating circuit breaker")
+                self._activate_circuit_breaker()
+                return []
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _kill_worker(self):
         if self._worker_proc is not None:
@@ -250,27 +268,42 @@ class RegionOCREngine:
 
     def _recognize_regions_inner(self, image: Image.Image) -> List[dict]:
         """Actual OCR logic (may block)."""
+        t0 = time.perf_counter()
         w, h = image.size
         has_bbox_support = hasattr(self.ocr_engine, "recognize_with_bboxes")
+        self.last_timing = {"total_ms": 0.0, "detector_ms": 0.0, "ocr_ms": 0.0}
 
         if has_bbox_support and self.region_detector is not None:
-            return self._recognize_via_assign(image, w, h)
+            out = self._recognize_via_assign(image, w, h)
+            self.last_timing["total_ms"] = (time.perf_counter() - t0) * 1000.0
+            return out
 
         if self.region_detector is None:
+            t_ocr = time.perf_counter()
             result = self.ocr_engine.recognize(image)
+            self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
+            self.last_timing["total_ms"] = (time.perf_counter() - t0) * 1000.0
             return _single_full_image_regions(w, h, result)
 
-        return self._recognize_per_region(image, w, h)
+        out = self._recognize_per_region(image, w, h)
+        self.last_timing["total_ms"] = (time.perf_counter() - t0) * 1000.0
+        return out
 
     def _recognize_via_assign(self, image: Image.Image, w: int, h: int) -> List[dict]:
         """Strategy B: single whole-image OCR → assign text to UIED regions."""
+        t_det = time.perf_counter()
         regions_meta = self.region_detector.detect(image)
+        self.last_timing["detector_ms"] += (time.perf_counter() - t_det) * 1000.0
 
         if not regions_meta:
+            t_ocr = time.perf_counter()
             result = self.ocr_engine.recognize(image)
+            self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
             return _single_full_image_regions(w, h, result)
 
+        t_ocr = time.perf_counter()
         text_bboxes = self.ocr_engine.recognize_with_bboxes(image)
+        self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
 
         if not text_bboxes:
             return []
@@ -323,10 +356,14 @@ class RegionOCREngine:
 
     def _recognize_per_region(self, image: Image.Image, w: int, h: int) -> List[dict]:
         """Fallback: per-region crop OCR + remainder (for engines without bbox support)."""
+        t_det = time.perf_counter()
         regions_meta = self.region_detector.detect(image)
+        self.last_timing["detector_ms"] += (time.perf_counter() - t_det) * 1000.0
 
         if not regions_meta:
+            t_ocr = time.perf_counter()
             result = self.ocr_engine.recognize(image)
+            self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
             return _single_full_image_regions(w, h, result)
 
         results = []
@@ -334,7 +371,9 @@ class RegionOCREngine:
             bbox = meta["bbox"]
             x1, y1, x2, y2 = bbox
             crop = image.crop((x1, y1, x2, y2))
+            t_ocr = time.perf_counter()
             ocr_result = self.ocr_engine.recognize(crop)
+            self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
             results.append({
                 "region_index": meta["region_index"],
                 "bbox": bbox,
@@ -350,7 +389,9 @@ class RegionOCREngine:
             x1, y1, x2, y2 = meta["bbox"]
             draw.rectangle([x1, y1, x2, y2], fill=(255, 255, 255))
 
+        t_ocr = time.perf_counter()
         remainder_result = self.ocr_engine.recognize(remainder_img)
+        self.last_timing["ocr_ms"] += (time.perf_counter() - t_ocr) * 1000.0
         if remainder_result.text.strip():
             next_index = max(r["region_index"] for r in results) + 1 if results else 0
             results.append({

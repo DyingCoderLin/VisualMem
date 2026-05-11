@@ -46,10 +46,15 @@ Choose the requirement file based on your OS:
   ```bash
   pip install -r requirements_macos.txt
   ```
-- **Linux (CUDA)**:
+- **Linux / Windows**:
   ```bash
   pip install -r requirements_linux_cuda.txt
   ```
+
+> [!NOTE]
+> `opencv-python-headless` is required for UIED region detection.
+> It is already included in both `requirements_macos.txt` and `requirements_linux_cuda.txt`.
+> Despite the filename, `requirements_linux_cuda.txt` is also the shared dependency file for Windows.
 
 ### 4. Build `screencap_rs` for Per-Window Capture
 

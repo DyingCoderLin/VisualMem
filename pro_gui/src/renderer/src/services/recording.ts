@@ -38,22 +38,40 @@ class RecordingService {
   private statusListeners: ((status: RecordingStatus) => void)[] = []
   private pendingRequests: Set<AbortController> = new Set() // 跟踪正在进行的请求
 
-  // 发送队列：截屏照常进行，发送排队执行，避免 HTTP 连接堆积
-  private sendQueue: Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number }> = []
-  private isSending: boolean = false
-  private readonly maxQueueSize: number = 20  // 队列超过此大小时丢弃最旧的帧
-  /** 发送积压 ≥ 此值时进入背压（暂停新截屏） */
-  private readonly sendQueueBackpressureThreshold: number = 12
-  /**
-   * 背压解除：队列长度 ≤ 此值时才恢复截屏（滞回，避免在 11↔13 之间因多显示器/重叠 tick 反复抖动）
-   */
-  private readonly sendQueueBackpressureResumeThreshold: number = 8
+  // 发送队列：每个显示器独立一条队列 + 一个并行 in-flight HTTP 请求。
+  //
+  // 历史：原来所有显示器共用一条 ``sendQueue`` + 一个 ``isSending`` 锁，
+  // 在 ``mode='all'`` + 多屏场景下等价于把 N 路独立流强行串行化——
+  // 后端单帧处理 10~30s 时，第 N 个显示器的帧要等 N-1 个前序帧依次串完
+  // 才能发出，队列轻易冲到 20 上限并开始丢旧帧，前端看起来就是「卡在
+  // 12:37」。改造后：每屏一条 queue + 一个 in-flight，背压阈值按屏数放大。
+  private sendQueues: Map<number, Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number; captureMs: number }>> = new Map()
+  private sendingMonitors: Set<number> = new Set()
+  /** 当前活跃屏幕数（最近一次 captureScreen 的结果数），用于放大背压阈值 */
+  private screenCount: number = 1
+  /** 单屏基准阈值，实际值会按 screenCount 放大 */
+  private readonly perMonitorMaxQueueSize: number = 20
+  private readonly perMonitorBackpressureThreshold: number = 12
+  private readonly perMonitorBackpressureResumeThreshold: number = 8
   /** setInterval 不等待 async，防止上一 tick 仍在 await captureScreen 时又开一轮截屏 */
   private captureTickInFlight: boolean = false
   /** 背压锁存：进入后备压一直生效直到队列充分下降 */
   private backpressureLatched: boolean = false
   private lastBackpressureLogMs: number = 0
   private lastQueueDropLogMs: number = 0
+  /**
+   * 后端 FrameEnrichmentWorker 积压：queue_depth + inflight（与 /api/stats、
+   * store_frame 响应字段一致）。用于在 HTTP 发送队列尚不深时仍暂停截屏。
+   */
+  private backendPipelineDepth: number = 0
+  private enrichBpHigh: number = 14
+  private enrichBpLow: number = 6
+  /**
+   * 进入背压后不再发 store_frame，`enrichment_pipeline_depth` 会停在旧值。
+   * 节流拉 /api/stats 刷新真实积压，避免永远卡在 pipeline==high。
+   */
+  private lastEnrichmentStatsPollMs: number = 0
+  private static readonly ENRICHMENT_STATS_POLL_MS = 2000
 
   private maxImageWidth: number = 1920  // 最大图片宽度，从后端获取（默认 1920）
   private imageQuality: number = 0.85  // 图片质量（0-1），从后端获取（默认 0.85，对应 85%）
@@ -117,6 +135,32 @@ class RecordingService {
     this.statusListeners.forEach((listener) => listener(s))
   }
 
+  /** 解析后端返回的 enrichment 背压信号（/api/stats 与 store_frame） */
+  private applyEnrichmentSignals(s: {
+    enrichment_pipeline_depth?: number
+    enrichment_queue_depth?: number
+    enrichment_inflight?: number
+    enrichment_backpressure_high?: number
+    enrichment_backpressure_low?: number
+  }): void {
+    if (typeof s.enrichment_pipeline_depth === 'number') {
+      this.backendPipelineDepth = s.enrichment_pipeline_depth
+    } else if (
+      typeof s.enrichment_queue_depth === 'number' ||
+      typeof s.enrichment_inflight === 'number'
+    ) {
+      const q = s.enrichment_queue_depth ?? 0
+      const inf = s.enrichment_inflight ?? 0
+      this.backendPipelineDepth = q + inf
+    }
+    if (typeof s.enrichment_backpressure_high === 'number') {
+      this.enrichBpHigh = s.enrichment_backpressure_high
+    }
+    if (typeof s.enrichment_backpressure_low === 'number') {
+      this.enrichBpLow = s.enrichment_backpressure_low
+    }
+  }
+
   /**
    * 从后端获取所有配置（diff_threshold, capture_interval, max_image_width, image_quality）
    */
@@ -157,6 +201,8 @@ class RecordingService {
         this.imageQuality = stats.image_quality / 100.0
         console.log(`[RecordingService] Loaded image_quality from backend: ${stats.image_quality}% (${this.imageQuality})`)
       }
+
+      this.applyEnrichmentSignals(stats)
     } catch (error) {
       console.warn('[RecordingService] Failed to load config from backend, using defaults:', error)
       // 使用默认值，不阻塞
@@ -220,7 +266,7 @@ class RecordingService {
   /**
    * 使用 Electron desktopCapturer API 和 WebRTC 截屏
    */
-  private async captureScreen(): Promise<{ base64Data: string; diffData: ImageData; index: number; width: number; height: number }[]> {
+  private async captureScreen(): Promise<{ base64Data: string; diffData: ImageData; index: number; width: number; height: number; captureMs: number }[]> {
     try {
       // 检查 electronAPI 是否可用
       const electronAPI = (window as any).electronAPI
@@ -243,7 +289,7 @@ class RecordingService {
       // 根据模式选择源
       const sourcesToCapture = this.options.mode === 'primary' ? [sources[0]] : sources
       
-      const results: { base64Data: string; diffData: ImageData; index: number; width: number; height: number }[] = []
+      const results: { base64Data: string; diffData: ImageData; index: number; width: number; height: number; captureMs: number }[] = []
 
       for (let i = 0; i < sourcesToCapture.length; i++) {
         const source = sourcesToCapture[i]
@@ -264,7 +310,8 @@ class RecordingService {
           })
 
           // 将流转换为图片数据
-          const captureResult = await new Promise<{ base64Data: string; diffData: ImageData; width: number; height: number } | null>((resolve) => {
+          const tCapture0 = performance.now()
+          const captureResult = await new Promise<{ base64Data: string; diffData: ImageData; width: number; height: number; captureMs: number } | null>((resolve) => {
             const video = document.createElement('video')
             video.style.display = 'none'
             document.body.appendChild(video)
@@ -300,7 +347,7 @@ class RecordingService {
                 }
 
                 if (!shouldCaptureFull) {
-                  resolve({ base64Data: '', diffData, width: video.videoWidth, height: video.videoHeight })
+                  resolve({ base64Data: '', diffData, width: video.videoWidth, height: video.videoHeight, captureMs: performance.now() - tCapture0 })
                   return
                 }
 
@@ -335,7 +382,8 @@ class RecordingService {
                   base64Data: base64.split(',')[1], 
                   diffData, 
                   width: video.videoWidth, 
-                  height: video.videoHeight 
+                  height: video.videoHeight,
+                  captureMs: performance.now() - tCapture0,
                 })
               } catch (e) {
                 console.error('Failed to capture frame from video:', e)
@@ -361,7 +409,8 @@ class RecordingService {
               diffData: captureResult.diffData, 
               index: i,
               width: captureResult.width,
-              height: captureResult.height
+              height: captureResult.height,
+              captureMs: captureResult.captureMs,
             })
           }
         } catch (err) {
@@ -384,6 +433,7 @@ class RecordingService {
   private async refreshStatsOnly(): Promise<void> {
     try {
       const statsResult = await apiClient.getStats()
+      this.applyEnrichmentSignals(statsResult)
       if (typeof window !== 'undefined' && statsResult) {
         window.dispatchEvent(new CustomEvent('recording-data-refreshed', {
           detail: { stats: statsResult }
@@ -408,7 +458,11 @@ class RecordingService {
     this.liveRecording = false
     this.lastImageDataArray = []
     this.frameCounter = 0
-    this.isSending = false
+    this.sendQueues.clear()
+    this.sendingMonitors.clear()
+    this.backpressureLatched = false
+    this.backendPipelineDepth = 0
+    this.lastEnrichmentStatsPollMs = 0
     sessionStorage.setItem('vlm_is_recording', 'true')
     this.notifyStatusListeners()
 
@@ -438,7 +492,9 @@ class RecordingService {
   private async resumeAfterPageReload(): Promise<void> {
     this.lastImageDataArray = []
     this.frameCounter = 0
-    this.isSending = false
+    this.sendQueues.clear()
+    this.sendingMonitors.clear()
+    this.backpressureLatched = false
     await this.runFirstScreenshotWarmup()
     if (!this.sessionActive) return
     this.warmupPhase = false
@@ -448,19 +504,30 @@ class RecordingService {
   }
 
   /**
-   * 第一次截图产生的全部 store_frame 请求完成后再进入稳态
+   * 第一次截图产生的全部 store_frame 请求完成，并给后端 worker 一个有上限的启动缓冲。
    */
   private async runFirstScreenshotWarmup(): Promise<void> {
-    console.log('[RecordingService] Warmup: first capture tick + drain send queue')
+    console.log('[RecordingService] Warmup: first capture tick + bounded backend settle')
     await this.runSingleCaptureTick()
     await this.drainSendQueue()
+    await this.waitForBackendWarmupSettle()
     console.log('[RecordingService] Warmup complete')
+  }
+
+  private totalQueueDepth(): number {
+    let total = 0
+    for (const q of this.sendQueues.values()) total += q.length
+    return total
+  }
+
+  private anySending(): boolean {
+    return this.sendingMonitors.size > 0
   }
 
   private async drainSendQueue(): Promise<void> {
     const maxWaitMs = 30 * 60 * 1000
     const t0 = Date.now()
-    while (this.sendQueue.length > 0 || this.isSending) {
+    while (this.totalQueueDepth() > 0 || this.anySending()) {
       if (!this.sessionActive) {
         break
       }
@@ -469,6 +536,55 @@ class RecordingService {
         break
       }
       await new Promise((r) => setTimeout(r, 50))
+    }
+  }
+
+  private async waitForBackendWarmupSettle(): Promise<void> {
+    const maxWaitMs = Math.min(15000, Math.max(5000, this.options.interval * 2))
+    const pollMs = 1000
+    const statsTimeoutMs = 3000
+    const logEveryMs = 3000
+    const t0 = Date.now()
+    let lastLogMs = 0
+
+    while (this.sessionActive) {
+      let pipelineDepth = this.backendPipelineDepth
+      if (pipelineDepth <= 0) {
+        break
+      }
+
+      try {
+        const stats = await apiClient.getStats(statsTimeoutMs)
+        this.applyEnrichmentSignals(stats)
+        pipelineDepth = this.backendPipelineDepth
+      } catch (error) {
+        console.warn('[RecordingService] Warmup: backend stats unavailable, entering steady loop with backpressure:', error)
+        break
+      }
+
+      if (pipelineDepth <= 0) {
+        break
+      }
+
+      const now = Date.now()
+      if (now - t0 > maxWaitMs) {
+        console.warn(
+          `[RecordingService] Warmup: backend enrichment still running ` +
+            `(depth=${pipelineDepth}) after ${Math.round(maxWaitMs / 1000)}s; ` +
+            `entering steady loop with backpressure.`
+        )
+        break
+      }
+
+      if (now - lastLogMs > logEveryMs) {
+        console.log(
+          `[RecordingService] Warmup: backend enrichment depth=${pipelineDepth}; ` +
+            `waiting up to ${Math.round(maxWaitMs / 1000)}s before steady loop`
+        )
+        lastLogMs = now
+      }
+
+      await new Promise((r) => setTimeout(r, pollMs))
     }
   }
 
@@ -508,7 +624,11 @@ class RecordingService {
       const seconds = String(now.getSeconds()).padStart(2, '0')
       const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`
 
-      for (const { base64Data, diffData, index, width, height } of captureResults) {
+      if (captureResults.length > 0) {
+        this.screenCount = captureResults.length
+      }
+
+      for (const { base64Data, diffData, index, width, height, captureMs } of captureResults) {
         if (!this.sessionActive) {
           break
         }
@@ -521,7 +641,7 @@ class RecordingService {
         }
         const microSeconds = String(index).padStart(6, '0')
         const frameId = `${frameIdPrefix}${microSeconds}`
-        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index)
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs)
       }
     } catch (error) {
       if (!this.sessionActive) {
@@ -542,20 +662,43 @@ class RecordingService {
     }
 
     // Warmup 阶段不背压，保证第一次截图全部入队并可被 drain
-    // 背压（带滞回）：队列冲高后暂停截屏，降到 resume 以下才恢复，避免 12/13 边界来回跳
+    // 背压（带滞回）：队列冲高后暂停截屏，降到 resume 以下才恢复，避免 12/13 边界来回跳。
+    // 多屏场景下阈值按 ``screenCount`` 放大——每屏独立一条 inflight，
+    // 整体积压上限自然应线性放大。
     if (!this.warmupPhase) {
-      if (this.sendQueue.length >= this.sendQueueBackpressureThreshold) {
+      const pollNow = Date.now()
+      if (
+        pollNow - this.lastEnrichmentStatsPollMs >= RecordingService.ENRICHMENT_STATS_POLL_MS &&
+        (this.backpressureLatched ||
+          this.backendPipelineDepth >= Math.max(0, this.enrichBpHigh - 1))
+      ) {
+        this.lastEnrichmentStatsPollMs = pollNow
+        try {
+          const st = await apiClient.getStats()
+          this.applyEnrichmentSignals(st)
+        } catch {
+          /* 仍用上次 pipeline；下一轮再试 */
+        }
+      }
+
+      const screens = Math.max(1, this.screenCount)
+      const depth = this.totalQueueDepth()
+      const trigger = this.perMonitorBackpressureThreshold * screens
+      const resume = this.perMonitorBackpressureResumeThreshold * screens
+      const maxTotal = this.perMonitorMaxQueueSize * screens
+      const pipeline = this.backendPipelineDepth
+      if (depth >= trigger || pipeline >= this.enrichBpHigh) {
         this.backpressureLatched = true
       }
-      if (this.sendQueue.length <= this.sendQueueBackpressureResumeThreshold) {
+      if (depth <= resume && pipeline <= this.enrichBpLow) {
         this.backpressureLatched = false
       }
       if (this.backpressureLatched) {
         const now = Date.now()
         if (now - this.lastBackpressureLogMs > 8000) {
           console.warn(
-            `[RecordingService] Send backlog high (${this.sendQueue.length}/${this.maxQueueSize}), ` +
-              `skipping capture until queue ≤ ${this.sendQueueBackpressureResumeThreshold}`
+            `[RecordingService] Backpressure: send_queue=${depth}/${maxTotal} (screens=${screens}, resume≤${resume}); ` +
+              `enrich_pipeline=${pipeline} (resume≤${this.enrichBpLow}, high≥${this.enrichBpHigh}). Skipping capture tick.`
           )
           this.lastBackpressureLogMs = now
         }
@@ -576,6 +719,11 @@ class RecordingService {
         return
       }
 
+      // 更新屏幕数（背压阈值随之自动伸缩）
+      if (captureResults.length > 0) {
+        this.screenCount = captureResults.length
+      }
+
       const now = new Date()
       const timestamp = now.toISOString()
 
@@ -588,7 +736,7 @@ class RecordingService {
       const seconds = String(now.getSeconds()).padStart(2, '0')
       const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`
 
-      for (const { base64Data, diffData, index, width, height } of captureResults) {
+      for (const { base64Data, diffData, index, width, height, captureMs } of captureResults) {
         // 再次检查录制状态
         if (!this.sessionActive || !this.liveRecording) {
           break
@@ -613,7 +761,7 @@ class RecordingService {
         const frameId = `${frameIdPrefix}${microSeconds}`
 
         // 加入发送队列（截屏不等发送，发送逐个排队避免 HTTP 堆积）
-        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index)
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs)
       }
     } catch (error) {
       // 如果已经停止录制，忽略错误
@@ -627,55 +775,68 @@ class RecordingService {
   }
 
   /**
-   * 将帧加入发送队列。截屏不受影响，发送逐个执行避免 HTTP 连接堆积。
+   * 将帧加入目标显示器的发送队列。各屏独立积压、独立 inflight；
+   * 一个慢屏不会阻塞其他屏的发送。
    */
-  private enqueueFrame(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number): void {
-    // 队列满时丢弃最旧的帧（保留最新的截屏）
-    if (this.sendQueue.length >= this.maxQueueSize) {
-      const dropped = this.sendQueue.shift()
+  private enqueueFrame(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number, captureMs: number): void {
+    let queue = this.sendQueues.get(monitorId)
+    if (!queue) {
+      queue = []
+      this.sendQueues.set(monitorId, queue)
+    }
+
+    // 单屏队列满时丢弃最旧的帧（保留最新的截屏）
+    if (queue.length >= this.perMonitorMaxQueueSize) {
+      const dropped = queue.shift()
       const now = Date.now()
       if (now - this.lastQueueDropLogMs > 3000) {
         console.warn(
-          `[RecordingService] Send queue full (${this.maxQueueSize}), dropped oldest frame ${dropped?.frameId}`
+          `[RecordingService] Send queue full for monitor ${monitorId} ` +
+            `(${this.perMonitorMaxQueueSize}), dropped oldest frame ${dropped?.frameId}`
         )
         this.lastQueueDropLogMs = now
       }
     }
-    this.sendQueue.push({ base64Data, frameId, timestamp, width, height, monitorId })
-    // 启动队列处理（如果没在运行）
-    this.processSendQueue()
+    queue.push({ base64Data, frameId, timestamp, width, height, monitorId, captureMs })
+
+    // 启动该屏的 queue 处理（如果没在运行）
+    this.processSendQueue(monitorId)
   }
 
   /**
-   * 逐个发送队列中的帧，一次只有一个 HTTP 请求在飞。
-   * 这样浏览器的 6 个连接中只有 1 个被 store_frame 占用，
-   * 剩余 5 个可以服务 getStats/getFramesByDate 等轻量请求。
+   * 每个显示器的发送循环。一屏一个 in-flight HTTP 请求，屏与屏之间并行。
+   *
+   * 浏览器对单一 origin 有 6 个并发 HTTP 连接上限，4 屏并发也远未触及该上限；
+   * 后端 ``FrameEnrichmentWorker`` 也会并发消费这些请求（见
+   * ``FRAME_ENRICHMENT_WORKERS``），因此不必串行。
    */
-  private async processSendQueue(): Promise<void> {
-    if (this.isSending) return  // 已经在处理中
-    this.isSending = true
+  private async processSendQueue(monitorId: number): Promise<void> {
+    if (this.sendingMonitors.has(monitorId)) return
+    this.sendingMonitors.add(monitorId)
 
     try {
-      while (this.sendQueue.length > 0 && this.sessionActive) {
-        const frame = this.sendQueue.shift()!
+      while (this.sessionActive) {
+        const queue = this.sendQueues.get(monitorId)
+        if (!queue || queue.length === 0) break
+        const frame = queue.shift()!
         try {
           await this.sendFrameToBackendDirectly(
             frame.base64Data, frame.frameId, frame.timestamp,
-            frame.width, frame.height, frame.monitorId
+            frame.width, frame.height, frame.monitorId, frame.captureMs
           )
         } catch (err) {
-          console.error(`Error sending frame ${frame.frameId}:`, err)
+          console.error(`Error sending frame ${frame.frameId} (monitor ${monitorId}):`, err)
         }
       }
     } finally {
-      this.isSending = false
+      this.sendingMonitors.delete(monitorId)
     }
   }
 
   /**
    * 直接发送 Base64 帧到后端
    */
-  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number = 0): Promise<void> {
+  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number = 0, captureMs: number = 0): Promise<void> {
     // 再次检查录制状态
     if (!this.sessionActive) {
       return
@@ -691,8 +852,11 @@ class RecordingService {
           width: width,
           height: height,
           monitor_id: monitorId
-        }
+        },
+        client_capture_ms: captureMs,
       })
+
+      this.applyEnrichmentSignals(result)
 
       // Dispatch frame data directly to TimelineView (no extra HTTP round-trips)
       if (result.status === 'ok' && result.frame_summary && typeof window !== 'undefined') {
@@ -728,6 +892,16 @@ class RecordingService {
 
   /**
    * 停止录制
+   *
+   * 顺序要点：
+   *   1. 翻 ``sessionActive=false``，清队列 → 让所有 ``processSendQueue(monitorId)``
+   *      自然退出，``sendingMonitors`` 会在各自 ``finally`` 里自行释放。
+   *   2. **先** ``await apiClient.stopRecording()`` 让后端先 drain enrichment
+   *      再 flush video/batch buffer——这段期间后端对其它 API 是忙的，但
+   *      前端静默 AbortError 即可（见 ``api.ts`` 超时调优 + ``DailyReportView``
+   *      等页面）。
+   *   3. ``await`` 返回后才释放 ``sendingMonitors``——不过实际上此时它已经
+   *      空了，再显式 clear() 是兜底。
    */
   async stop(): Promise<void> {
     this.sessionActive = false
@@ -735,22 +909,18 @@ class RecordingService {
     this.liveRecording = false
     sessionStorage.removeItem('vlm_is_recording')
     this.notifyStatusListeners()
-    
-    // 清除定时器
+
     if (this.intervalId !== null) {
       clearInterval(this.intervalId)
       this.intervalId = null
     }
 
-    // 重置状态
     this.lastImageDataArray = []
-    this.sendQueue = []
+    this.sendQueues.clear()
     this.backpressureLatched = false
     this.captureTickInFlight = false
-    this.isSending = false  // 释放发送锁，防止残留的 inflight 请求阻塞下次录制
-    console.log('Recording stopped')
+    console.log('Recording stopped; flushing backend...')
 
-    // 通知后端刷新缓冲区（与 store_frame 可能并行；慢时勿用短超时误判为「后端卡死」）
     try {
       await apiClient.stopRecording()
       console.log('Backend buffer flushed on stop')
@@ -766,6 +936,10 @@ class RecordingService {
       } else {
         console.warn('Failed to notify backend to flush buffer:', error)
       }
+    } finally {
+      // 兜底：即使后端响应了 error，依然把 inflight 标记清掉，避免下次录制
+      // 开始时 ``processSendQueue`` 误以为该屏仍有在途请求。
+      this.sendingMonitors.clear()
     }
   }
 
@@ -797,4 +971,3 @@ class RecordingService {
 }
 
 export const recordingService = new RecordingService()
-

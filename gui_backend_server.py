@@ -10,9 +10,10 @@ Responsibilities:
 """
 
 from datetime import datetime, time, timezone, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 import base64
 import io
+import os
 import threading
 import time as time_module
 from collections import deque
@@ -28,6 +29,8 @@ from pathlib import Path
 
 from config import config
 from utils.logger import setup_logger
+from utils.eval_stats import emit_jsonl, get_eval_logger
+from utils.eval_stability import start_stability_monitor
 from utils.app_name_manager import app_name_manager
 from core.api.router import router as data_platform_router, init_data_service
 from core.api.daily_report_routes import router as daily_report_router
@@ -45,10 +48,21 @@ from core.retrieval.reranker import Reranker
 from core.understand.api_vlm import ApiVLM
 from core.ocr import create_ocr_engine
 from core.capture.focused_window import get_focused_window
+from core.worker import EnrichmentJob, FrameEnrichmentWorker
 from utils.model_utils import ensure_model_downloaded
 
 
 logger = setup_logger("gui_backend_server")
+
+_EVAL_LATENCY_ENABLED = config.EVAL_LATENCY_STATS
+_EVAL_STABILITY_ENABLED = config.EVAL_STABILITY_MONITOR
+_RUNTIME_DIAGNOSTIC_LOGS_ENABLED = config.ENABLE_RUNTIME_DIAGNOSTIC_LOGS
+_EVAL_LATENCY_LOGGER = (
+    get_eval_logger("latency_frames", "logs/eval_latency_frames.jsonl")
+    if _EVAL_LATENCY_ENABLED
+    else None
+)
+_EVAL_STABILITY_STOP_EVENT: Optional[threading.Event] = None
 
 app = FastAPI(title="VisualMem Backend Server")
 
@@ -137,6 +151,17 @@ def _to_local(dt_or_str) -> str:
     return dt_or_str.astimezone().isoformat()
 
 
+def _emit_latency_event(event: Dict[str, Any]) -> None:
+    if not _EVAL_LATENCY_ENABLED or _EVAL_LATENCY_LOGGER is None:
+        return
+    emit_jsonl(_EVAL_LATENCY_LOGGER, event)
+
+
+def _runtime_diag(message: str) -> None:
+    if _RUNTIME_DIAGNOSTIC_LOGS_ENABLED:
+        logger.info(message)
+
+
 def _parent_watchdog():
     """
     监控父进程是否还在运行。如果父进程退出，则自动退出。
@@ -177,6 +202,7 @@ ocr_engine = None
 region_ocr_engine = None  # RegionOCREngine (UIED region detection + per-region OCR)
 _models_loaded = False  # Whether heavy models (encoder, reranker, OCR) have been loaded
 _models_loading = False  # Whether models are currently being loaded
+_models_lock = threading.Lock()
 
 # ============ 视频存储相关组件 ============
 temp_frame_buffer: Optional[TempFrameBuffer] = None
@@ -232,7 +258,10 @@ class BatchWriteBuffer:
             self.buffer.append(frame_data)
             buf_len = len(self.buffer)
             should_flush = buf_len >= self.batch_size
-        logger.info(f"BatchWriteBuffer: added frame {frame_data.get('frame_id', '?')}, buffer={buf_len}/{self.batch_size}")
+        _runtime_diag(
+            f"BatchWriteBuffer: added frame {frame_data.get('frame_id', '?')}, "
+            f"buffer={buf_len}/{self.batch_size}"
+        )
         if should_flush:
             self._flush_buffer()
     
@@ -244,26 +273,48 @@ class BatchWriteBuffer:
             frames_to_write = list(self.buffer)
             self.buffer.clear()
             self.last_flush_time = time_module.time()
-        
+
         if not frames_to_write:
             return
-        
+
+        n = len(frames_to_write)
+        t_total0 = time_module.time()
+        lance_ms = 0.0
+        sqlite_ms_total = 0.0
+        sqlite_failed = 0
+        sqlite_ok = 0
+        # Snapshot which frame_ids are in this flush so a mid-flush hang is
+        # diagnosable from the log (matched against enrich heartbeat / stack dump).
+        ids_preview = ",".join(f.get("frame_id", "?") for f in frames_to_write[:5])
+        if n > 5:
+            ids_preview += f",...(+{n - 5})"
+        _runtime_diag(
+            f"BatchWriteBuffer: flushing {n} frames to LanceDB+SQLite... ids=[{ids_preview}]"
+        )
+
         try:
-            logger.info(f"BatchWriteBuffer: flushing {len(frames_to_write)} frames to LanceDB+SQLite...")
-            # 批量写入到 LanceDB
             if vector_storage is not None:
-                success = vector_storage.store_frames_batch(frames_to_write)
+                t0 = time_module.time()
+                try:
+                    success = vector_storage.store_frames_batch(frames_to_write)
+                except Exception as e:
+                    logger.error(f"BatchWriteBuffer: LanceDB threw: {e}", exc_info=True)
+                    success = False
+                lance_ms = (time_module.time() - t0) * 1000.0
                 if success:
-                    logger.info(f"BatchWriteBuffer: ✓ LanceDB wrote {len(frames_to_write)} frames")
+                    _runtime_diag(
+                        f"BatchWriteBuffer: ✓ LanceDB wrote {n} frames in {lance_ms:.0f}ms"
+                    )
                 else:
-                    logger.error(f"BatchWriteBuffer: ✗ LanceDB batch write failed")
-            
-            # 批量写入到 SQLite（逐条写入，因为 SQLite 的批量写入接口可能不同）
+                    logger.error(
+                        f"BatchWriteBuffer: ✗ LanceDB batch write failed in {lance_ms:.0f}ms"
+                    )
+
             if sqlite_storage is not None:
                 for frame_data in frames_to_write:
+                    fid = frame_data.get("frame_id", "?")
+                    t0 = time_module.time()
                     try:
-                        # If OCR was already stored via store_ocr_with_regions,
-                        # pass empty ocr_text to avoid duplicate ocr_text rows.
                         ocr_text_for_sqlite = "" if frame_data.get("_ocr_regions_stored") else frame_data.get("ocr_text", "")
                         sqlite_storage.store_frame_with_ocr(
                             frame_id=frame_data["frame_id"],
@@ -280,22 +331,65 @@ class BatchWriteBuffer:
                             focused_app_name=frame_data.get("focused_app_name"),
                             focused_window_name=frame_data.get("focused_window_name"),
                         )
+                        sqlite_ok += 1
                     except Exception as e:
-                        logger.error(f"写入 SQLite 失败 (frame_id={frame_data.get('frame_id')}): {e}")
+                        sqlite_failed += 1
+                        logger.error(
+                            f"BatchWriteBuffer: SQLite write failed for {fid}: {e}",
+                            exc_info=True,
+                        )
+                    finally:
+                        sqlite_ms_total += (time_module.time() - t0) * 1000.0
         except Exception as e:
-            logger.error(f"批量写入失败: {e}")
-    
+            logger.error(f"BatchWriteBuffer: flush aborted: {e}", exc_info=True)
+
+        total_ms = (time_module.time() - t_total0) * 1000.0
+        avg_sqlite = (sqlite_ms_total / n) if n else 0.0
+        _runtime_diag(
+            f"BatchWriteBuffer: flush done n={n} total={total_ms:.0f}ms "
+            f"lance={lance_ms:.0f}ms sqlite_total={sqlite_ms_total:.0f}ms "
+            f"sqlite_avg={avg_sqlite:.0f}ms ok={sqlite_ok} failed={sqlite_failed}"
+        )
+        _emit_latency_event(
+            {
+                "event_type": "batch_flush",
+                "n_frames": n,
+                "total_ms": total_ms,
+                "lance_ms": lance_ms,
+                "sqlite_total_ms": sqlite_ms_total,
+                "sqlite_ok": sqlite_ok,
+                "sqlite_failed": sqlite_failed,
+            }
+        )
+
     def _periodic_flush(self):
         """定期检查并刷新缓冲区（后台线程）"""
+        last_idle_log = time_module.time()
+        IDLE_LOG_INTERVAL = 60.0  # heartbeat even when buffer empty
         while not self.stop_event.is_set():
-            time_module.sleep(1)  # 每秒检查一次
+            time_module.sleep(1)
             with self.buffer_lock:
                 elapsed = time_module.time() - self.last_flush_time
-                should_flush = elapsed >= self.flush_interval and len(self.buffer) > 0
-            
+                buf_len = len(self.buffer)
+                should_flush = elapsed >= self.flush_interval and buf_len > 0
+
             if should_flush:
-                logger.info(f"BatchWriteBuffer: periodic flush triggered ({elapsed:.0f}s elapsed, {len(self.buffer)} frames)")
+                _runtime_diag(
+                    f"BatchWriteBuffer: periodic flush triggered ({elapsed:.0f}s elapsed, {buf_len} frames)"
+                )
                 self._flush_buffer()
+
+            now = time_module.time()
+            if _RUNTIME_DIAGNOSTIC_LOGS_ENABLED and now - last_idle_log >= IDLE_LOG_INTERVAL:
+                # Cheap periodic visibility: if this stops appearing in the
+                # log while frames are still being captured, the flush thread
+                # itself has died (which previously went completely unnoticed).
+                logger.info(
+                    f"BatchWriteBuffer: heartbeat buffer={buf_len} "
+                    f"since_last_flush={elapsed:.0f}s "
+                    f"config(batch={self.batch_size}, interval={self.flush_interval}s)"
+                )
+                last_idle_log = now
     
     def start(self):
         """启动后台刷新线程"""
@@ -316,6 +410,11 @@ class BatchWriteBuffer:
 
 # 全局批量写入缓冲区
 batch_write_buffer: Optional[BatchWriteBuffer] = None
+
+# Long-lived enrichment worker: keeps heavy per-frame work
+# (embedding, window OCR, cluster_assign, batch_write_buffer.add_frame)
+# off the /api/store_frame HTTP request path. See core/worker/.
+frame_enrichment_worker: Optional[FrameEnrichmentWorker] = None
 
 
 def _resolve_sub_frame_image_path(sf: dict) -> Optional[str]:
@@ -414,6 +513,7 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
     if not frames or ffmpeg_compressor is None:
         return
     
+    t0 = time_module.time()
     try:
         # 获取输出路径
         first_frame = frames[0]
@@ -545,6 +645,16 @@ def _compress_video_batch(batch_type: str, identifier: str, frames: List[FrameIn
             
     except Exception as e:
         logger.error(f"Error compressing video batch: {e}")
+    finally:
+        _emit_latency_event(
+            {
+                "event_type": "video_compress_batch",
+                "batch_type": batch_type,
+                "identifier": identifier,
+                "frames_in_batch": len(frames),
+                "compress_ms": (time_module.time() - t0) * 1000.0,
+            }
+        )
 
 
 def _check_and_compress_batches():
@@ -720,18 +830,7 @@ def _init_components():
             logger.warning(f"Failed to init OCR engine, fallback to dummy: {e}")
             ocr_engine = create_ocr_engine("dummy")
 
-    if region_ocr_engine is None and ocr_engine is not None:
-        from core.ocr.region_detector import UIEDRegionDetector
-        from core.ocr.region_ocr_engine import RegionOCREngine
-        _uied = UIEDRegionDetector() if config.ENABLE_UIED else None
-        region_ocr_engine = RegionOCREngine(
-            ocr_engine=ocr_engine,
-            region_detector=_uied,
-        )
-        if _uied is not None:
-            logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
-        else:
-            logger.info("RegionOCREngine initialized (whole-image OCR only; ENABLE_UIED=false).")
+    _init_region_ocr_engine()
 
 
 _DIFF_STATE_TABLE = "window_diff_state"
@@ -874,6 +973,44 @@ def _warm_up_frame_diff_detector():
         logger.warning(f"Frame diff warm-up failed (non-fatal): {e}")
 
 
+def _init_region_ocr_engine() -> None:
+    """Initialize region OCR, but degrade gracefully when UIED/OpenCV is unavailable."""
+    global ocr_engine, region_ocr_engine
+
+    if region_ocr_engine is not None or ocr_engine is None:
+        return
+
+    detector = None
+    if config.ENABLE_UIED:
+        try:
+            from core.ocr.region_detector import UIEDRegionDetector
+
+            detector = UIEDRegionDetector()
+        except Exception as e:
+            logger.warning(
+                "UIED region detector unavailable, falling back to whole-image OCR only: "
+                f"{e}"
+            )
+
+    try:
+        from core.ocr.region_ocr_engine import RegionOCREngine
+
+        region_ocr_engine = RegionOCREngine(
+            ocr_engine=ocr_engine,
+            region_detector=detector,
+        )
+        if detector is not None:
+            logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
+        else:
+            logger.info("RegionOCREngine initialized (whole-image OCR only).")
+    except Exception as e:
+        logger.warning(
+            "Failed to initialize RegionOCREngine; OCR will continue without region segmentation: "
+            f"{e}"
+        )
+        region_ocr_engine = None
+
+
 def _init_models():
     """
     Load heavy ML models: encoder, reranker, OCR engine.
@@ -884,69 +1021,67 @@ def _init_models():
 
     if _models_loaded:
         return
-    _models_loading = True
+    with _models_lock:
+        if _models_loaded:
+            return
 
-    try:
-        # 0. Pre-flight check: Ensure models are downloaded
-        ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
-        if config.ENABLE_RERANK:
-            ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
-
-        # 1. Load encoder (embedding model)
-        logger.info(f"[model 1/4] Loading encoder {config.EMBEDDING_MODEL}...")
-        encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
-
-        # 2. Initialize LanceDB storage (needs encoder.embedding_dim)
-        logger.info("[model 2/4] Initializing LanceDB storage...")
-        vector_storage = LanceDBStorage(
-            db_path=config.LANCEDB_PATH,
-            embedding_dim=encoder.embedding_dim,
+        _models_loading = True
+        logger.info(
+            "Starting model initialization on thread "
+            f"{threading.current_thread().name} (lazy={config.MODEL_LAZY_LOAD})"
         )
 
-        # 2b. Optimize LanceDB
         try:
-            if vector_storage.table is not None:
-                logger.info("Optimizing LanceDB (cleanup old versions)...")
-                vector_storage.cleanup_old_versions(older_than_hours=0.1, delete_unverified=True)
-                logger.info("LanceDB optimization done.")
-            else:
-                logger.info("LanceDB table does not exist, skipping optimization.")
-        except Exception as e:
-            logger.warning(f"LanceDB optimization failed: {e}")
+            # 0. Pre-flight check: Ensure models are downloaded
+            ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
+            if config.ENABLE_RERANK:
+                ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
 
-        # 3. Load Reranker model
-        if config.ENABLE_RERANK:
-            logger.info("[model 3/4] Loading Reranker model...")
-            reranker = Reranker()
-        else:
-            logger.info("[model 3/4] Reranker disabled (ENABLE_RERANK=False)")
+            # 1. Load encoder (embedding model)
+            logger.info(f"[model 1/4] Loading encoder {config.EMBEDDING_MODEL}...")
+            encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
 
-        # 4. Initialize OCR engine (if enabled)
-        if config.ENABLE_OCR:
-            logger.info(f"[model 4/4] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
-            try:
-                ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
-            except Exception as e:
-                logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
-                ocr_engine = create_ocr_engine("dummy")
-            from core.ocr.region_detector import UIEDRegionDetector
-            from core.ocr.region_ocr_engine import RegionOCREngine
-            _uied = UIEDRegionDetector() if config.ENABLE_UIED else None
-            region_ocr_engine = RegionOCREngine(
-                ocr_engine=ocr_engine,
-                region_detector=_uied,
+            # 2. Initialize LanceDB storage (needs encoder.embedding_dim)
+            logger.info("[model 2/4] Initializing LanceDB storage...")
+            vector_storage = LanceDBStorage(
+                db_path=config.LANCEDB_PATH,
+                embedding_dim=encoder.embedding_dim,
             )
-            if _uied is not None:
-                logger.info("RegionOCREngine initialized (UIED + per-region OCR).")
-            else:
-                logger.info("RegionOCREngine initialized (whole-image OCR only; ENABLE_UIED=false).")
-        else:
-            logger.info("[model 4/4] OCR engine disabled (ENABLE_OCR=False)")
 
-        _models_loaded = True
-        logger.info("All ML models loaded successfully!")
-    finally:
-        _models_loading = False
+            # 2b. Optimize LanceDB
+            try:
+                if vector_storage.table is not None:
+                    logger.info("Optimizing LanceDB (cleanup old versions)...")
+                    vector_storage.cleanup_old_versions(older_than_hours=0.1, delete_unverified=True)
+                    logger.info("LanceDB optimization done.")
+                else:
+                    logger.info("LanceDB table does not exist, skipping optimization.")
+            except Exception as e:
+                logger.warning(f"LanceDB optimization failed: {e}")
+
+            # 3. Load Reranker model
+            if config.ENABLE_RERANK:
+                logger.info("[model 3/4] Loading Reranker model...")
+                reranker = Reranker()
+            else:
+                logger.info("[model 3/4] Reranker disabled (ENABLE_RERANK=False)")
+
+            # 4. Initialize OCR engine (if enabled)
+            if config.ENABLE_OCR:
+                logger.info(f"[model 4/4] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
+                try:
+                    ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
+                except Exception as e:
+                    logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
+                    ocr_engine = create_ocr_engine("dummy")
+                _init_region_ocr_engine()
+            else:
+                logger.info("[model 4/4] OCR engine disabled (ENABLE_OCR=False)")
+
+            _models_loaded = True
+            logger.info("All ML models loaded successfully!")
+        finally:
+            _models_loading = False
 
 
 def _init_infra():
@@ -954,8 +1089,9 @@ def _init_infra():
     Initialize lightweight infrastructure components (no ML models).
     Always called at startup regardless of MODEL_LAZY_LOAD.
     """
-    global sqlite_storage, vlm, batch_write_buffer
+    global sqlite_storage, vlm, batch_write_buffer, frame_enrichment_worker
     global temp_frame_buffer, ffmpeg_compressor, ffmpeg_extractor, window_diff_detector
+    global _EVAL_STABILITY_STOP_EVENT
 
     logger.info("=" * 60)
     logger.info("Initializing infrastructure components...")
@@ -970,8 +1106,19 @@ def _init_infra():
     vlm = ApiVLM()
 
     # Batch write buffer
-    logger.info("[infra 3/7] Initializing batch write buffer...")
-    batch_write_buffer = BatchWriteBuffer(batch_size=10, flush_interval_seconds=60.0)
+    # NOTE: After the /api/store_frame fast-path refactor, ``today_count`` and
+    # ``/api/recent_frames`` both read from SQLite. Stale reads (counter-drift
+    # and empty realtime view) appear whenever this buffer lags behind the
+    # fast path by more than a few frames, so keep the parameters small.
+    logger.info(
+        f"[infra 3/7] Initializing batch write buffer "
+        f"(size={config.BATCH_WRITE_BUFFER_SIZE}, "
+        f"flush_interval={config.BATCH_WRITE_FLUSH_INTERVAL_SECONDS:.1f}s)..."
+    )
+    batch_write_buffer = BatchWriteBuffer(
+        batch_size=config.BATCH_WRITE_BUFFER_SIZE,
+        flush_interval_seconds=config.BATCH_WRITE_FLUSH_INTERVAL_SECONDS,
+    )
     batch_write_buffer.start()
 
     # Temp frame buffer for video compression
@@ -1003,6 +1150,40 @@ def _init_infra():
     logger.info("Warming up frame diff detector from previous session...")
     _warm_up_frame_diff_detector()
     _start_periodic_diff_state_flush(interval=300.0)  # every 5 min, crash safety
+
+    # Long-lived frame enrichment worker (embedding / OCR / sub_frame writes).
+    # Started once here; drained on /api/recording/stop and on shutdown.
+    logger.info(
+        f"[infra 8/8] Starting frame enrichment worker "
+        f"({config.FRAME_ENRICHMENT_WORKERS} threads)..."
+    )
+    frame_enrichment_worker = FrameEnrichmentWorker(
+        num_workers=config.FRAME_ENRICHMENT_WORKERS,
+        name="frame-enrich",
+        enable_diagnostics=config.ENABLE_ENRICHMENT_STACK_DUMPS,
+        heartbeat_interval_s=config.ENRICH_HEARTBEAT_SECONDS,
+        stuck_job_threshold_s=config.ENRICH_STUCK_SECONDS,
+    )
+    frame_enrichment_worker.start()
+
+    if _EVAL_STABILITY_ENABLED:
+        interval_s = config.EVAL_STABILITY_INTERVAL_S
+        _EVAL_STABILITY_STOP_EVENT = start_stability_monitor(
+            interval_s=interval_s,
+            log_path="logs/eval_stability.jsonl",
+            db_paths=[
+                config.OCR_DB_PATH,
+                config.ACTIVITY_DB_PATH,
+            ],
+            dir_paths=[
+                config.LANCEDB_PATH,
+                str(Path(config.STORAGE_ROOT) / "temp_frames"),
+                str(Path(config.STORAGE_ROOT) / "visualmem_video"),
+            ],
+        )
+        logger.info(
+            f"Eval stability monitor started (interval={interval_s:.1f}s, log=logs/eval_stability.jsonl)"
+        )
 
 
 def _init_all_components():
@@ -1057,6 +1238,11 @@ class StoreFrameRequest(BaseModel):
     monitor_id: int = 0  # 显示器ID
     metadata: Optional[Dict] = None
     windows: Optional[List[WindowInfo]] = None  # 窗口截图列表（可选）
+    client_capture_ms: Optional[float] = None
+
+
+class FrontendConfigResponse(BaseModel):
+    theme: str
 
 
 class FrameResult(BaseModel):
@@ -1156,6 +1342,10 @@ async def shutdown_event():
     logger.info("Shutting down backend server...")
     
     global encoder, reranker, vlm, ocr_engine, region_ocr_engine, vector_storage, sqlite_storage
+    global _EVAL_STABILITY_STOP_EVENT
+    if _EVAL_STABILITY_STOP_EVENT is not None:
+        _EVAL_STABILITY_STOP_EVENT.set()
+        _EVAL_STABILITY_STOP_EVENT = None
     
     # 0. Persist frame diff state (before any cleanup)
     try:
@@ -1163,6 +1353,31 @@ async def shutdown_event():
         _flush_diff_state()
     except Exception as e:
         logger.error(f"Error flushing diff state: {e}")
+
+    # 0.5 Drain enrichment worker so any in-flight frames finish writing
+    # before we flush video/batch buffers.
+    try:
+        if frame_enrichment_worker is not None:
+            stop_timeout = getattr(config, "STOP_FLUSH_MAX_SECONDS", 30.0)
+            logger.info(
+                f"Draining frame enrichment queue on shutdown (max {stop_timeout}s)..."
+            )
+            drained = frame_enrichment_worker.drain(timeout=stop_timeout)
+            stats = frame_enrichment_worker.stats()
+            if drained:
+                logger.info(
+                    f"Frame enrichment drained on shutdown "
+                    f"(completed={stats['completed']} failed={stats['failed']})"
+                )
+            else:
+                logger.warning(
+                    f"Frame enrichment drain TIMEOUT on shutdown — "
+                    f"queue={stats['queue_depth']} inflight={stats['inflight']}; "
+                    f"proceeding to flush anyway"
+                )
+            frame_enrichment_worker.shutdown(timeout=5.0)
+    except Exception as e:
+        logger.error(f"Error draining frame enrichment worker: {e}")
 
     # 1. 先刷新视频缓冲区
     try:
@@ -1239,17 +1454,18 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/api/frontend_config", response_model=FrontendConfigResponse)
+def get_frontend_config():
+    return {"theme": config.FRONTEND_THEME}
+
+
 @app.post("/api/load_models")
-def load_models_api():
+async def load_models_api():
     """
     On-demand loading of heavy ML models (encoder, reranker, OCR).
     Called by frontend before starting recording when MODEL_LAZY_LOAD=true.
     Returns immediately if models are already loaded.
     """
-    if _models_loaded:
-        return {"status": "ok", "message": "Models already loaded"}
-    if _models_loading:
-        return {"status": "loading", "message": "Models are currently loading"}
     try:
         _init_models()
         return {"status": "ok", "message": "Models loaded successfully"}
@@ -1323,7 +1539,28 @@ def get_stats():
                 stats["total_frames"] = sqlite_stats.get("total_frames", 0)
         except Exception as e:
             logger.warning(f"Failed to get SQLite storage stats: {e}")
-    
+
+    # Enrichment worker backlog (for remote GUI capture backpressure)
+    if frame_enrichment_worker is not None:
+        try:
+            es = frame_enrichment_worker.stats()
+            qd = int(es.get("queue_depth", 0) or 0)
+            inf = int(es.get("inflight", 0) or 0)
+            stats["enrichment_queue_depth"] = qd
+            stats["enrichment_inflight"] = inf
+            stats["enrichment_pipeline_depth"] = qd + inf
+        except Exception as e:
+            logger.debug(f"Enrichment stats for /api/stats: {e}")
+            stats["enrichment_queue_depth"] = 0
+            stats["enrichment_inflight"] = 0
+            stats["enrichment_pipeline_depth"] = 0
+    else:
+        stats["enrichment_queue_depth"] = 0
+        stats["enrichment_inflight"] = 0
+        stats["enrichment_pipeline_depth"] = 0
+    stats["enrichment_backpressure_high"] = config.ENRICHMENT_PIPELINE_BACKPRESS_HIGH
+    stats["enrichment_backpressure_low"] = config.ENRICHMENT_PIPELINE_BACKPRESS_LOW
+
     return stats
 
 
@@ -1343,25 +1580,35 @@ def get_activity_cluster_debug(app_name: Optional[str] = Query(default=None)):
 @app.post("/api/store_frame")
 def store_frame(req: StoreFrameRequest):
     """
-    Store a frame sent from remote GUI (支持新的视频存储模式).
-    
-    新逻辑:
-    1. 全屏截图 -> 临时PNG文件 -> 每60帧压缩成MP4
-    2. 窗口截图 -> 临时PNG文件 -> 每60帧压缩成MP4
-    3. 同时进行embedding和OCR处理
+    Store a frame sent from remote GUI (video-storage mode).
+
+    Request path is split in two:
+
+    * **Sync fast path** (this function body, target < 500ms): decode + solid-
+      color check + focused-window query + full-screen PNG persist. Returns a
+      ``frame_summary`` so the frontend timeline can update immediately.
+    * **Enrichment job** (``_enrich_frame_job``, runs on
+      :data:`frame_enrichment_worker`): full-screen embedding, per-window
+      embedding + OCR + sub_frame persistence, fullscreen-app sub_frame
+      synthesis, cluster assignment, ``batch_write_buffer.add_frame`` for the
+      main frame.
+
+    Sub-frames are therefore initially returned empty and populated in SQLite /
+    LanceDB asynchronously. TimelineView only consumes the main-frame
+    image_path on the immediate ``recording-frame-stored`` event — sub-frames
+    appear on the next page refresh or drill-down fetch.
     """
     global encoder, vector_storage, sqlite_storage, batch_write_buffer
-    global temp_frame_buffer
+    global temp_frame_buffer, frame_enrichment_worker
 
     _t0 = time_module.time()
-    _HANDLER_MAX_SECONDS = 25
     logger.info(f"store_frame: START {req.frame_id}")
 
-    # 组件检查
     assert encoder is not None
     assert vector_storage is not None
     assert sqlite_storage is not None
     assert batch_write_buffer is not None
+    assert frame_enrichment_worker is not None
 
     try:
         ts = datetime.fromisoformat(req.timestamp)
@@ -1369,37 +1616,44 @@ def store_frame(req: StoreFrameRequest):
         logger.error(f"Invalid timestamp '{req.timestamp}': {e}")
         raise HTTPException(status_code=400, detail=f"Invalid timestamp: {e}")
 
-    # Decode full screen image
+    # Decode full screen image (needed for solid-color check AND for embedding
+    # inside the worker — decode once and hand the PIL off).
     img_bytes = base64.b64decode(req.image_base64)
     image = PILImage.open(io.BytesIO(img_bytes)).convert("RGB")
 
     # Skip solid-color / black-screen frames entirely (e.g. monitor off, lid closed)
     if is_solid_color_image(image):
         logger.debug("store_frame: skipping solid-color full screen image (screen off?)")
-        return {"status": "skipped", "reason": "solid_color_frame", "frame_id": None}
+        es0 = frame_enrichment_worker.stats()
+        q0 = int(es0.get("queue_depth", 0) or 0)
+        i0 = int(es0.get("inflight", 0) or 0)
+        return {
+            "status": "skipped",
+            "reason": "solid_color_frame",
+            "frame_id": None,
+            "enrichment_queue_depth": q0,
+            "enrichment_inflight": i0,
+            "enrichment_pipeline_depth": q0 + i0,
+            "enrichment_backpressure_high": config.ENRICHMENT_PIPELINE_BACKPRESS_HIGH,
+            "enrichment_backpressure_low": config.ENRICHMENT_PIPELINE_BACKPRESS_LOW,
+        }
 
-    # 生成 frame_id
     base_frame_id = ts.strftime("%Y%m%d_%H%M%S_") + f"{ts.microsecond:06d}"
     frame_id = f"frame_{base_frame_id}_{req.monitor_id}"
 
-    # ========== 0. 检测当前聚焦窗口 ==========
     focused_app, focused_win = get_focused_window()
 
-    # ========== 1. 处理全屏截图 ==========
-    
-    # 保存到临时文件用于视频压缩
+    # Persist full-screen PNG to the temp frame buffer. This is a cheap disk
+    # write (no ffmpeg yet); batch compression runs later inside the worker
+    # when a 60-frame batch is ready.
     if temp_frame_buffer is not None:
-        temp_image_path, batch_ready = temp_frame_buffer.add_full_screen_frame(
+        temp_image_path, fs_batch_ready = temp_frame_buffer.add_full_screen_frame(
             frame_id=frame_id,
             image=image,
             timestamp=ts,
             monitor_id=req.monitor_id,
-            metadata=req.metadata
+            metadata=req.metadata,
         )
-        
-        # 如果批次就绪，触发压缩
-        if batch_ready:
-            _check_and_compress_batches()
     else:
         # 回退到原有的JPEG存储方式
         date_dir = config.IMAGE_STORAGE_PATH
@@ -1408,12 +1662,150 @@ def store_frame(req: StoreFrameRequest):
         image_filename = f"{base_frame_id}.jpg"
         temp_image_path = str((date_path / image_filename).resolve())
         image.save(temp_image_path, format="JPEG", quality=config.IMAGE_QUALITY)
+        fs_batch_ready = False
 
-    # ========== 2. Embedding 和 OCR 处理 ==========
-    logger.info(f"store_frame: {frame_id} step=embedding")
-    # Compute image embedding
+    sync_ms = (time_module.time() - _t0) * 1000.0
+
+    # Build fast-path response BEFORE enqueuing so the returned frame_summary
+    # reflects what's on disk right now.
+    today_count = 0
+    try:
+        today_str = ts.strftime("%Y-%m-%d")
+        next_day_str = (ts + timedelta(days=1)).strftime("%Y-%m-%d")
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) as count FROM frames
+                WHERE timestamp >= ? AND timestamp < ?
+                  AND image_path IS NOT NULL AND image_path != ''
+                  AND frame_id LIKE 'frame_%'
+                """,
+                (today_str, next_day_str),
+            )
+            row = cursor.fetchone()
+            today_count = row["count"] if row else 0
+    except Exception:
+        pass
+
+    queue_depth_before = frame_enrichment_worker.queue_depth()
+
+    def _processor():
+        _enrich_frame_job(
+            req=req,
+            image=image,
+            ts=ts,
+            frame_id=frame_id,
+            base_frame_id=base_frame_id,
+            temp_image_path=temp_image_path,
+            focused_app=focused_app,
+            focused_win=focused_win,
+            fs_batch_ready=fs_batch_ready,
+            sync_ms=sync_ms,
+            client_capture_ms=float(req.client_capture_ms or 0.0),
+        )
+
+    frame_enrichment_worker.submit(
+        EnrichmentJob(frame_id=frame_id, processor=_processor)
+    )
+
+    es_after = frame_enrichment_worker.stats()
+    q_after = int(es_after.get("queue_depth", 0) or 0)
+    i_after = int(es_after.get("inflight", 0) or 0)
+
+    logger.info(
+        f"store_frame: {frame_id} fastpath_done sync_ms={sync_ms:.0f} "
+        f"enrich_queue_depth={queue_depth_before + 1}"
+    )
+
+    return {
+        "status": "ok",
+        "frame_id": frame_id,
+        "sub_frame_count": 0,  # populated asynchronously
+        "today_count": today_count,
+        "enrichment_queue_depth": q_after,
+        "enrichment_inflight": i_after,
+        "enrichment_pipeline_depth": q_after + i_after,
+        "enrichment_backpressure_high": config.ENRICHMENT_PIPELINE_BACKPRESS_HIGH,
+        "enrichment_backpressure_low": config.ENRICHMENT_PIPELINE_BACKPRESS_LOW,
+        "frame_summary": {
+            "frame_id": frame_id,
+            "timestamp": ts.isoformat(),
+            "image_path": temp_image_path,
+            "ocr_text": "",
+            "sub_frames": [],
+        },
+    }
+
+
+def _enrich_frame_job(
+    *,
+    req: "StoreFrameRequest",
+    image: "PILImage.Image",
+    ts: datetime,
+    frame_id: str,
+    base_frame_id: str,
+    temp_image_path: str,
+    focused_app: Optional[str],
+    focused_win: Optional[str],
+    fs_batch_ready: bool,
+    sync_ms: float = 0.0,
+    client_capture_ms: float = 0.0,
+) -> None:
+    """Heavy per-frame work, run on :data:`frame_enrichment_worker`.
+
+    This used to be inline in ``store_frame`` and blocked the HTTP request for
+    10–30 s in ``all`` recording mode. Moving it here keeps the fast path
+    sub-second while the workers handle embedding, OCR, sub_frame persistence
+    and cluster assignment at their own pace.
+    """
+    global encoder, vector_storage, sqlite_storage, batch_write_buffer
+    global temp_frame_buffer
+
+    _t0 = time_module.time()
+    _HANDLER_MAX_SECONDS = 25
+    _runtime_diag(f"enrich_frame: {frame_id} step=start")
+    timings: Dict[str, float] = {
+        "client_capture_ms": float(client_capture_ms or 0.0),
+        "sync_ms": float(sync_ms or 0.0),
+        "compress_batches_ms": 0.0,
+        "embedding_ms": 0.0,
+        "win_diff_ms": 0.0,
+        "win_embedding_total_ms": 0.0,
+        "win_ocr_total_ms": 0.0,
+        "uied_total_ms": 0.0,
+        "syn_ocr_ms": 0.0,
+        "main_store_ocr_ms": 0.0,
+        "cluster_assign_total_ms": 0.0,
+        "add_frame_ms": 0.0,
+    }
+
+    # If the full-screen batch became ready during the sync path, compress it
+    # here instead of blocking the HTTP response.
+    if fs_batch_ready:
+        _tc0 = time_module.time()
+        try:
+            _check_and_compress_batches()
+            _runtime_diag(
+                f"enrich_frame: {frame_id} step=compress_batches_done "
+                f"t={((time_module.time() - _tc0) * 1000):.0f}ms"
+            )
+            timings["compress_batches_ms"] += (time_module.time() - _tc0) * 1000.0
+        except Exception as e:
+            logger.warning(
+                f"Full-screen batch compression failed for {frame_id} after "
+                f"{((time_module.time() - _tc0) * 1000):.0f}ms: {e}",
+                exc_info=True,
+            )
+
+    _te0 = time_module.time()
+    _runtime_diag(f"enrich_frame: {frame_id} step=embedding")
     embedding = encoder.encode_image(image)
-    logger.info(f"store_frame: {frame_id} step=embedding_done")
+    _runtime_diag(
+        f"enrich_frame: {frame_id} step=embedding_done "
+        f"t={((time_module.time() - _te0) * 1000):.0f}ms"
+    )
+    timings["embedding_ms"] = (time_module.time() - _te0) * 1000.0
 
     # Full-screen frame OCR is deferred: we collect sub_frame OCR results first,
     # then combine them as the frame's ocr_text (labeled by app_name).
@@ -1446,12 +1838,12 @@ def store_frame(req: StoreFrameRequest):
     # 如果前端没有提供窗口信息，且启用了后端窗口捕获，使用screencap_rs
     elif ENABLE_BACKEND_WINDOW_CAPTURE and USE_SCREENCAP_RS and screencap_rs_module is not None:
         try:
-            logger.info(f"store_frame: {frame_id} step=capture_windows_start")
+            _runtime_diag(f"store_frame: {frame_id} step=capture_windows_start")
             captured_windows = screencap_rs_module.capture_all_windows(
                 include_minimized=False,
                 filter_system=True
             )
-            logger.info(f"store_frame: {frame_id} step=capture_windows_done count={len(captured_windows)}")
+            _runtime_diag(f"store_frame: {frame_id} step=capture_windows_done count={len(captured_windows)}")
             for cw in captured_windows:
                 try:
                     # 将PNG bytes转换为PIL Image
@@ -1503,6 +1895,7 @@ def store_frame(req: StoreFrameRequest):
                 
                 # Window-level frame diff dedup
                 if window_diff_detector is not None:
+                    _td0 = time_module.time()
                     win_hash = calculate_image_hash(win_image)
                     wf = WF(
                         app_name=app_name,
@@ -1512,6 +1905,7 @@ def store_frame(req: StoreFrameRequest):
                         timestamp=ts,
                     )
                     diff_result = window_diff_detector.check_window_diff(wf)
+                    timings["win_diff_ms"] += (time_module.time() - _td0) * 1000.0
                     if not diff_result.should_store:
                         logger.debug(
                             f"Skipping duplicate window {app_name}/{window_name} "
@@ -1539,12 +1933,15 @@ def store_frame(req: StoreFrameRequest):
                 sub_frame_id = f"subframe_{safe_app}_{base_frame_id}_{i}"
                 
                 # 对窗口帧做 embedding
-                logger.info(f"store_frame: {frame_id} win={app_name} step=win_embedding")
+                _runtime_diag(f"store_frame: {frame_id} win={app_name} step=win_embedding")
+                _twe0 = time_module.time()
                 win_embedding = encoder.encode_image(win_image)
-                logger.info(f"store_frame: {frame_id} win={app_name} step=win_embedding_done")
+                _runtime_diag(f"store_frame: {frame_id} win={app_name} step=win_embedding_done")
+                timings["win_embedding_total_ms"] += (time_module.time() - _twe0) * 1000.0
 
                 # 对窗口帧做 region OCR
-                logger.info(f"store_frame: {frame_id} win={app_name} step=win_ocr_start")
+                _runtime_diag(f"store_frame: {frame_id} win={app_name} step=win_ocr_start")
+                _two0 = time_module.time()
                 win_ocr_text = ""
                 win_ocr_json = ""
                 win_ocr_engine_name = "none"
@@ -1562,6 +1959,8 @@ def store_frame(req: StoreFrameRequest):
                 if region_ocr_engine is not None:
                     try:
                         win_regions = region_ocr_engine.recognize_regions(win_image)
+                        _region_timing = getattr(region_ocr_engine, "last_timing", {}) or {}
+                        timings["uied_total_ms"] += float(_region_timing.get("detector_ms", 0.0) or 0.0)
                         if win_regions:
                             win_w, win_h = win_image.size
                             win_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
@@ -1605,7 +2004,8 @@ def store_frame(req: StoreFrameRequest):
                     except Exception as e:
                         logger.warning(f"Region OCR failed for window {app_name}: {e}")
 
-                logger.info(f"store_frame: {frame_id} win={app_name} step=win_ocr_done len={len(win_ocr_text)}")
+                _runtime_diag(f"store_frame: {frame_id} win={app_name} step=win_ocr_done len={len(win_ocr_text)}")
+                timings["win_ocr_total_ms"] += (time_module.time() - _two0) * 1000.0
 
                 # Collect for frame-level combined OCR
                 if win_ocr_text:
@@ -1663,8 +2063,9 @@ def store_frame(req: StoreFrameRequest):
 
                 # Activity cluster assignment (real-time)
                 if cluster_manager is not None:
+                    _tca0 = time_module.time()
                     try:
-                        logger.info(f"store_frame: {frame_id} win={app_name} step=cluster_assign")
+                        _runtime_diag(f"store_frame: {frame_id} win={app_name} step=cluster_assign")
                         activity_label = cluster_manager.assign_frame(
                             app_name=app_name,
                             frame_id=sub_frame_id,
@@ -1675,12 +2076,20 @@ def store_frame(req: StoreFrameRequest):
                             timestamp=ts.isoformat(),
                             window_name=window_name,
                         )
-                        logger.info(f"store_frame: {frame_id} win={app_name} step=cluster_done label={activity_label}")
+                        _runtime_diag(
+                            f"store_frame: {frame_id} win={app_name} step=cluster_done "
+                            f"label={activity_label} t={((time_module.time() - _tca0) * 1000):.0f}ms"
+                        )
+                        timings["cluster_assign_total_ms"] += (time_module.time() - _tca0) * 1000.0
                         if activity_label:
                             logger.debug(f"Assigned {sub_frame_id} -> '{activity_label}'")
                         _log_non_committed_cluster_result(app_name, sub_frame_id)
                     except Exception as e:
-                        logger.debug(f"Cluster assign failed for {sub_frame_id}: {e}")
+                        logger.warning(
+                            f"store_frame: {frame_id} win={app_name} step=cluster_failed "
+                            f"t={((time_module.time() - _tca0) * 1000):.0f}ms err={e}",
+                            exc_info=True,
+                        )
 
                 sub_frame_ids.append(sub_frame_id)
                 sub_frame_summaries.append({
@@ -1709,7 +2118,7 @@ def store_frame(req: StoreFrameRequest):
     if focused_app and temp_frame_buffer is not None:
         captured_app_names = {w.get("app_name", "") for w in windows_to_process}
         if focused_app not in captured_app_names:
-            logger.info(f"store_frame: {frame_id} step=fullscreen_subframe_start app={focused_app}")
+            _runtime_diag(f"store_frame: {frame_id} step=fullscreen_subframe_start app={focused_app}")
             _syn_should_store = True
             if window_diff_detector is not None:
                 from core.capture.window_capturer import calculate_image_hash as _calc_hash
@@ -1743,7 +2152,8 @@ def store_frame(req: StoreFrameRequest):
                     safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
                     syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
 
-                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_start")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_start")
+                    _tsyn0 = time_module.time()
                     syn_ocr_text = ""
                     syn_ocr_engine_name = "none"
                     syn_ocr_conf = 0.0
@@ -1758,6 +2168,8 @@ def store_frame(req: StoreFrameRequest):
                     elif region_ocr_engine is not None:
                         try:
                             syn_regions = region_ocr_engine.recognize_regions(image)
+                            _region_timing = getattr(region_ocr_engine, "last_timing", {}) or {}
+                            timings["uied_total_ms"] += float(_region_timing.get("detector_ms", 0.0) or 0.0)
                             if syn_regions:
                                 syn_img_w, syn_img_h = image.size
                                 syn_ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto')
@@ -1800,8 +2212,9 @@ def store_frame(req: StoreFrameRequest):
                                     syn_layout_text = ""
                         except Exception as e:
                             logger.warning(f"Region OCR failed for fullscreen app sub_frame {focused_app}: {e}")
+                    timings["syn_ocr_ms"] += (time_module.time() - _tsyn0) * 1000.0
 
-                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_done len={len(syn_ocr_text)}")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_done len={len(syn_ocr_text)}")
                     # SQLite: sub_frames record (window_chunk_id=0 marks fullscreen app)
                     if sqlite_storage is not None:
                         sqlite_storage.store_sub_frame(
@@ -1829,7 +2242,7 @@ def store_frame(req: StoreFrameRequest):
                             window_name=focused_win or focused_app,
                         )
 
-                    logger.info(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_sqlite_done")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_sqlite_done")
                     # LanceDB: reuse the same embedding (no re-encoding)
                     syn_frame_data = {
                         "frame_id": syn_sub_id,
@@ -1850,7 +2263,11 @@ def store_frame(req: StoreFrameRequest):
                     batch_write_buffer.add_frame(syn_frame_data)
 
                     if cluster_manager is not None:
+                        _tca0 = time_module.time()
                         try:
+                            _runtime_diag(
+                                f"store_frame: {frame_id} fullscreen_app={focused_app} step=cluster_assign"
+                            )
                             activity_label = cluster_manager.assign_frame(
                                 app_name=focused_app,
                                 frame_id=syn_sub_id,
@@ -1861,11 +2278,21 @@ def store_frame(req: StoreFrameRequest):
                                 timestamp=ts.isoformat(),
                                 window_name=focused_win or "",
                             )
+                            _runtime_diag(
+                                f"store_frame: {frame_id} fullscreen_app={focused_app} "
+                                f"step=cluster_done label={activity_label} "
+                                f"t={((time_module.time() - _tca0) * 1000):.0f}ms"
+                            )
+                            timings["cluster_assign_total_ms"] += (time_module.time() - _tca0) * 1000.0
                             if activity_label:
                                 logger.debug(f"Assigned {syn_sub_id} -> '{activity_label}'")
                             _log_non_committed_cluster_result(focused_app, syn_sub_id)
                         except Exception as e:
-                            logger.debug(f"Cluster assign failed for {syn_sub_id}: {e}")
+                            logger.warning(
+                                f"store_frame: {frame_id} fullscreen_app={focused_app} "
+                                f"step=cluster_failed t={((time_module.time() - _tca0) * 1000):.0f}ms err={e}",
+                                exc_info=True,
+                            )
 
                     sub_frame_ids.append(syn_sub_id)
                     sub_frame_summaries.append({
@@ -1903,19 +2330,35 @@ def store_frame(req: StoreFrameRequest):
 
     # Store frame's combined OCR to ocr_text (for FTS search)
     if combined_ocr_text and sqlite_storage is not None:
-        sqlite_storage.store_frame_with_ocr(
-            frame_id=frame_id,
-            timestamp=ts,
-            image_path=temp_image_path,
-            ocr_text=combined_ocr_text,
-            ocr_text_json="",
-            ocr_engine=ocr_engine_name,
-            ocr_confidence=combined_ocr_conf,
-            device_name=f"monitor_{req.monitor_id}",
-            metadata=req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
-            focused_app_name=focused_app or None,
-            focused_window_name=focused_win or None,
-        )
+        _tso0 = time_module.time()
+        try:
+            _runtime_diag(
+                f"enrich_frame: {frame_id} step=main_store_ocr_start ocr_len={len(combined_ocr_text)}"
+            )
+            sqlite_storage.store_frame_with_ocr(
+                frame_id=frame_id,
+                timestamp=ts,
+                image_path=temp_image_path,
+                ocr_text=combined_ocr_text,
+                ocr_text_json="",
+                ocr_engine=ocr_engine_name,
+                ocr_confidence=combined_ocr_conf,
+                device_name=f"monitor_{req.monitor_id}",
+                metadata=req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
+                focused_app_name=focused_app or None,
+                focused_window_name=focused_win or None,
+            )
+            _runtime_diag(
+                f"enrich_frame: {frame_id} step=main_store_ocr_done "
+                f"t={((time_module.time() - _tso0) * 1000):.0f}ms"
+            )
+            timings["main_store_ocr_ms"] = (time_module.time() - _tso0) * 1000.0
+        except Exception as e:
+            logger.error(
+                f"enrich_frame: {frame_id} step=main_store_ocr_failed "
+                f"t={((time_module.time() - _tso0) * 1000):.0f}ms err={e}",
+                exc_info=True,
+            )
 
     # Write frame to batch buffer (LanceDB + frames table via BatchWriteBuffer)
     frame_data = {
@@ -1936,7 +2379,14 @@ def store_frame(req: StoreFrameRequest):
         "focused_window_name": focused_win or None,
         "_ocr_regions_stored": True,  # Already stored above, skip duplicate in BatchWriteBuffer
     }
+    _tba0 = time_module.time()
+    _runtime_diag(f"enrich_frame: {frame_id} step=main_add_frame_start")
     batch_write_buffer.add_frame(frame_data)
+    _runtime_diag(
+        f"enrich_frame: {frame_id} step=main_add_frame_done "
+        f"t={((time_module.time() - _tba0) * 1000):.0f}ms"
+    )
+    timings["add_frame_ms"] = (time_module.time() - _tba0) * 1000.0
 
     _elapsed = time_module.time() - _t0
 
@@ -1947,7 +2397,7 @@ def store_frame(req: StoreFrameRequest):
         return ", ".join(f"{a}×{c}" if c > 1 else a for a, c in counts.items())
 
     _summary_parts = [
-        f"store_frame: {frame_id} done in {_elapsed:.2f}s "
+        f"enrich_frame: {frame_id} done in {_elapsed:.2f}s "
         f"sub_frames={len(sub_frame_ids)} processed={len(_processed_apps)} "
         f"deduped={len(_skipped_dedup_apps)} solid={_skipped_solid} "
         f"focused={focused_app}"
@@ -1957,9 +2407,22 @@ def store_frame(req: StoreFrameRequest):
             _summary_parts.append(f"  + {_r}")
     if _skipped_dedup_apps:
         _summary_parts.append(f"  deduped: {_format_app_list(_skipped_dedup_apps)}")
-    logger.info("\n".join(_summary_parts))
+    _runtime_diag("\n".join(_summary_parts))
+    _emit_latency_event(
+        {
+            "event_type": "frame_latency",
+            "frame_id": frame_id,
+            "win_count": len(windows_to_process),
+            "sub_frame_count": len(sub_frame_ids),
+            "focused_app": focused_app or "",
+            "total_enrich_ms": _elapsed * 1000.0,
+            **timings,
+        }
+    )
 
-    # Check if cluster recalculation is needed (runs in background thread)
+    # Check if cluster recalculation is needed (runs in background thread).
+    # Safe to launch from the enrichment worker — cluster_manager.recalculate
+    # is idempotent and gated by should_recalculate().
     if cluster_manager is not None and cluster_manager.should_recalculate():
         if vector_storage is not None and vector_storage.table is not None:
             threading.Thread(
@@ -1967,38 +2430,6 @@ def store_frame(req: StoreFrameRequest):
                 args=(vector_storage.table,),
                 daemon=True,
             ).start()
-
-    # Build frame summary for frontend (avoids extra HTTP round-trips for timeline refresh)
-    today_count = 0
-    try:
-        today_str = ts.strftime("%Y-%m-%d")
-        next_day_str = (ts + timedelta(days=1)).strftime("%Y-%m-%d")
-        with sqlite_storage._connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT COUNT(*) as count FROM frames
-                WHERE timestamp >= ? AND timestamp < ?
-                  AND image_path IS NOT NULL AND image_path != ''
-                  AND frame_id LIKE 'frame_%'
-            """, (today_str, next_day_str))
-            row = cursor.fetchone()
-            today_count = row["count"] if row else 0
-    except Exception:
-        pass
-
-    return {
-        "status": "ok",
-        "frame_id": frame_id,
-        "sub_frame_count": len(sub_frame_ids),
-        "today_count": today_count,
-        "frame_summary": {
-            "frame_id": frame_id,
-            "timestamp": ts.isoformat(),
-            "image_path": temp_image_path,
-            "ocr_text": combined_ocr_text,
-            "sub_frames": sub_frame_summaries,
-        },
-    }
 
 
 @app.post("/api/query_rag_with_time", response_model=QueryRagWithTimeResponse)
@@ -2843,23 +3274,63 @@ def get_frames_by_date_range(req: GetFramesByDateRangeRequest):
 @app.post("/api/recording/stop")
 def stop_recording_api():
     """
-    停止录制信号：触发后端所有缓冲区的强制刷新
-    - 视频帧缓冲区 -> 压缩成MP4
-    - 批量写入缓冲区 -> 写入LanceDB和SQLite
+    停止录制信号：触发后端所有缓冲区的强制刷新。
+
+    Order matters — the old implementation called ``_flush_all_video_buffers``
+    and ``batch_write_buffer._flush_buffer`` first, but since the enrichment
+    worker still had in-flight frames whose ``batch_write_buffer.add_frame``
+    hadn't been called yet, those frames would miss the flush and stay
+    uncommitted until the next periodic flush (or shutdown). That is the
+    root cause of ``listDailyReports`` / ``recording.ts stopRecording``
+    timing out — the HTTP worker pool was stuck inside the sync flush while
+    the enrichment worker kept adding to the batch buffer behind its back.
+
+    New order:
+      1. Drain the enrichment queue (bounded by STOP_FLUSH_MAX_SECONDS) so
+         all pending ``batch_write_buffer.add_frame`` calls complete.
+      2. Flush video frame buffers (compress remaining temp PNGs into MP4).
+      3. Flush the batch-write buffer (final commit to LanceDB + SQLite).
     """
     logger.info("收到前端录制停止信号...")
-    
-    # 1. 先刷新视频帧缓冲区（压缩剩余帧为MP4）
+
+    stop_timeout = getattr(config, "STOP_FLUSH_MAX_SECONDS", 30.0)
+    t0 = time_module.time()
+
+    # 1. Drain the enrichment worker first so any in-flight frames land in
+    # batch_write_buffer before we flush it below.
+    if frame_enrichment_worker is not None:
+        stats_before = frame_enrichment_worker.stats()
+        logger.info(
+            f"Draining frame enrichment queue "
+            f"(queue={stats_before['queue_depth']} inflight={stats_before['inflight']}, "
+            f"max {stop_timeout:.0f}s)..."
+        )
+        drained = frame_enrichment_worker.drain(timeout=stop_timeout)
+        elapsed = time_module.time() - t0
+        stats_after = frame_enrichment_worker.stats()
+        if drained:
+            logger.info(
+                f"Frame enrichment drained in {elapsed:.2f}s "
+                f"(completed_total={stats_after['completed']} failed_total={stats_after['failed']})"
+            )
+        else:
+            logger.warning(
+                f"Frame enrichment drain TIMEOUT after {elapsed:.2f}s — "
+                f"queue={stats_after['queue_depth']} inflight={stats_after['inflight']}; "
+                f"proceeding to flush anyway (remaining work will land on next flush)"
+            )
+
+    # 2. 刷新视频帧缓冲区（压缩剩余帧为MP4）
     if temp_frame_buffer is not None:
         logger.info("刷新视频帧缓冲区...")
         _flush_all_video_buffers()
-    
-    # 2. 再刷新批量写入缓冲区
+
+    # 3. 刷新批量写入缓冲区
     if batch_write_buffer is not None:
         logger.info("刷新批量写入缓冲区...")
         batch_write_buffer._flush_buffer()
 
-    # 3. 输出本次录制的聚类统计并重置计数器
+    # 4. 输出本次录制的聚类统计并重置计数器
     if cluster_manager is not None:
         stats = cluster_manager.get_assignment_stats()
         total = stats["total_frames"]
@@ -2870,7 +3341,13 @@ def stop_recording_api():
         )
         cluster_manager.reset_assignment_stats()
 
-    return {"status": "success", "message": "All buffers flushed"}
+    total_elapsed = time_module.time() - t0
+    logger.info(f"Recording stop flush total elapsed={total_elapsed:.2f}s")
+    return {
+        "status": "success",
+        "message": "All buffers flushed",
+        "elapsed_seconds": round(total_elapsed, 2),
+    }
 
 
 @app.get("/api/video/extract_frame")

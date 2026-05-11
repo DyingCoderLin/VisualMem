@@ -3,10 +3,14 @@ import logging
 import logging.handlers
 import sys
 import os
-import fcntl
 from datetime import datetime
 from pathlib import Path
 from queue import Queue
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 # 日志级别映射
 LOG_LEVEL_MAP = {
@@ -19,6 +23,14 @@ LOG_LEVEL_MAP = {
 
 _LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 _LOG_FILE = _LOG_DIR / "backend_server.log"
+
+# Per-process guard so the SESSION banner is emitted once regardless of how
+# many ``setup_logger("module.name")`` calls happen during import fan-out.
+_SESSION_BANNER_EMITTED = False
+
+# Clear previous ``backend_server.log`` once when this process first attaches
+# the file handler (each app / backend start). Subsequent log lines append.
+_BACKEND_LOG_TRUNCATED = False
 
 
 class ColorFormatter(logging.Formatter):
@@ -80,6 +92,8 @@ class NonBlockingStreamHandler(logging.StreamHandler):
         if self._tried_nonblock:
             return
         self._tried_nonblock = True
+        if fcntl is None:
+            return
         try:
             fd = self.stream.fileno()
             flags = fcntl.fcntl(fd, fcntl.F_GETFL)
@@ -134,9 +148,28 @@ def setup_logger(name: str = "visualmem", level: int = None) -> logging.Logger:
     datefmt = '%Y-%m-%d %H:%M:%S'
 
     # --- Primary handler: direct file write (never blocks on pipe) ---
+    # Each backend process: wipe the previous run's main log once, then append.
+    # Guard is required because many modules call ``setup_logger(__name__)``.
+    # ``RotatingFileHandler`` uses append when ``maxBytes > 0`` (CPython), so
+    # truncation is done explicitly before opening the handler.
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    # Fresh file each backend process start; append would grow without bound across restarts.
-    file_handler = logging.FileHandler(str(_LOG_FILE), mode="w", encoding="utf-8")
+    max_bytes = int(os.environ.get("LOG_MAX_BYTES", str(50 * 1024 * 1024)))  # 50 MB
+    backup_count = int(os.environ.get("LOG_BACKUP_COUNT", "5"))  # ~300 MB ceiling
+    global _BACKEND_LOG_TRUNCATED
+    if not _BACKEND_LOG_TRUNCATED:
+        try:
+            with open(str(_LOG_FILE), "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
+        _BACKEND_LOG_TRUNCATED = True
+    file_handler = logging.handlers.RotatingFileHandler(
+        str(_LOG_FILE),
+        mode="a",
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
     file_handler.setLevel(log_level)
     force_color = os.environ.get("LOG_COLOR", "").lower() in ("1", "true", "yes")
     if force_color:
@@ -154,6 +187,20 @@ def setup_logger(name: str = "visualmem", level: int = None) -> logging.Logger:
     else:
         stdout_handler.setFormatter(logging.Formatter(fmt_str, datefmt=datefmt))
     logger.addHandler(stdout_handler)
+
+    # Session banner once per process (many modules call setup_logger on import).
+    global _SESSION_BANNER_EMITTED
+    if not _SESSION_BANNER_EMITTED:
+        _SESSION_BANNER_EMITTED = True
+        try:
+            _banner = "=" * 60
+            logger.info(_banner)
+            logger.info(
+                f"SESSION START pid={os.getpid()} level={logging.getLevelName(log_level)}"
+            )
+            logger.info(_banner)
+        except Exception:
+            pass
 
     return logger
 
@@ -205,5 +252,4 @@ def setup_generate_logger(log_file: str = "logs/generate_info.log") -> logging.L
     logger.propagate = False
     
     return logger
-
 

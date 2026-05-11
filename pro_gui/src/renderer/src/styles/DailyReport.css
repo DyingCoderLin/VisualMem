@@ -59,7 +59,7 @@
 }
 
 .daily-report-date-item.active {
-  background-color: rgba(255, 215, 0, 0.05);
+  background-color: var(--accent-soft);
   color: var(--text-accent);
   border-left: 3px solid var(--accent-primary);
   padding-left: calc(var(--spacing-md) - 3px);
@@ -116,7 +116,7 @@
 }
 
 .daily-report-date-input::-webkit-calendar-picker-indicator {
-  filter: invert(0.8);
+  filter: var(--calendar-icon-filter);
   cursor: pointer;
 }
 
@@ -133,7 +133,7 @@
 }
 
 .daily-report-gen-btn:hover:not(:disabled) {
-  background: rgba(255, 215, 0, 0.08);
+  background: var(--accent-hover-bg);
 }
 
 .daily-report-gen-btn:disabled {
@@ -264,7 +264,7 @@
 
 .daily-report-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, var(--accent-primary), rgba(255, 215, 0, 0.75));
+  background: linear-gradient(90deg, var(--accent-primary), var(--accent-gradient-end));
   border-radius: 4px;
   min-width: 2px;
   transition: width 0.3s ease;
@@ -273,7 +273,7 @@
 .daily-report-pill-work {
   color: var(--accent-primary);
   border: 1px solid var(--accent-primary);
-  background: rgba(255, 215, 0, 0.06);
+  background: var(--accent-soft);
 }
 
 .daily-report-pill-life {
@@ -286,7 +286,7 @@
   border-radius: var(--radius-md);
   padding: var(--spacing-md);
   margin-bottom: var(--spacing-md);
-  background-color: rgba(0, 0, 0, 0.15);
+  background-color: var(--daily-panel-bg);
 }
 
 .daily-report-panel h4 {
@@ -313,7 +313,7 @@
   padding: var(--spacing-md);
   border: 1px solid var(--accent-primary);
   border-radius: var(--radius-md);
-  background-color: rgba(255, 215, 0, 0.05);
+  background-color: var(--accent-soft);
   margin-top: var(--spacing-md);
 }
 
@@ -340,12 +340,12 @@
 }
 
 .daily-report-banner.warn {
-  border-color: rgba(255, 180, 0, 0.35);
+  border-color: var(--warning-border);
   color: var(--text-primary);
 }
 
 .daily-report-error {
-  color: #f87171;
+  color: var(--danger);
   font-size: var(--font-size-sm);
   margin-top: var(--spacing-xs);
   max-width: 360px;

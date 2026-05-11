@@ -1,6 +1,6 @@
 node_modules/
 dist/
 dist-electron/
+out/
 *.local
 .DS_Store
-

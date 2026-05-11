@@ -468,7 +468,3 @@ class RecordWorker(QObject):
             self.ocr_thread.join(timeout=5.0)
         
         self.status_signal.emit("录制已停止")
-<<<<<<< HEAD
-
-=======
->>>>>>> main

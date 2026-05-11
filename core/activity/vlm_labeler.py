@@ -147,6 +147,8 @@ def _image_to_base64(img) -> str:
 
 def log_cluster_labeling_event(event: Dict[str, object]) -> None:
     """Append a cluster labeling event into logs/cluster_labeling_events.jsonl."""
+    if not config.EVAL_CLUSTER_LABEL_STATS:
+        return
     try:
         _CLUSTER_LABEL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         payload = {"timestamp": datetime.now(timezone.utc).isoformat(), **event}

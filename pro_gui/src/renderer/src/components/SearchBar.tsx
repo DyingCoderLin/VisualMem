@@ -19,13 +19,9 @@ interface SearchBarProps {
 
 const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
   const [query, setQuery] = useState('')
-  // 日期选择器已注释，保留状态以便后续使用
-  // const [startDate, setStartDate] = useState('2025-10-27')
-  // const [endDate, setEndDate] = useState('2025-12-18')
   const [isSearching, setIsSearching] = useState(false)
   const searchRequestRef = useRef<AbortController | null>(null)
-  
-  // 使用全局状态
+
   const {
     isRecording,
     isWarmingUp,
@@ -40,28 +36,24 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
 
   const handleSearch = async () => {
     if (!query.trim()) return
-    
-    // 如果正在搜索，忽略新的请求
+
     if (isSearching) {
       console.log('Search already in progress, ignoring duplicate request')
       return
     }
 
-    // 取消之前的请求（如果有）
     if (searchRequestRef.current) {
       searchRequestRef.current.abort()
     }
 
-    // 创建新的 AbortController
     const abortController = new AbortController()
     searchRequestRef.current = abortController
 
     setIsSearching(true)
     try {
-      // 如果是实时追踪视图，时间写死为最近 5 分钟
-      let startTime = undefined
-      let endTime = undefined
-      
+      let startTime = undefined as string | undefined
+      let endTime = undefined as string | undefined
+
       if (currentView === 'realtime') {
         const now = new Date()
         const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000)
@@ -74,23 +66,21 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
           query: query.trim(),
           start_time: startTime,
           end_time: endTime,
-          search_type: 'image' // 默认使用图片搜索
+          search_type: 'image'
         },
-        abortController.signal // 传递 AbortSignal
+        abortController.signal
       )
-      
-      // 检查请求是否被取消
+
       if (abortController.signal.aborted) {
         return
       }
-      
+
       if (currentView === 'realtime') {
         setRealtimeSearchResult(result)
       } else {
         onSearchResult(result)
       }
     } catch (error: any) {
-      // 如果请求被取消，不显示错误
       if (error.name === 'AbortError' || abortController.signal.aborted) {
         return
       }
@@ -100,7 +90,6 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
         frames: []
       })
     } finally {
-      // 只有在当前请求还没被取消时才更新状态
       if (!abortController.signal.aborted) {
         setIsSearching(false)
         searchRequestRef.current = null
@@ -122,28 +111,16 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !isSearching) {
-      e.preventDefault() // 防止表单提交（如果有表单）
+      e.preventDefault()
       handleSearch()
     }
   }
-  
-  // 组件卸载时取消正在进行的请求
+
   useEffect(() => {
     return () => {
       if (searchRequestRef.current) {
         searchRequestRef.current.abort()
       }
-    }
-  }, [])
-
-  // 组件卸载时停止录制（如果需要）
-  useEffect(() => {
-    return () => {
-      // 注意：这里不自动停止录制，让用户手动控制
-      // 如果需要在组件卸载时停止，可以取消下面的注释
-      // if (isRecording) {
-      //   stopRecording()
-      // }
     }
   }, [])
 
@@ -160,7 +137,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
             onKeyPress={handleKeyPress}
           />
         </div>
-        
+
         <div className="toggle-group">
           <button
             className={`toggle-btn ${recordingMode === 'primary' ? 'active' : ''}`}
@@ -178,24 +155,6 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
           </button>
         </div>
 
-        {/* 日期选择器已注释，保留以便后续使用 */}
-        {/* <div className="date-range-picker">
-          <input
-            type="date"
-            className="date-input"
-            value={startDate}
-            onChange={(e) => setStartDate(e.target.value)}
-          />
-          <span>→</span>
-          <input
-            type="date"
-            className="date-input"
-            value={endDate}
-            onChange={(e) => setEndDate(e.target.value)}
-          />
-        </div> */}
-
-        {/* 录屏按钮 */}
         {isModelLoading ? (
           <div className="record-btn-loading">
             <svg className="loading-spinner" width="24" height="24" viewBox="0 0 24 24" fill="none">
@@ -251,4 +210,3 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
 }
 
 export default SearchBar
-

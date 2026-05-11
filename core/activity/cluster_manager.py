@@ -25,14 +25,25 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 from config import config
+from utils.eval_stats import emit_jsonl, get_eval_logger
 from utils.logger import setup_logger
 
 logger = setup_logger("activity.cluster_manager")
+_EVAL_LAYER_STATS_ENABLED = config.EVAL_LAYER_STATS
+_EVAL_LAYER_LOGGER = (
+    get_eval_logger(
+        "layer_events",
+        str(Path(__file__).resolve().parents[2] / "logs" / "eval_layer_events.jsonl"),
+    )
+    if _EVAL_LAYER_STATS_ENABLED
+    else None
+)
 
 
 def _utcnow() -> str:
@@ -117,6 +128,35 @@ class ClusterManager:
         )
         self._load_centroids()
         self._rebuild_pending_pool_from_db()
+
+    def _emit_layer_event(
+        self,
+        *,
+        layer: str,
+        app_name: str,
+        frame_id: str = "",
+        window_name: str = "",
+        cluster_id: Optional[int] = None,
+        label: str = "",
+        similarity: Optional[float] = None,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        if not _EVAL_LAYER_STATS_ENABLED:
+            return
+        if _EVAL_LAYER_LOGGER is None:
+            return
+        event = {
+            "layer": layer,
+            "app_name": app_name,
+            "frame_id": frame_id,
+            "window_name": window_name,
+            "cluster_id": cluster_id,
+            "label": label,
+            "similarity": similarity,
+        }
+        if extra:
+            event.update(extra)
+        emit_jsonl(_EVAL_LAYER_LOGGER, event)
 
     # ------------------------------------------------------------------
     # Connection helpers
@@ -1090,6 +1130,13 @@ class ClusterManager:
         )
         self._sync_sessions_for_promoted_cluster(conn, cluster_id, row["label"])
         logger.info(f"Promoted candidate cluster {cluster_id} ({row['app_name']}/{row['label']}) to committed")
+        self._emit_layer_event(
+            layer="L2_promote",
+            app_name=row["app_name"],
+            cluster_id=cluster_id,
+            label=row["label"],
+            extra={"support_count": int(count)},
+        )
 
     def _freeze_old_committed_frames(self, conn: sqlite3.Connection, app_name: str):
         freeze_before = (datetime.now(timezone.utc).replace(tzinfo=None) - self.freeze_window).isoformat()
@@ -1172,6 +1219,15 @@ class ClusterManager:
                 self._freeze_old_committed_frames(conn, app_name)
                 conn.commit()
                 conn.close()
+                self._emit_layer_event(
+                    layer="L1",
+                    app_name=app_name,
+                    frame_id=frame_id,
+                    window_name=window_name,
+                    cluster_id=best_cluster_id,
+                    label=best_label,
+                    similarity=float(best_sim),
+                )
                 return best_label
 
             # --- Layer 2: candidate clusters (DB, similarity-only) ---
@@ -1205,6 +1261,15 @@ class ClusterManager:
                 conn.commit()
                 conn.close()
                 self._load_centroids_for_apps({app_name})
+                self._emit_layer_event(
+                    layer="L2_hit",
+                    app_name=app_name,
+                    frame_id=frame_id,
+                    window_name=window_name,
+                    cluster_id=cand_id,
+                    label=cand_label,
+                    similarity=float(cand_sim),
+                )
                 return cand_label
 
             # --- Layer 3+4: pending pool (persistent) + VLM ---
@@ -1234,6 +1299,16 @@ class ClusterManager:
                     conn.commit()
                     conn.close()
                     self._load_centroids_for_apps({app_name})
+                    self._emit_layer_event(
+                        layer="L3",
+                        app_name=app_name,
+                        frame_id=frame_id,
+                        window_name=window_name,
+                        cluster_id=pending_entry.candidate_id,
+                        label=pending_entry.label or "",
+                        similarity=None,
+                        extra={"source": "pending_resolved"},
+                    )
                     return pending_entry.label
                 else:
                     # Leader still waiting for VLM — become a follower
@@ -1256,6 +1331,20 @@ class ClusterManager:
                     self._add_follower_to_group(conn, pending_entry.group_id, embedding)
                     conn.commit()
                     conn.close()
+                    self._emit_layer_event(
+                        layer="L3",
+                        app_name=app_name,
+                        frame_id=frame_id,
+                        window_name=window_name,
+                        cluster_id=None,
+                        label="",
+                        similarity=None,
+                        extra={
+                            "source": "pending_follower",
+                            "pending_group_id": int(pending_entry.group_id),
+                            "leader_frame_id": pending_entry.leader_frame_id,
+                        },
+                    )
                     return None
 
             # This frame is a new leader — call VLM (or defer if circuit is open)
@@ -1289,6 +1378,19 @@ class ClusterManager:
             logger.info(
                 f"VLM labeling scheduled (async): app={app_name}{_win} frame={frame_id} "
                 f"time={_ts_display} sim={best_sim:.3f}"
+            )
+            self._emit_layer_event(
+                layer="L4",
+                app_name=app_name,
+                frame_id=frame_id,
+                window_name=window_name,
+                cluster_id=None,
+                label="",
+                similarity=float(best_sim),
+                extra={
+                    "pending_group_id": int(leader_entry.group_id),
+                    "leader_frame_id": leader_entry.leader_frame_id,
+                },
             )
             self._schedule_async_vlm_leader(
                 leader_entry=leader_entry,
