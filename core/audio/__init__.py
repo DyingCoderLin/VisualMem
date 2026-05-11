@@ -16,8 +16,11 @@ from .asr_engine import (
 
 from .audio_embedding import (
     AudioEmbedding,
+    PyannoteEmbedding,
+    DummyEmbedding,
     SpeakerEmbedding,
-    create_audio_embedding
+    create_audio_embedding,
+    compare_speaker_embeddings,
 )
 
 __all__ = [
@@ -29,7 +32,9 @@ __all__ = [
     'create_asr_engine',
     # Embedding
     'AudioEmbedding',
+    'PyannoteEmbedding',
+    'DummyEmbedding',
     'SpeakerEmbedding',
-    'create_audio_embedding'
+    'create_audio_embedding',
+    'compare_speaker_embeddings',
 ]
-

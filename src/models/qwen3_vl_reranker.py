@@ -2,10 +2,8 @@ import os
 import torch
 import numpy as np
 import logging
-import unicodedata
 
 from PIL import Image
-from scipy import special
 from typing import List, Union, Optional, Dict
 from urllib.parse import urlparse
 from qwen_vl_utils import process_vision_info
