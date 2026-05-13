@@ -5,6 +5,7 @@
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:devtools": "OPEN_DEVTOOLS=true electron-vite dev",
     "dev:no-devtools": "OPEN_DEVTOOLS=false electron-vite dev",
     "build": "electron-vite build",
     "preview": "electron-vite preview",

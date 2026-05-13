@@ -26,6 +26,7 @@ from utils.app_name_manager import app_name_manager
 from config import config
 
 from .window_capturer import WindowCapturer
+from .focused_window import get_fullscreen_window_for_monitor
 from ..preprocess.frame_diff import FrameDiffDetector, FrameDiffResult, is_solid_color_image
 from ..storage.video_chunk_writer import VideoChunkManager
 from ..storage.sqlite_storage import SQLiteStorage
@@ -344,17 +345,20 @@ class RecordingCoordinator:
                     self._get_latest_video_chunk_id()
                 )
                 
-                # If the focused app is full-screen (not among captured windows),
-                # tag this frame with its app_name so app-filtered searches find it.
-                fullscreen_app = None
-                fullscreen_win = None
-                if focused_app:
-                    focused_in_windows = any(
-                        w.app_name == focused_app for w in screen_obj.windows
-                    )
-                    if not focused_in_windows:
-                        fullscreen_app = focused_app
-                        fullscreen_win = focused_win or focused_app
+                # If a monitor-local app covers this screen, tag the frame with
+                # that app/window. Do not use the global focused app here: on
+                # multi-monitor setups it may be focused on a different display.
+                fullscreen_app, fullscreen_win = get_fullscreen_window_for_monitor(
+                    screen_obj.monitor_bounds
+                )
+                fullscreen_win = fullscreen_win or fullscreen_app or None
+                if fullscreen_app:
+                    app_name_manager.add_apps([fullscreen_app])
+                    if fullscreen_win:
+                        app_name_manager.add_window_pairs([(fullscreen_app, fullscreen_win)])
+                fullscreen_in_windows = bool(fullscreen_app) and any(
+                    w.app_name == fullscreen_app for w in screen_obj.windows
+                )
 
                 # Store frame metadata
                 self.db.store_frame_with_video_ref(
@@ -364,7 +368,7 @@ class RecordingCoordinator:
                     offset_index=offset_index,
                     monitor_id=screen_obj.monitor_id,
                     device_name=screen_obj.device_name,
-                    app_name=fullscreen_app,
+                    app_name=fullscreen_app or None,
                     window_name=fullscreen_win,
                     focused_app_name=focused_app or None,
                     focused_window_name=focused_win or None,
@@ -372,17 +376,17 @@ class RecordingCoordinator:
                 
                 # Full-screen OCR is deferred — combined from sub_frame OCR results later.
 
-                # If focused app is full-screen (not among captured windows),
-                # create a fullscreen app sub_frame referencing the same video
-                if fullscreen_app:
-                    syn_id = self._generate_sub_frame_id(focused_app)
+                # If monitor-local fullscreen app is not among captured windows,
+                # create a fullscreen app sub_frame referencing the same video.
+                if fullscreen_app and not fullscreen_in_windows:
+                    syn_id = self._generate_sub_frame_id(fullscreen_app)
                     self.db.store_sub_frame(
                         sub_frame_id=syn_id,
                         timestamp=screen_obj.timestamp,
                         window_chunk_id=0,
                         offset_index=offset_index,
-                        app_name=focused_app,
-                        window_name=focused_win or focused_app,
+                        app_name=fullscreen_app,
+                        window_name=fullscreen_win or fullscreen_app,
                     )
                     self.db.add_frame_subframe_mapping(frame_id, syn_id)
                     self.db.store_frame_with_video_ref(
@@ -392,8 +396,8 @@ class RecordingCoordinator:
                         offset_index=offset_index,
                         monitor_id=screen_obj.monitor_id,
                         device_name=screen_obj.device_name,
-                        app_name=focused_app,
-                        window_name=focused_win or focused_app,
+                        app_name=fullscreen_app,
+                        window_name=fullscreen_win or fullscreen_app,
                     )
                     # Region OCR for fullscreen app sub_frame
                     if self.config.run_ocr and self.region_ocr_engine is not None:
@@ -412,12 +416,12 @@ class RecordingCoordinator:
                             syn_tl = sum(len(r.get("text", "")) for r in syn_regions)
                             syn_conf = sum(len(r.get("text", "")) * r.get("ocr_confidence", 0.0) for r in syn_regions) / syn_tl if syn_tl > 0 else 0.0
                             if syn_text:
-                                sub_frame_ocr_parts.append((focused_app, syn_text, syn_conf))
+                                sub_frame_ocr_parts.append((fullscreen_app, syn_text, syn_conf))
                             self.stats.ocr_processed += 1
                     sub_frame_ids.append(syn_id)
                     logger.debug(
                         f"Created fullscreen app sub_frame {syn_id} for "
-                        f"full-screen app {focused_app}"
+                        f"full-screen app {fullscreen_app}"
                     )
                 
                 result["frame_id"] = frame_id

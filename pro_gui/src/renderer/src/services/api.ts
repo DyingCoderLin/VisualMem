@@ -43,6 +43,93 @@ export interface FrontendConfigResponse {
   theme: FrontendTheme
 }
 
+export interface RewindSubFrameResult {
+  sub_frame_id: string
+  timestamp: string
+  app_name: string
+  window_name: string
+  image_path?: string | null
+}
+
+export interface RewindSegment {
+  segment_id?: string | null
+  frame_id?: string | null
+  timestamp?: string | null
+  start_time?: string | null
+  end_time?: string | null
+  title?: string | null
+  app_name?: string | null
+  window_name?: string | null
+  activity_label?: string | null
+  image_path?: string | null
+  ocr_text?: string | null
+  sub_frames?: RewindSubFrameResult[]
+  metadata?: Record<string, unknown>
+}
+
+export interface RewindEvidenceRef {
+  frame_id?: string | null
+  sub_frame_id?: string | null
+  timestamp?: string | null
+  image_path?: string | null
+  app_name?: string | null
+  window_name?: string | null
+  activity_label?: string | null
+  ocr_snippet?: string | null
+}
+
+export interface RewindSearchResponse {
+  query: string
+  segments: RewindSegment[]
+}
+
+export interface RewindTimelineFrame {
+  frame_id: string
+  timestamp: string
+  image_path?: string | null
+  ocr_text?: string | null
+  sub_frames?: RewindSubFrameResult[]
+}
+
+export interface RewindTimelineFramesResponse {
+  start_time: string
+  end_time: string
+  offset: number
+  limit: number
+  total_count: number
+  frames: RewindTimelineFrame[]
+}
+
+export interface TaskMemory {
+  task_memory_id: string
+  title: string
+  markdown: string
+  source_query: string
+  selected_segments: RewindSegment[]
+  evidence_refs: RewindEvidenceRef[]
+  created_at: string
+  updated_at: string
+}
+
+export interface TaskMemoryListItem {
+  task_memory_id: string
+  title: string
+  source_query: string
+  created_at: string
+  updated_at: string
+  selected_segment_count: number
+}
+
+export interface TaskMemoryListResponse {
+  memories: TaskMemoryListItem[]
+}
+
+export interface TaskMemoryAskResponse {
+  task_memory_id: string
+  answer: string
+  evidence_refs: RewindEvidenceRef[]
+}
+
 interface StatsResponse {
   total_frames: number
   disk_usage?: string
@@ -312,6 +399,94 @@ class ApiClient {
         body: JSON.stringify({ date })
       },
       900000
+    )
+  }
+
+  async searchRewindSegments(req: {
+    query: string
+    start_time?: string
+    end_time?: string
+    top_k?: number
+  }): Promise<RewindSearchResponse> {
+    return this.request<RewindSearchResponse>(
+      '/api/rewind/search_segments',
+      {
+        method: 'POST',
+        body: JSON.stringify(req)
+      },
+      120000
+    )
+  }
+
+  async getRewindTimelineFrames(req: {
+    start_time: string
+    end_time: string
+    offset?: number
+    limit?: number
+  }): Promise<RewindTimelineFramesResponse> {
+    return this.request<RewindTimelineFramesResponse>(
+      '/api/rewind/timeline_frames',
+      {
+        method: 'POST',
+        body: JSON.stringify(req)
+      },
+      120000
+    )
+  }
+
+  async buildRewindContext(req: {
+    source_query: string
+    selected_segments: RewindSegment[]
+    evidence_refs?: RewindEvidenceRef[]
+    title?: string
+    start_time?: string
+    end_time?: string
+    top_k?: number
+  }): Promise<TaskMemory> {
+    return this.request<TaskMemory>(
+      '/api/rewind/build_context',
+      {
+        method: 'POST',
+        body: JSON.stringify(req)
+      },
+      420000
+    )
+  }
+
+  async listTaskMemories(): Promise<TaskMemoryListResponse> {
+    return this.request<TaskMemoryListResponse>('/api/rewind/task_memories')
+  }
+
+  async getTaskMemory(taskMemoryId: string): Promise<TaskMemory> {
+    return this.request<TaskMemory>(
+      `/api/rewind/task_memories/${encodeURIComponent(taskMemoryId)}`
+    )
+  }
+
+  async updateTaskMemory(
+    taskMemoryId: string,
+    req: { title?: string; markdown?: string }
+  ): Promise<TaskMemory> {
+    return this.request<TaskMemory>(
+      `/api/rewind/task_memories/${encodeURIComponent(taskMemoryId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(req)
+      }
+    )
+  }
+
+  async askTaskMemory(
+    taskMemoryId: string,
+    req: { question: string; markdown?: string }
+  ): Promise<TaskMemoryAskResponse> {
+    return this.request<TaskMemoryAskResponse>(
+      `/api/rewind/task_memories/${encodeURIComponent(taskMemoryId)}/ask`,
+      {
+        method: 'POST',
+        body: JSON.stringify(req)
+      },
+      120000
     )
   }
 }

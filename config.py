@@ -118,6 +118,11 @@ class Config:
     ENABLE_LLM_REWRITE = os.environ.get("ENABLE_LLM_REWRITE", "true").lower() == "true"
     ENABLE_TIME_FILTER = os.environ.get("ENABLE_TIME_FILTER", "true").lower() == "true"
     QUERY_REWRITE_NUM = int(os.environ.get("QUERY_REWRITE_NUM", "3"))
+    REWIND_ENABLE_AGENTIC_SEARCH = os.environ.get("REWIND_ENABLE_AGENTIC_SEARCH", "true").lower() == "true"
+    REWIND_SESSION_PADDING_MINUTES = int(os.environ.get("REWIND_SESSION_PADDING_MINUTES", "5"))
+    REWIND_SESSION_FRAME_LIMIT = int(os.environ.get("REWIND_SESSION_FRAME_LIMIT", "8"))
+    REWIND_SESSION_MAX_MINUTES = int(os.environ.get("REWIND_SESSION_MAX_MINUTES", "45"))
+    REWIND_ASK_TIMEOUT_SECONDS = int(os.environ.get("REWIND_ASK_TIMEOUT_SECONDS", "90"))
 
     # ============================================
     # GUI Mode (local disk vs remote backend)
@@ -334,8 +339,12 @@ class Config:
         REPORT_DATA_API_BASE = GUI_REMOTE_BACKEND_URL.rstrip("/")
     else:
         REPORT_DATA_API_BASE = "http://localhost:18080"
-    # Reduce: read prior daily_report_*.json from this directory (project-relative ok).
-    REPORT_LOG_DIR = _resolve_path(os.environ.get("REPORT_LOG_DIR", "logs"))
+    # Reduce: read prior daily_report_*.json from this storage-bound directory.
+    # Defaults to <STORAGE_ROOT>/reports so test/prod storage roots do not share reports.
+    REPORT_LOG_DIR = _resolve_path(os.environ.get(
+        "REPORT_LOG_DIR",
+        os.path.join(STORAGE_ROOT, "reports"),
+    ))
     # How many calendar days to walk backward when looking for prior report files.
     REPORT_HISTORY_DAYS = int(os.environ.get("REPORT_HISTORY_DAYS", "14"))
     # ============================================

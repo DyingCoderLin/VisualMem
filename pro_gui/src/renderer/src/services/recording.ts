@@ -20,6 +20,44 @@ interface RecordingOptions {
   mode?: RecordingMode // 录制模式，默认 'primary'
 }
 
+interface MonitorBounds {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+interface CaptureMetadata {
+  source_id?: string
+  source_name?: string
+  display_id?: number | string
+  monitor_bounds?: MonitorBounds
+  monitor_physical_bounds?: MonitorBounds
+  work_area?: MonitorBounds
+  scale_factor?: number
+}
+
+interface CaptureResult {
+  base64Data: string
+  diffData: ImageData
+  index: number
+  width: number
+  height: number
+  captureMs: number
+  metadata?: CaptureMetadata
+}
+
+interface QueuedFrame {
+  base64Data: string
+  frameId: string
+  timestamp: string
+  width: number
+  height: number
+  monitorId: number
+  captureMs: number
+  metadata?: CaptureMetadata
+}
+
 class RecordingService {
   private intervalId: number | null = null
   private lastImageDataArray: (ImageData | null)[] = [] // 存储用于对比的低分辨率图像数据
@@ -45,7 +83,7 @@ class RecordingService {
   // 后端单帧处理 10~30s 时，第 N 个显示器的帧要等 N-1 个前序帧依次串完
   // 才能发出，队列轻易冲到 20 上限并开始丢旧帧，前端看起来就是「卡在
   // 12:37」。改造后：每屏一条 queue + 一个 in-flight，背压阈值按屏数放大。
-  private sendQueues: Map<number, Array<{ base64Data: string; frameId: string; timestamp: string; width: number; height: number; monitorId: number; captureMs: number }>> = new Map()
+  private sendQueues: Map<number, QueuedFrame[]> = new Map()
   private sendingMonitors: Set<number> = new Set()
   /** 当前活跃屏幕数（最近一次 captureScreen 的结果数），用于放大背压阈值 */
   private screenCount: number = 1
@@ -266,7 +304,7 @@ class RecordingService {
   /**
    * 使用 Electron desktopCapturer API 和 WebRTC 截屏
    */
-  private async captureScreen(): Promise<{ base64Data: string; diffData: ImageData; index: number; width: number; height: number; captureMs: number }[]> {
+  private async captureScreen(): Promise<CaptureResult[]> {
     try {
       // 检查 electronAPI 是否可用
       const electronAPI = (window as any).electronAPI
@@ -280,6 +318,12 @@ class RecordingService {
         types: ['screen'],
         thumbnailSize: { width: 1, height: 1 } // 我们不再需要缩略图，设为最小以节省开销
       })
+      const displays = electronAPI.screen?.getAllDisplays
+        ? await electronAPI.screen.getAllDisplays()
+        : []
+      const displayById = new Map<string, any>(
+        displays.map((display: any) => [String(display.id), display])
+      )
 
       if (!sources || sources.length === 0) {
         console.error('No screen source found')
@@ -289,10 +333,37 @@ class RecordingService {
       // 根据模式选择源
       const sourcesToCapture = this.options.mode === 'primary' ? [sources[0]] : sources
       
-      const results: { base64Data: string; diffData: ImageData; index: number; width: number; height: number; captureMs: number }[] = []
+      const results: CaptureResult[] = []
 
       for (let i = 0; i < sourcesToCapture.length; i++) {
         const source = sourcesToCapture[i]
+        const sourceDisplayId = (source as any).display_id
+        const display = displayById.get(String(sourceDisplayId)) || displays[i]
+        const scaleFactor = typeof display?.scaleFactor === 'number' ? display.scaleFactor : undefined
+        const metadata: CaptureMetadata = {
+          source_id: source.id,
+          source_name: source.name,
+          display_id: sourceDisplayId || display?.id,
+          monitor_bounds: display?.bounds ? {
+            x: display.bounds.x,
+            y: display.bounds.y,
+            width: display.bounds.width,
+            height: display.bounds.height,
+          } : undefined,
+          monitor_physical_bounds: display?.bounds && scaleFactor ? {
+            x: Math.round(display.bounds.x * scaleFactor),
+            y: Math.round(display.bounds.y * scaleFactor),
+            width: Math.round(display.bounds.width * scaleFactor),
+            height: Math.round(display.bounds.height * scaleFactor),
+          } : undefined,
+          work_area: display?.workArea ? {
+            x: display.workArea.x,
+            y: display.workArea.y,
+            width: display.workArea.width,
+            height: display.workArea.height,
+          } : undefined,
+          scale_factor: scaleFactor,
+        }
         try {
           // 使用 WebRTC 获取真实的屏幕流
           const stream = await navigator.mediaDevices.getUserMedia({
@@ -411,6 +482,7 @@ class RecordingService {
               width: captureResult.width,
               height: captureResult.height,
               captureMs: captureResult.captureMs,
+              metadata,
             })
           }
         } catch (err) {
@@ -628,7 +700,7 @@ class RecordingService {
         this.screenCount = captureResults.length
       }
 
-      for (const { base64Data, diffData, index, width, height, captureMs } of captureResults) {
+      for (const { base64Data, diffData, index, width, height, captureMs, metadata } of captureResults) {
         if (!this.sessionActive) {
           break
         }
@@ -641,7 +713,7 @@ class RecordingService {
         }
         const microSeconds = String(index).padStart(6, '0')
         const frameId = `${frameIdPrefix}${microSeconds}`
-        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs)
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs, metadata)
       }
     } catch (error) {
       if (!this.sessionActive) {
@@ -736,7 +808,7 @@ class RecordingService {
       const seconds = String(now.getSeconds()).padStart(2, '0')
       const frameIdPrefix = `${year}${month}${day}_${hours}${minutes}${seconds}_`
 
-      for (const { base64Data, diffData, index, width, height, captureMs } of captureResults) {
+      for (const { base64Data, diffData, index, width, height, captureMs, metadata } of captureResults) {
         // 再次检查录制状态
         if (!this.sessionActive || !this.liveRecording) {
           break
@@ -761,7 +833,7 @@ class RecordingService {
         const frameId = `${frameIdPrefix}${microSeconds}`
 
         // 加入发送队列（截屏不等发送，发送逐个排队避免 HTTP 堆积）
-        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs)
+        this.enqueueFrame(base64Data, frameId, timestamp, width, height, index, captureMs, metadata)
       }
     } catch (error) {
       // 如果已经停止录制，忽略错误
@@ -778,7 +850,16 @@ class RecordingService {
    * 将帧加入目标显示器的发送队列。各屏独立积压、独立 inflight；
    * 一个慢屏不会阻塞其他屏的发送。
    */
-  private enqueueFrame(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number, captureMs: number): void {
+  private enqueueFrame(
+    base64Data: string,
+    frameId: string,
+    timestamp: string,
+    width: number,
+    height: number,
+    monitorId: number,
+    captureMs: number,
+    metadata?: CaptureMetadata
+  ): void {
     let queue = this.sendQueues.get(monitorId)
     if (!queue) {
       queue = []
@@ -797,7 +878,7 @@ class RecordingService {
         this.lastQueueDropLogMs = now
       }
     }
-    queue.push({ base64Data, frameId, timestamp, width, height, monitorId, captureMs })
+    queue.push({ base64Data, frameId, timestamp, width, height, monitorId, captureMs, metadata })
 
     // 启动该屏的 queue 处理（如果没在运行）
     this.processSendQueue(monitorId)
@@ -822,7 +903,7 @@ class RecordingService {
         try {
           await this.sendFrameToBackendDirectly(
             frame.base64Data, frame.frameId, frame.timestamp,
-            frame.width, frame.height, frame.monitorId, frame.captureMs
+            frame.width, frame.height, frame.monitorId, frame.captureMs, frame.metadata
           )
         } catch (err) {
           console.error(`Error sending frame ${frame.frameId} (monitor ${monitorId}):`, err)
@@ -836,7 +917,16 @@ class RecordingService {
   /**
    * 直接发送 Base64 帧到后端
    */
-  private async sendFrameToBackendDirectly(base64Data: string, frameId: string, timestamp: string, width: number, height: number, monitorId: number = 0, captureMs: number = 0): Promise<void> {
+  private async sendFrameToBackendDirectly(
+    base64Data: string,
+    frameId: string,
+    timestamp: string,
+    width: number,
+    height: number,
+    monitorId: number = 0,
+    captureMs: number = 0,
+    metadata?: CaptureMetadata
+  ): Promise<void> {
     // 再次检查录制状态
     if (!this.sessionActive) {
       return
@@ -849,6 +939,7 @@ class RecordingService {
         image_base64: base64Data,
         monitor_id: monitorId,
         metadata: {
+          ...(metadata || {}),
           width: width,
           height: height,
           monitor_id: monitorId

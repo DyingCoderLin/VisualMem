@@ -10,20 +10,23 @@ Responsibilities:
 """
 
 from datetime import datetime, time, timezone, timedelta
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Tuple
 import base64
 import io
 import os
+import re
 import threading
 import time as time_module
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import json
+import uuid
 
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from PIL import Image as PILImage
 from pathlib import Path
 
@@ -47,7 +50,7 @@ from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
 from core.retrieval.reranker import Reranker
 from core.understand.api_vlm import ApiVLM
 from core.ocr import create_ocr_engine
-from core.capture.focused_window import get_focused_window
+from core.capture.focused_window import get_focused_window, get_fullscreen_window_for_monitor
 from core.worker import EnrichmentJob, FrameEnrichmentWorker
 from utils.model_utils import ensure_model_downloaded
 
@@ -239,6 +242,93 @@ except ImportError:
 ENABLE_BACKEND_WINDOW_CAPTURE = True
 
 # ============ 批量写入缓冲区 ============
+
+def _normalize_rect(bounds: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    """Normalize screen/window bounds dictionaries from Electron, Quartz, or xcap."""
+    if not isinstance(bounds, dict):
+        return None
+    try:
+        x = bounds.get("x", bounds.get("X"))
+        y = bounds.get("y", bounds.get("Y"))
+        width = bounds.get("width", bounds.get("Width"))
+        height = bounds.get("height", bounds.get("Height"))
+        if x is None or y is None or width is None or height is None:
+            return None
+        width_f = float(width)
+        height_f = float(height)
+        if width_f <= 0 or height_f <= 0:
+            return None
+        return {
+            "x": float(x),
+            "y": float(y),
+            "width": width_f,
+            "height": height_f,
+        }
+    except Exception:
+        return None
+
+
+def _extract_monitor_bounds(metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    """Extract monitor bounds sent by the Electron recorder."""
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("monitor_bounds", "display_bounds", "bounds", "monitor_physical_bounds", "physical_bounds"):
+        rect = _normalize_rect(metadata.get(key))
+        if rect:
+            return rect
+    return _normalize_rect(metadata)
+
+
+def _get_screencap_monitor_bounds(monitor_id: int) -> Optional[Dict[str, float]]:
+    """Best-effort local monitor bounds fallback for older GUI clients."""
+    if not (USE_SCREENCAP_RS and screencap_rs_module is not None):
+        return None
+    try:
+        monitors = screencap_rs_module.get_monitors()
+        if not monitors:
+            return None
+        monitor = monitors[monitor_id] if 0 <= monitor_id < len(monitors) else monitors[0]
+        return _normalize_rect(
+            {
+                "x": getattr(monitor, "x", 0),
+                "y": getattr(monitor, "y", 0),
+                "width": getattr(monitor, "width", 0),
+                "height": getattr(monitor, "height", 0),
+            }
+        )
+    except Exception as e:
+        logger.debug(f"Failed to read screencap monitor bounds: {e}")
+        return None
+
+
+def _intersection_area(a: Dict[str, float], b: Dict[str, float]) -> float:
+    left = max(a["x"], b["x"])
+    top = max(a["y"], b["y"])
+    right = min(a["x"] + a["width"], b["x"] + b["width"])
+    bottom = min(a["y"] + a["height"], b["y"] + b["height"])
+    if right <= left or bottom <= top:
+        return 0.0
+    return (right - left) * (bottom - top)
+
+
+def _window_overlaps_monitor(
+    window_data: Dict[str, Any],
+    monitor_bounds: Optional[Dict[str, float]],
+    min_window_overlap: float = 0.20,
+) -> bool:
+    """Return True when a captured window belongs to the target monitor."""
+    if not monitor_bounds:
+        return True
+    window_rect = _normalize_rect(window_data)
+    if not window_rect:
+        # Older clients do not send window bounds. Keep those windows rather
+        # than silently dropping potentially valid sub_frames.
+        return True
+    window_area = window_rect["width"] * window_rect["height"]
+    if window_area <= 0:
+        return False
+    return (_intersection_area(window_rect, monitor_bounds) / window_area) >= min_window_overlap
+
 
 class BatchWriteBuffer:
     """批量写入缓冲区：累积帧数据，达到阈值时批量写入"""
@@ -1229,6 +1319,10 @@ class WindowInfo(BaseModel):
     app_name: str
     window_name: str
     image_base64: str  # 窗口截图的base64
+    x: Optional[int] = None
+    y: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
 
 
 class StoreFrameRequest(BaseModel):
@@ -1290,6 +1384,127 @@ class DateFrameCountResponse(BaseModel):
 class DateRangeResponse(BaseModel):
     earliest_date: Optional[str]  # YYYY-MM-DD，最早的照片日期
     latest_date: Optional[str]    # YYYY-MM-DD，最新的照片日期
+
+
+class RewindSubFrameResult(BaseModel):
+    sub_frame_id: str = ""
+    timestamp: str = ""
+    app_name: str = ""
+    window_name: str = ""
+    image_path: Optional[str] = None
+
+
+class RewindSegment(BaseModel):
+    segment_id: Optional[str] = None
+    frame_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    title: Optional[str] = None
+    app_name: Optional[str] = None
+    window_name: Optional[str] = None
+    activity_label: Optional[str] = None
+    image_path: Optional[str] = None
+    ocr_text: Optional[str] = ""
+    sub_frames: List[RewindSubFrameResult] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RewindEvidenceRef(BaseModel):
+    frame_id: Optional[str] = None
+    sub_frame_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    image_path: Optional[str] = None
+    app_name: Optional[str] = None
+    window_name: Optional[str] = None
+    activity_label: Optional[str] = None
+    ocr_snippet: Optional[str] = ""
+
+
+class RewindSearchRequest(BaseModel):
+    query: str
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    top_k: int = 12
+
+
+class RewindSearchResponse(BaseModel):
+    query: str
+    segments: List[RewindSegment]
+
+
+class RewindTimelineFramesRequest(BaseModel):
+    start_time: str
+    end_time: str
+    offset: int = 0
+    limit: int = 36
+
+
+class RewindTimelineFrame(BaseModel):
+    frame_id: str
+    timestamp: str
+    image_path: Optional[str] = None
+    ocr_text: Optional[str] = ""
+    sub_frames: List[RewindSubFrameResult] = Field(default_factory=list)
+
+
+class RewindTimelineFramesResponse(BaseModel):
+    start_time: str
+    end_time: str
+    offset: int
+    limit: int
+    total_count: int
+    frames: List[RewindTimelineFrame]
+
+
+class BuildRewindContextRequest(BaseModel):
+    source_query: str
+    selected_segments: List[RewindSegment] = Field(default_factory=list)
+    evidence_refs: List[RewindEvidenceRef] = Field(default_factory=list)
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    top_k: int = 12
+
+
+class TaskMemoryResponse(BaseModel):
+    task_memory_id: str
+    title: str
+    markdown: str
+    source_query: str
+    selected_segments: List[RewindSegment]
+    evidence_refs: List[RewindEvidenceRef]
+    created_at: str
+    updated_at: str
+
+
+class TaskMemoryListItem(BaseModel):
+    task_memory_id: str
+    title: str
+    source_query: str
+    created_at: str
+    updated_at: str
+    selected_segment_count: int = 0
+
+
+class TaskMemoryListResponse(BaseModel):
+    memories: List[TaskMemoryListItem]
+
+
+class TaskMemoryPatchRequest(BaseModel):
+    title: Optional[str] = None
+    markdown: Optional[str] = None
+
+
+class TaskMemoryAskRequest(BaseModel):
+    question: str
+    markdown: Optional[str] = None
+
+
+class TaskMemoryAskResponse(BaseModel):
+    task_memory_id: str
+    answer: str
+    evidence_refs: List[RewindEvidenceRef]
 
 
 class ActivityClusterDebugAppStatus(BaseModel):
@@ -1811,6 +2026,17 @@ def _enrich_frame_job(
     # then combine them as the frame's ocr_text (labeled by app_name).
     # This avoids mixing text from unrelated windows in a single OCR pass.
     ocr_engine_name = getattr(ocr_engine, 'engine_name', 'auto') if ocr_engine else "pending"
+    monitor_bounds = _extract_monitor_bounds(req.metadata) or _get_screencap_monitor_bounds(req.monitor_id)
+    fullscreen_app, fullscreen_win = get_fullscreen_window_for_monitor(monitor_bounds)
+    if fullscreen_app:
+        fullscreen_win = fullscreen_win or fullscreen_app
+        app_name_manager.add_apps([fullscreen_app])
+        if fullscreen_win:
+            app_name_manager.add_window_pairs([(fullscreen_app, fullscreen_win)])
+        _runtime_diag(
+            f"enrich_frame: {frame_id} monitor={req.monitor_id} "
+            f"fullscreen_label={fullscreen_app}/{fullscreen_win}"
+        )
 
     # Collector for sub_frame OCR results: [(app_name, ocr_text, confidence), ...]
     sub_frame_ocr_parts = []
@@ -1830,7 +2056,11 @@ def _enrich_frame_job(
                 windows_to_process.append({
                     "app_name": win.app_name,
                     "window_name": win.window_name,
-                    "image": win_image
+                    "image": win_image,
+                    "x": win.x,
+                    "y": win.y,
+                    "width": win.width,
+                    "height": win.height,
                 })
             except Exception as e:
                 logger.warning(f"Failed to decode window image for {win.app_name}: {e}")
@@ -1852,13 +2082,29 @@ def _enrich_frame_job(
                     windows_to_process.append({
                         "app_name": cw.info.app_name,
                         "window_name": cw.info.title,
-                        "image": win_image
+                        "image": win_image,
+                        "x": getattr(cw.info, "x", None),
+                        "y": getattr(cw.info, "y", None),
+                        "width": getattr(cw.info, "width", None),
+                        "height": getattr(cw.info, "height", None),
                     })
                 except Exception as e:
                     logger.debug(f"Failed to process captured window {cw.info.app_name}: {e}")
             logger.debug(f"Backend captured {len(windows_to_process)} windows")
         except Exception as e:
             logger.warning(f"Backend window capture failed: {e}")
+
+    if monitor_bounds and windows_to_process:
+        before_filter = len(windows_to_process)
+        windows_to_process = [
+            w for w in windows_to_process
+            if _window_overlaps_monitor(w, monitor_bounds)
+        ]
+        if len(windows_to_process) != before_filter:
+            logger.debug(
+                f"Filtered backend windows for monitor {req.monitor_id}: "
+                f"{before_filter} -> {len(windows_to_process)}"
+            )
     
     # Tracking for final summary log (shared across window batch + fullscreen app subframe)
     _processed_apps: List[str] = []
@@ -2110,49 +2356,48 @@ def _enrich_frame_job(
 
         # (batch summary moved to final done log)
 
-    # ========== 4. 全屏应用检测：如果聚焦的应用不在已捕获的窗口中，创建全屏应用子帧 ==========
-    # When an app is in macOS native fullscreen, screencap_rs can't capture its
-    # window.  The fullscreen screenshot IS the focused app, so we OCR the
-    # fullscreen image directly — sub_frame_ocr_parts contain background-window
-    # OCR which is NOT what's on screen.
-    if focused_app and temp_frame_buffer is not None:
+    # ========== 4. 全屏应用检测：只使用当前 monitor 的几何覆盖窗口来创建子帧 ==========
+    # macOS native fullscreen windows may be missing from screencap_rs window
+    # captures. The global focused app can be on another display, so the label
+    # must come from monitor-local Quartz geometry instead.
+    if fullscreen_app and temp_frame_buffer is not None:
         captured_app_names = {w.get("app_name", "") for w in windows_to_process}
-        if focused_app not in captured_app_names:
-            _runtime_diag(f"store_frame: {frame_id} step=fullscreen_subframe_start app={focused_app}")
+        if fullscreen_app not in captured_app_names:
+            _runtime_diag(f"store_frame: {frame_id} step=fullscreen_subframe_start app={fullscreen_app}")
             _syn_should_store = True
             if window_diff_detector is not None:
                 from core.capture.window_capturer import calculate_image_hash as _calc_hash
                 from utils.data_models import WindowFrame as _WF
                 _syn_hash = _calc_hash(image)
                 _syn_wf = _WF(
-                    app_name=focused_app,
-                    window_name=focused_win or focused_app,
+                    app_name=fullscreen_app,
+                    window_name=fullscreen_win or fullscreen_app,
                     image=image,
                     image_hash=_syn_hash,
                     timestamp=ts,
                 )
                 _syn_diff = window_diff_detector.check_window_diff(_syn_wf)
                 if not _syn_diff.should_store:
-                    _skipped_dedup_apps.append(f"{focused_app}(fullscreen)")
+                    _skipped_dedup_apps.append(f"{fullscreen_app}(fullscreen)")
                     _syn_should_store = False
                     # Reuse cached OCR so the frame-level combined OCR still
                     # contains the fullscreen app's text
-                    _cached = _fullscreen_ocr_cache.get(focused_app)
+                    _cached = _fullscreen_ocr_cache.get(fullscreen_app)
                     if _cached:
-                        sub_frame_ocr_parts.append((focused_app, _cached[0], _cached[1]))
+                        sub_frame_ocr_parts.append((fullscreen_app, _cached[0], _cached[1]))
                 else:
-                    _processed_apps.append(f"{focused_app}(fullscreen)")
+                    _processed_apps.append(f"{fullscreen_app}(fullscreen)")
                     _processed_reasons.append(
-                        f"{focused_app}(fullscreen) diff={_syn_diff.diff_score:.4f} "
+                        f"{fullscreen_app}(fullscreen) diff={_syn_diff.diff_score:.4f} "
                         f"reason={_syn_diff.reason}"
                     )
 
             if _syn_should_store:
                 try:
-                    safe_focused = focused_app.replace(" ", "_").replace("/", "_")[:20]
+                    safe_focused = fullscreen_app.replace(" ", "_").replace("/", "_")[:20]
                     syn_sub_id = f"subframe_{safe_focused}_{base_frame_id}_fullscreen"
 
-                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_start")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={fullscreen_app} step=syn_ocr_start")
                     _tsyn0 = time_module.time()
                     syn_ocr_text = ""
                     syn_ocr_engine_name = "none"
@@ -2163,7 +2408,7 @@ def _enrich_frame_job(
                     if _elapsed_check > _HANDLER_MAX_SECONDS:
                         logger.warning(
                             f"store_frame: {frame_id} TIMEOUT GUARD — {_elapsed_check:.1f}s elapsed, "
-                            f"skipping fullscreen OCR for {focused_app}"
+                            f"skipping fullscreen OCR for {fullscreen_app}"
                         )
                     elif region_ocr_engine is not None:
                         try:
@@ -2211,10 +2456,10 @@ def _enrich_frame_job(
                                 except Exception:
                                     syn_layout_text = ""
                         except Exception as e:
-                            logger.warning(f"Region OCR failed for fullscreen app sub_frame {focused_app}: {e}")
+                            logger.warning(f"Region OCR failed for fullscreen app sub_frame {fullscreen_app}: {e}")
                     timings["syn_ocr_ms"] += (time_module.time() - _tsyn0) * 1000.0
 
-                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_ocr_done len={len(syn_ocr_text)}")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={fullscreen_app} step=syn_ocr_done len={len(syn_ocr_text)}")
                     # SQLite: sub_frames record (window_chunk_id=0 marks fullscreen app)
                     if sqlite_storage is not None:
                         sqlite_storage.store_sub_frame(
@@ -2222,8 +2467,8 @@ def _enrich_frame_job(
                             timestamp=ts,
                             window_chunk_id=0,
                             offset_index=0,
-                            app_name=focused_app,
-                            window_name=focused_win or focused_app,
+                            app_name=fullscreen_app,
+                            window_name=fullscreen_win or fullscreen_app,
                         )
                         sqlite_storage.add_frame_subframe_mapping(
                             frame_id=frame_id,
@@ -2237,12 +2482,12 @@ def _enrich_frame_job(
                             ocr_text_json="",
                             ocr_engine=syn_ocr_engine_name,
                             ocr_confidence=syn_ocr_conf,
-                            device_name=f"{focused_app}/{focused_win}",
-                            app_name=focused_app,
-                            window_name=focused_win or focused_app,
+                            device_name=f"{fullscreen_app}/{fullscreen_win}",
+                            app_name=fullscreen_app,
+                            window_name=fullscreen_win or fullscreen_app,
                         )
 
-                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={focused_app} step=syn_sqlite_done")
+                    _runtime_diag(f"store_frame: {frame_id} fullscreen_app={fullscreen_app} step=syn_sqlite_done")
                     # LanceDB: reuse the same embedding (no re-encoding)
                     syn_frame_data = {
                         "frame_id": syn_sub_id,
@@ -2254,10 +2499,14 @@ def _enrich_frame_job(
                         "ocr_text_json": "",
                         "ocr_engine": syn_ocr_engine_name,
                         "ocr_confidence": syn_ocr_conf,
-                        "device_name": f"{focused_app}/{focused_win}",
-                        "metadata": {"is_fullscreen_synthetic": True, "parent_frame_id": frame_id},
-                        "app_name": focused_app,
-                        "window_name": focused_win or focused_app,
+                        "device_name": f"{fullscreen_app}/{fullscreen_win}",
+                        "metadata": {
+                            "is_fullscreen_synthetic": True,
+                            "parent_frame_id": frame_id,
+                            "fullscreen_label_source": "monitor_geometry",
+                        },
+                        "app_name": fullscreen_app,
+                        "window_name": fullscreen_win or fullscreen_app,
                         "_ocr_regions_stored": syn_ocr_regions_stored,
                     }
                     batch_write_buffer.add_frame(syn_frame_data)
@@ -2266,30 +2515,30 @@ def _enrich_frame_job(
                         _tca0 = time_module.time()
                         try:
                             _runtime_diag(
-                                f"store_frame: {frame_id} fullscreen_app={focused_app} step=cluster_assign"
+                                f"store_frame: {frame_id} fullscreen_app={fullscreen_app} step=cluster_assign"
                             )
                             activity_label = cluster_manager.assign_frame(
-                                app_name=focused_app,
+                                app_name=fullscreen_app,
                                 frame_id=syn_sub_id,
                                 embedding=embedding,
                                 image=image,
                                 ocr_text=syn_ocr_text,
                                 layout_text=syn_layout_text,
                                 timestamp=ts.isoformat(),
-                                window_name=focused_win or "",
+                                window_name=fullscreen_win or "",
                             )
                             _runtime_diag(
-                                f"store_frame: {frame_id} fullscreen_app={focused_app} "
+                                f"store_frame: {frame_id} fullscreen_app={fullscreen_app} "
                                 f"step=cluster_done label={activity_label} "
                                 f"t={((time_module.time() - _tca0) * 1000):.0f}ms"
                             )
                             timings["cluster_assign_total_ms"] += (time_module.time() - _tca0) * 1000.0
                             if activity_label:
                                 logger.debug(f"Assigned {syn_sub_id} -> '{activity_label}'")
-                            _log_non_committed_cluster_result(focused_app, syn_sub_id)
+                            _log_non_committed_cluster_result(fullscreen_app, syn_sub_id)
                         except Exception as e:
                             logger.warning(
-                                f"store_frame: {frame_id} fullscreen_app={focused_app} "
+                                f"store_frame: {frame_id} fullscreen_app={fullscreen_app} "
                                 f"step=cluster_failed t={((time_module.time() - _tca0) * 1000):.0f}ms err={e}",
                                 exc_info=True,
                             )
@@ -2298,22 +2547,22 @@ def _enrich_frame_job(
                     sub_frame_summaries.append({
                         "sub_frame_id": syn_sub_id,
                         "timestamp": ts.isoformat(),
-                        "app_name": focused_app,
-                        "window_name": focused_win or focused_app,
+                        "app_name": fullscreen_app,
+                        "window_name": fullscreen_win or fullscreen_app,
                         "image_path": temp_image_path,
                     })
 
                     # Collect for frame-level combined OCR + update cache
                     if syn_ocr_text:
-                        sub_frame_ocr_parts.append((focused_app, syn_ocr_text, syn_ocr_conf))
-                        _fullscreen_ocr_cache[focused_app] = (syn_ocr_text, syn_ocr_conf)
+                        sub_frame_ocr_parts.append((fullscreen_app, syn_ocr_text, syn_ocr_conf))
+                        _fullscreen_ocr_cache[fullscreen_app] = (syn_ocr_text, syn_ocr_conf)
 
                     logger.debug(
                         f"Created fullscreen app sub_frame {syn_sub_id} for "
-                        f"full-screen app {focused_app}/{focused_win}"
+                        f"full-screen app {fullscreen_app}/{fullscreen_win}"
                     )
                 except Exception as e:
-                    logger.warning(f"Failed to create fullscreen app sub_frame for {focused_app}: {e}")
+                    logger.warning(f"Failed to create fullscreen app sub_frame for {fullscreen_app}: {e}")
 
     # ========== 5. 组合全屏帧 OCR：拼接所有 sub_frame 的 OCR 文本 ==========
     combined_ocr_text = ""
@@ -2345,6 +2594,8 @@ def _enrich_frame_job(
                 ocr_confidence=combined_ocr_conf,
                 device_name=f"monitor_{req.monitor_id}",
                 metadata=req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
+                app_name=fullscreen_app or None,
+                window_name=fullscreen_win or None,
                 focused_app_name=focused_app or None,
                 focused_window_name=focused_win or None,
             )
@@ -2373,8 +2624,8 @@ def _enrich_frame_job(
         "ocr_confidence": combined_ocr_conf,
         "device_name": f"monitor_{req.monitor_id}",
         "metadata": req.metadata or {"size": image.size, "monitor_id": req.monitor_id},
-        "app_name": None,
-        "window_name": None,
+        "app_name": fullscreen_app or None,
+        "window_name": fullscreen_win or None,
         "focused_app_name": focused_app or None,
         "focused_window_name": focused_win or None,
         "_ocr_regions_stored": True,  # Already stored above, skip duplicate in BatchWriteBuffer
@@ -2744,6 +2995,2878 @@ Focus on what the user was doing and how the visual content relates to their que
         )
 
     return QueryRagWithTimeResponse(answer=answer, frames=resp_frames)
+
+
+_TASK_MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_TASK_MEMORY_OCR_LIMIT = 2000
+
+
+def _task_memory_dir() -> Path:
+    path = Path(config.STORAGE_ROOT) / "task_memories"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _task_memory_path(task_memory_id: str) -> Path:
+    if not task_memory_id or not _TASK_MEMORY_ID_RE.match(task_memory_id):
+        raise HTTPException(status_code=400, detail="Invalid task_memory_id")
+    return _task_memory_dir() / f"{task_memory_id}.json"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _clip_text(text: Any, limit: int = _TASK_MEMORY_OCR_LIMIT) -> str:
+    if text is None:
+        return ""
+    value = str(text).strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "..."
+
+
+def _clip_one_line(text: Any, limit: int = 500) -> str:
+    return _clip_text(" ".join(str(text or "").split()), limit)
+
+
+def _parse_optional_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return _ensure_utc(datetime.fromisoformat(str(value).replace("Z", "+00:00")))
+    except Exception:
+        return None
+
+
+def _ts_to_iso(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except json.JSONDecodeError as e:
+        logger.warning(f"Invalid Task Memory JSON {path}: {e}")
+    except OSError as e:
+        logger.warning(f"Unable to read Task Memory {path}: {e}")
+    return {}
+
+
+def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    tmp_path.replace(path)
+
+
+def _normalize_task_memory(raw: Dict[str, Any]) -> Dict[str, Any]:
+    selected_segments = raw.get("selected_segments") or []
+    evidence_refs = raw.get("evidence_refs") or []
+    return {
+        "task_memory_id": str(raw.get("task_memory_id") or ""),
+        "title": str(raw.get("title") or "Untitled Task Memory"),
+        "markdown": str(raw.get("markdown") or ""),
+        "source_query": str(raw.get("source_query") or ""),
+        "selected_segments": selected_segments if isinstance(selected_segments, list) else [],
+        "evidence_refs": evidence_refs if isinstance(evidence_refs, list) else [],
+        "created_at": str(raw.get("created_at") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+    }
+
+
+def _save_task_memory(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_task_memory(payload)
+    path = _task_memory_path(normalized["task_memory_id"])
+    _write_json_file(path, normalized)
+    return normalized
+
+
+def _load_task_memory(task_memory_id: str) -> Dict[str, Any]:
+    path = _task_memory_path(task_memory_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Task Memory not found")
+    memory = _normalize_task_memory(_read_json_file(path))
+    if not memory["task_memory_id"]:
+        memory["task_memory_id"] = task_memory_id
+    return memory
+
+
+def _list_task_memories() -> List[Dict[str, Any]]:
+    memories = []
+    for path in _task_memory_dir().glob("*.json"):
+        data = _normalize_task_memory(_read_json_file(path))
+        if not data["task_memory_id"]:
+            data["task_memory_id"] = path.stem
+        memories.append(data)
+    memories.sort(key=lambda m: m.get("updated_at") or m.get("created_at") or "", reverse=True)
+    return memories
+
+
+def _activity_label_for_ids(frame_ids: List[str]) -> Optional[str]:
+    ids = [fid for fid in frame_ids if fid]
+    if not ids or sqlite_storage is None:
+        return None
+    try:
+        placeholders = ",".join(["?"] * len(ids))
+        with sqlite_storage._activity_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT activity_label, provisional_label
+                FROM activity_assignments
+                WHERE sub_frame_id IN ({placeholders})
+                ORDER BY timestamp DESC
+                LIMIT 1
+                """,
+                ids,
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return row["activity_label"] or row["provisional_label"] or None
+    except Exception as e:
+        logger.debug(f"Task Memory activity label lookup failed: {e}")
+        return None
+
+
+_REWIND_QUESTION_FILLERS = (
+    "你猜猜看",
+    "猜猜看",
+    "帮我看看",
+    "帮我查查",
+    "是谁啊",
+    "是谁呀",
+    "是谁呢",
+    "是谁",
+    "是什么",
+    "是啥",
+    "谁啊",
+    "谁呀",
+    "谁呢",
+    "这个",
+    "那个",
+    "一下",
+    "请问",
+    "请",
+    "啊",
+    "呀",
+    "呢",
+    "吗",
+    "？",
+    "?",
+)
+
+_REWIND_RAG_SOURCE_WEIGHTS = {
+    "dense_image": 1.0,
+    "dense_ocr": 0.9,
+    "sparse_fts": 0.85,
+    "keyword_like": 0.75,
+    "window_title": 0.65,
+    "time_range_fallback": 0.45,
+}
+
+
+def _dedupe_strings(values: List[Any], limit: int = 20) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _rewind_local_rank_score(source: str, rank: int) -> float:
+    safe_rank = max(int(rank or 1), 1)
+    weight = _REWIND_RAG_SOURCE_WEIGHTS.get(source, 0.5)
+    return float(weight) / (safe_rank ** 0.5)
+
+
+def _clean_rewind_keyword(term: str) -> str:
+    value = str(term or "").strip()
+    for filler in sorted(_REWIND_QUESTION_FILLERS, key=len, reverse=True):
+        value = value.replace(filler, " ")
+    value = re.sub(r"[\s,，。；;：:!！?？\"'`“”‘’（）()【】\[\]{}<>《》]+", " ", value)
+    return value.strip()
+
+
+def _rewind_keyword_terms(query: str, sparse_queries: Optional[List[str]] = None) -> List[str]:
+    candidates = [query]
+    candidates.extend(sparse_queries or [])
+    terms: List[str] = []
+    for candidate in candidates:
+        cleaned = _clean_rewind_keyword(candidate)
+        if cleaned:
+            terms.append(cleaned)
+        for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_@#.\-]{2,}", str(candidate or "")):
+            token = _clean_rewind_keyword(token)
+            if len(token) >= 2:
+                terms.append(token)
+    return _dedupe_strings(terms, limit=12)
+
+
+def _merge_rewind_time_range(
+    explicit_start: Optional[datetime],
+    explicit_end: Optional[datetime],
+    llm_time_range: Optional[Tuple[datetime, datetime]],
+) -> Tuple[Optional[datetime], Optional[datetime]]:
+    start_time = explicit_start
+    end_time = explicit_end
+    if llm_time_range is None:
+        return start_time, end_time
+
+    llm_start, llm_end = (_ensure_utc(llm_time_range[0]), _ensure_utc(llm_time_range[1]))
+    if explicit_start and llm_start:
+        start_time = max(explicit_start, llm_start)
+    elif llm_start:
+        start_time = llm_start
+
+    if explicit_end and llm_end:
+        end_time = min(explicit_end, llm_end)
+    elif llm_end:
+        end_time = llm_end
+
+    if start_time and end_time and start_time > end_time:
+        if explicit_start or explicit_end:
+            return explicit_start, explicit_end
+        return llm_start, llm_end
+    return start_time, end_time
+
+
+def _build_rewind_retrieval_plan(
+    query: str,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> Dict[str, Any]:
+    dense_queries = [query] if query.strip() else []
+    sparse_queries = [query] if query.strip() else []
+    related_apps = None
+    unrelated_apps = None
+    window_filters = None
+    llm_time_range = None
+    controller_used = False
+    controller_error = None
+
+    if query.strip() and config.REWIND_ENABLE_AGENTIC_SEARCH:
+        try:
+            rewrite_result = rewrite_and_time(
+                query,
+                enable_rewrite=config.ENABLE_LLM_REWRITE,
+                enable_time=config.ENABLE_TIME_FILTER,
+                expand_n=config.QUERY_REWRITE_NUM,
+                api_client=vlm,
+            )
+            if len(rewrite_result) == 6:
+                (
+                    dense_llm,
+                    sparse_llm,
+                    llm_time_range,
+                    related_apps,
+                    unrelated_apps,
+                    window_filters,
+                ) = rewrite_result
+            else:
+                dense_llm, sparse_llm, llm_time_range, related_apps, unrelated_apps = rewrite_result
+                window_filters = None
+            if config.ENABLE_LLM_REWRITE:
+                dense_queries = dense_llm or dense_queries
+                sparse_queries = sparse_llm or sparse_queries
+            controller_used = True
+        except Exception as e:
+            controller_error = str(e)
+            logger.warning(f"Rewind retrieval controller failed, using deterministic hops: {e}")
+
+    merged_start, merged_end = _merge_rewind_time_range(start_dt, end_dt, llm_time_range)
+    keyword_terms = _rewind_keyword_terms(query, sparse_queries)
+    dense_queries = _dedupe_strings(dense_queries, limit=8)
+    sparse_queries = _dedupe_strings([*sparse_queries, *keyword_terms], limit=16)
+
+    return {
+        "mode": "agentic_session" if config.REWIND_ENABLE_AGENTIC_SEARCH else "legacy",
+        "controller_used": controller_used,
+        "controller_error": controller_error,
+        "dense_queries": dense_queries,
+        "sparse_queries": sparse_queries,
+        "keyword_terms": keyword_terms,
+        "start_time": merged_start,
+        "end_time": merged_end,
+        "related_apps": related_apps,
+        "unrelated_apps": unrelated_apps,
+        "window_filters": window_filters,
+        "hops": [
+            "llm_rewrite_time_app_window",
+            "activity_session_candidate_filter",
+            "parallel_cloud_label_scoring",
+            "parallel_local_multihop_rag",
+            "rag_frame_to_activity_session_reverse_map",
+            "label_rag_weighted_fusion",
+        ],
+    }
+
+
+def _rewind_filter_app_sets(plan: Dict[str, Any]) -> Tuple[set, set, Dict[str, List[str]], Dict[str, List[str]]]:
+    include_apps = set(plan.get("related_apps") or [])
+    exclude_apps = set(plan.get("unrelated_apps") or [])
+    window_filters = plan.get("window_filters") or {}
+    include_windows = window_filters.get("include") or {}
+    exclude_windows = window_filters.get("exclude") or {}
+    include_apps.update(app for app in include_windows.keys() if app)
+    exclude_apps.update(app for app in exclude_windows.keys() if app)
+    return include_apps, exclude_apps, include_windows, exclude_windows
+
+
+def _session_window_names(session: Dict[str, Any], limit: int = 8) -> List[str]:
+    if sqlite_storage is None:
+        return []
+    start = session.get("start_time")
+    end = session.get("end_time")
+    app_name = session.get("app_name") or ""
+    if not start or not end:
+        return []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT DISTINCT sf.window_name
+                FROM sub_frames sf
+                WHERE sf.timestamp >= ? AND sf.timestamp <= ?
+                  AND (? = '' OR sf.app_name = ?)
+                  AND sf.window_name IS NOT NULL AND sf.window_name != ''
+                ORDER BY sf.timestamp DESC
+                LIMIT ?
+                """,
+                (start, end, app_name, app_name, limit),
+            )
+            return [row["window_name"] for row in cursor.fetchall() if row["window_name"]]
+    except Exception as e:
+        logger.debug(f"Rewind session window-name lookup failed: {e}")
+        return []
+
+
+def _session_matches_plan_filters(session: Dict[str, Any], plan: Dict[str, Any]) -> bool:
+    app = session.get("app_name") or ""
+    include_apps, exclude_apps, include_windows, exclude_windows = _rewind_filter_app_sets(plan)
+    if include_apps and app not in include_apps:
+        return False
+    if exclude_apps and app in exclude_apps:
+        return False
+
+    windows = _session_window_names(session, limit=12)
+    if include_windows:
+        included = False
+        for include_app, allowed_windows in include_windows.items():
+            if include_app and include_app != app:
+                continue
+            if not allowed_windows or any(w in allowed_windows for w in windows):
+                included = True
+                break
+        if not included:
+            return False
+    for exclude_app, blocked_windows in exclude_windows.items():
+        if exclude_app and exclude_app != app:
+            continue
+        if not blocked_windows or any(w in blocked_windows for w in windows):
+            return False
+    return True
+
+
+def _candidate_activity_sessions_for_plan(
+    plan: Dict[str, Any],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Collect app/window/label session candidates before the parallel loops."""
+    if sqlite_storage is None:
+        return []
+    start_dt = plan.get("start_time")
+    end_dt = plan.get("end_time")
+    include_apps, exclude_apps, _include_windows, _exclude_windows = _rewind_filter_app_sets(plan)
+    keyword_terms = plan.get("keyword_terms") or []
+    sessions: List[Dict[str, Any]] = []
+
+    try:
+        with sqlite_storage._activity_connection() as conn:
+            cursor = conn.cursor()
+            where = ["session_status IN ('committed', 'candidate')"]
+            params: List[Any] = []
+            if start_dt:
+                where.append("end_time >= ?")
+                params.append(_sql_dt(start_dt))
+            if end_dt:
+                where.append("start_time <= ?")
+                params.append(_sql_dt(end_dt))
+            if include_apps:
+                placeholders = ",".join("?" for _ in include_apps)
+                where.append(f"app_name IN ({placeholders})")
+                params.extend(sorted(include_apps))
+            if exclude_apps:
+                placeholders = ",".join("?" for _ in exclude_apps)
+                where.append(f"app_name NOT IN ({placeholders})")
+                params.extend(sorted(exclude_apps))
+
+            if not include_apps and keyword_terms:
+                term_clauses = []
+                for term in keyword_terms[:6]:
+                    term_clauses.append("(label LIKE ? ESCAPE '\\' OR app_name LIKE ? ESCAPE '\\')")
+                    params.extend([_like_pattern(term), _like_pattern(term)])
+                where.append("(" + " OR ".join(term_clauses) + ")")
+
+            params.append(min(max(limit, 20), 160))
+            cursor.execute(
+                f"""
+                SELECT id, app_name, cluster_id, label, start_time, end_time,
+                       frame_count, session_status
+                FROM activity_sessions
+                WHERE {" AND ".join(where)}
+                ORDER BY
+                    CASE WHEN session_status = 'committed' THEN 0 ELSE 1 END,
+                    frame_count DESC,
+                    end_time DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            sessions = [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.debug(f"Rewind candidate activity-session collection failed: {e}")
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    seen = set()
+    for session in sessions:
+        if not _session_matches_plan_filters(session, plan):
+            continue
+        key = _session_key(session)
+        if key in seen:
+            continue
+        seen.add(key)
+        enriched = dict(session)
+        enriched["window_names"] = _session_window_names(session)
+        candidates.append(enriched)
+        if len(candidates) >= limit:
+            break
+
+    logger.info(
+        "Rewind agentic candidate sessions: "
+        f"count={len(candidates)} include_apps={sorted(include_apps)} "
+        f"exclude_apps={sorted(exclude_apps)}"
+    )
+    for idx, candidate in enumerate(candidates[:20], start=1):
+        logger.info(
+            "Rewind candidate[%02d]: session=%s app=%s label=%s windows=%s time=%s->%s frames=%s",
+            idx,
+            candidate.get("id"),
+            candidate.get("app_name"),
+            candidate.get("label"),
+            candidate.get("window_names") or [],
+            candidate.get("start_time"),
+            candidate.get("end_time"),
+            candidate.get("frame_count"),
+        )
+    return candidates
+
+
+def _session_identifier(session: Dict[str, Any]) -> str:
+    if session.get("id") is not None:
+        return str(session.get("id"))
+    return "|".join(
+        [
+            str(session.get("app_name") or ""),
+            str(session.get("label") or ""),
+            str(session.get("start_time") or ""),
+            str(session.get("end_time") or ""),
+        ]
+    )
+
+
+def _parse_rewind_json_payload(text: Any) -> Optional[Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", raw, flags=re.IGNORECASE | re.DOTALL):
+        candidates.insert(0, match.group(1).strip())
+    object_start = raw.find("{")
+    object_end = raw.rfind("}")
+    if object_start >= 0 and object_end > object_start:
+        candidates.append(raw[object_start : object_end + 1])
+    array_start = raw.find("[")
+    array_end = raw.rfind("]")
+    if array_start >= 0 and array_end > array_start:
+        candidates.append(raw[array_start : array_end + 1])
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            continue
+    return None
+
+
+def _fallback_rewind_label_score(
+    query: str,
+    plan: Dict[str, Any],
+    session: Dict[str, Any],
+) -> Tuple[float, str]:
+    include_apps, exclude_apps, include_windows, exclude_windows = _rewind_filter_app_sets(plan)
+    app = str(session.get("app_name") or "")
+    label = str(session.get("label") or "")
+    windows = [str(w or "") for w in session.get("window_names") or []]
+    haystack = " ".join([app, label, *windows]).lower()
+    terms = [str(term or "").strip().lower() for term in plan.get("keyword_terms") or [] if str(term or "").strip()]
+
+    score = 0.05
+    reasons: List[str] = []
+    if include_apps and app in include_apps:
+        score += 0.35
+        reasons.append("include_app")
+    if exclude_apps and app in exclude_apps:
+        return 0.0, "excluded_app"
+
+    matched_terms = [term for term in terms if term and term in haystack]
+    if terms:
+        score += 0.4 * (len(matched_terms) / max(len(terms), 1))
+        if matched_terms:
+            reasons.append("keyword:" + ",".join(matched_terms[:4]))
+    elif query.strip():
+        query_tokens = [
+            token.lower()
+            for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_@#.\-]{2,}", query)
+            if token.strip()
+        ]
+        overlap = [token for token in query_tokens if token in haystack]
+        score += 0.25 * (len(overlap) / max(len(query_tokens), 1)) if query_tokens else 0.0
+        if overlap:
+            reasons.append("query_overlap:" + ",".join(overlap[:4]))
+
+    if include_windows:
+        for include_app, allowed_windows in include_windows.items():
+            if include_app and include_app != app:
+                continue
+            if not allowed_windows:
+                score += 0.15
+                reasons.append("include_window_app")
+                break
+            matched_windows = [w for w in windows if w in allowed_windows]
+            if matched_windows:
+                score += 0.15
+                reasons.append("include_window:" + ",".join(matched_windows[:2]))
+                break
+    for exclude_app, blocked_windows in exclude_windows.items():
+        if exclude_app and exclude_app != app:
+            continue
+        if not blocked_windows or any(w in blocked_windows for w in windows):
+            return 0.0, "excluded_window"
+
+    frame_count = float(session.get("frame_count") or 0)
+    if frame_count > 0:
+        score += min(frame_count / 500.0, 0.1)
+    return min(score, 1.0), "; ".join(reasons) or "fallback_prior"
+
+
+def _score_rewind_label_candidates(
+    query: str,
+    plan: Dict[str, Any],
+    candidates: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
+    fallback_scores = {
+        _session_identifier(session): _fallback_rewind_label_score(query, plan, session)
+        for session in candidates
+    }
+    llm_scores: Dict[str, Tuple[float, str]] = {}
+    llm_error = None
+
+    compact_candidates = [
+        {
+            "id": _session_identifier(session),
+            "app": session.get("app_name") or "",
+            "windows": (session.get("window_names") or [])[:5],
+            "label": session.get("label") or "",
+            "start": session.get("start_time") or "",
+            "end": session.get("end_time") or "",
+            "frames": session.get("frame_count") or 0,
+        }
+        for session in candidates[:80]
+    ]
+
+    system_prompt = (
+        "你是 VisualMem Rewind 的检索控制器。你只根据候选 activity sessions 的 app、window、label、"
+        "时间段判断它们是否能回答用户问题。输出严格 JSON，不要输出 Markdown。"
+    )
+    prompt = {
+        "task": "score_activity_session_labels_for_rewind_search",
+        "user_query": query,
+        "rewrite_dense_queries": plan.get("dense_queries") or [],
+        "rewrite_sparse_queries": plan.get("sparse_queries") or [],
+        "include_apps": plan.get("related_apps") or [],
+        "exclude_apps": plan.get("unrelated_apps") or [],
+        "window_filters": plan.get("window_filters") or {},
+        "time_range": {
+            "start": _ts_to_iso(plan.get("start_time")),
+            "end": _ts_to_iso(plan.get("end_time")),
+        },
+        "candidates": compact_candidates,
+        "output_schema": {
+            "scores": [
+                {
+                    "id": "candidate id",
+                    "score": "number from 0.0 to 1.0",
+                    "reason": "short reason, mention label/app/window evidence",
+                }
+            ]
+        },
+    }
+
+    try:
+        ai = vlm or ApiVLM()
+        response = ai._call_vlm_text_only(
+            json.dumps(prompt, ensure_ascii=False),
+            system_prompt=system_prompt,
+        )
+        payload = _parse_rewind_json_payload(response)
+        score_items = payload.get("scores") if isinstance(payload, dict) else payload
+        if isinstance(score_items, list):
+            for item in score_items:
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("id") or item.get("session_id") or "")
+                if not sid:
+                    continue
+                try:
+                    score = max(0.0, min(float(item.get("score") or 0.0), 1.0))
+                except Exception:
+                    score = 0.0
+                reason = _clip_one_line(item.get("reason"), 220)
+                llm_scores[sid] = (score, reason or "llm_selected")
+    except Exception as e:
+        llm_error = str(e)
+        logger.debug(f"Rewind LLM label scoring failed, using fallback scores: {e}")
+
+    scored: List[Dict[str, Any]] = []
+    for session in candidates:
+        sid = _session_identifier(session)
+        fallback_score, fallback_reason = fallback_scores.get(sid, (0.0, "fallback_missing"))
+        score, reason = llm_scores.get(sid, (fallback_score, fallback_reason))
+        source = "cloud_llm" if sid in llm_scores else "fallback"
+        scored.append(
+            {
+                "session": session,
+                "session_id": sid,
+                "llm_label_score": score,
+                "llm_label_reason": reason,
+                "llm_label_score_source": source,
+                "fallback_label_score": fallback_score,
+                "fallback_label_reason": fallback_reason,
+                "llm_label_error": llm_error,
+            }
+        )
+
+    scored.sort(key=lambda item: item.get("llm_label_score") or 0.0, reverse=True)
+    logger.info(
+        "Rewind agentic top label scores: %s",
+        [
+            {
+                "session": item.get("session_id"),
+                "score": round(float(item.get("llm_label_score") or 0.0), 3),
+                "source": item.get("llm_label_score_source"),
+                "app": item.get("session", {}).get("app_name"),
+                "label": item.get("session", {}).get("label"),
+                "reason": item.get("llm_label_reason"),
+            }
+            for item in scored[:12]
+        ],
+    )
+    return scored[: max(limit, 1)]
+
+
+def _safe_metadata_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _dt_from_any(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _ensure_utc(value)
+    return _parse_optional_dt(str(value))
+
+
+def _sql_dt(value: Optional[datetime]) -> Optional[str]:
+    return _ensure_utc(value).isoformat() if value else None
+
+
+def _like_pattern(term: str) -> str:
+    escaped = str(term).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _app_window_allowed(
+    app_name: Optional[str],
+    window_name: Optional[str],
+    related_apps: Optional[List[str]],
+    unrelated_apps: Optional[List[str]],
+    window_filters: Optional[Dict[str, Dict[str, List[str]]]],
+) -> bool:
+    app = app_name or ""
+    window = window_name or ""
+    include_map = (window_filters or {}).get("include") or {}
+    exclude_map = (window_filters or {}).get("exclude") or {}
+
+    if include_map:
+        included = False
+        for include_app, windows in include_map.items():
+            if include_app and include_app != app:
+                continue
+            if not windows or window in windows:
+                included = True
+                break
+        if not included:
+            return False
+    elif related_apps and app not in related_apps:
+        return False
+
+    for exclude_app, windows in exclude_map.items():
+        if exclude_app and exclude_app != app:
+            continue
+        if not windows or window in windows:
+            return False
+    if unrelated_apps and app in unrelated_apps:
+        return False
+    return True
+
+
+def _parent_frame_id_for_sub_frame(sub_frame_id: Optional[str]) -> Optional[str]:
+    if not sub_frame_id or sqlite_storage is None:
+        return None
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT frame_id
+                FROM frame_subframe_mapping
+                WHERE sub_frame_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (sub_frame_id,),
+            )
+            row = cursor.fetchone()
+        return row["frame_id"] if row else None
+    except Exception as e:
+        logger.debug(f"Rewind parent-frame lookup failed for {sub_frame_id}: {e}")
+        return None
+
+
+def _normalize_rewind_hit(frame: Dict[str, Any], source: str, query_text: str, rank: int) -> Optional[Dict[str, Any]]:
+    fid = frame.get("frame_id")
+    metadata = _safe_metadata_dict(frame.get("metadata"))
+    sub_frame_id = frame.get("sub_frame_id") or metadata.get("sub_frame_id")
+    parent_frame_id = metadata.get("parent_frame_id")
+
+    if fid and not parent_frame_id:
+        parent_frame_id = _parent_frame_id_for_sub_frame(fid)
+        if parent_frame_id:
+            sub_frame_id = sub_frame_id or fid
+            fid = parent_frame_id
+
+    if not fid and sub_frame_id:
+        fid = _parent_frame_id_for_sub_frame(sub_frame_id) or sub_frame_id
+    if not fid:
+        return None
+
+    timestamp = _dt_from_any(frame.get("timestamp"))
+    local_rank_score = _rewind_local_rank_score(source, rank)
+    rag_detail = {
+        "source": source,
+        "query": query_text,
+        "rank": rank,
+        "score": round(local_rank_score, 4),
+    }
+    metadata.update(
+        {
+            "retrieval_sources": [source],
+            "retrieval_queries": [query_text] if query_text else [],
+            "retrieval_rank": rank,
+            "rag_details": [rag_detail],
+        }
+    )
+    if sub_frame_id:
+        metadata["sub_frame_id"] = sub_frame_id
+    if parent_frame_id:
+        metadata["parent_frame_id"] = parent_frame_id
+
+    normalized = dict(frame)
+    normalized["frame_id"] = fid
+    normalized["timestamp"] = timestamp or frame.get("timestamp")
+    normalized["metadata"] = metadata
+    if sub_frame_id:
+        normalized["sub_frame_id"] = sub_frame_id
+    normalized["_local_rag_score"] = float(frame.get("_local_rag_score") or 0.0) + local_rank_score
+    normalized["_rewind_score"] = (
+        float(frame.get("_rewind_score") or 0.0)
+        + max(0.0, 10.0 - rank)
+        + local_rank_score * 10.0
+    )
+    return normalized
+
+
+def _add_rewind_hit(
+    hits_by_key: Dict[Tuple[str, str], Dict[str, Any]],
+    frame: Dict[str, Any],
+    source: str,
+    query_text: str,
+    rank: int,
+) -> None:
+    hit = _normalize_rewind_hit(frame, source, query_text, rank)
+    if not hit:
+        return
+    key = (hit.get("frame_id") or "", hit.get("sub_frame_id") or hit.get("metadata", {}).get("sub_frame_id") or "")
+    existing = hits_by_key.get(key)
+    if existing is None:
+        hits_by_key[key] = hit
+        return
+    existing["_rewind_score"] = float(existing.get("_rewind_score") or 0.0) + float(hit.get("_rewind_score") or 0.0)
+    existing["_local_rag_score"] = (
+        float(existing.get("_local_rag_score") or 0.0)
+        + float(hit.get("_local_rag_score") or 0.0)
+    )
+    existing_ocr = existing.get("ocr_text") or ""
+    if len(hit.get("ocr_text") or "") > len(existing_ocr):
+        existing["ocr_text"] = hit.get("ocr_text")
+    metadata = existing.setdefault("metadata", {})
+    hit_metadata = hit.get("metadata", {})
+    if hit_metadata.get("retrieval_rank") is not None:
+        current_rank = metadata.get("retrieval_rank")
+        metadata["retrieval_rank"] = (
+            min(int(current_rank), int(hit_metadata["retrieval_rank"]))
+            if current_rank is not None
+            else hit_metadata["retrieval_rank"]
+        )
+    for value in hit.get("metadata", {}).get("retrieval_sources") or []:
+        if value not in metadata.setdefault("retrieval_sources", []):
+            metadata["retrieval_sources"].append(value)
+    for value in hit.get("metadata", {}).get("retrieval_queries") or []:
+        if value not in metadata.setdefault("retrieval_queries", []):
+            metadata["retrieval_queries"].append(value)
+    seen_details = {
+        (
+            detail.get("source"),
+            detail.get("query"),
+            detail.get("rank"),
+        )
+        for detail in metadata.setdefault("rag_details", [])
+        if isinstance(detail, dict)
+    }
+    for detail in hit_metadata.get("rag_details") or []:
+        if not isinstance(detail, dict):
+            continue
+        detail_key = (detail.get("source"), detail.get("query"), detail.get("rank"))
+        if detail_key in seen_details:
+            continue
+        seen_details.add(detail_key)
+        metadata["rag_details"].append(detail)
+
+
+def _rewind_keyword_like_search(
+    term: str,
+    limit: int,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    related_apps: Optional[List[str]],
+    unrelated_apps: Optional[List[str]],
+    window_filters: Optional[Dict[str, Dict[str, List[str]]]],
+) -> List[Dict[str, Any]]:
+    if sqlite_storage is None or not term:
+        return []
+    results: List[Dict[str, Any]] = []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            where = ["o.text LIKE ? ESCAPE '\\'"]
+            params: List[Any] = [_like_pattern(term)]
+            if start_dt:
+                where.append("COALESCE(sf.timestamp, f.timestamp, pf.timestamp) >= ?")
+                params.append(_sql_dt(start_dt))
+            if end_dt:
+                where.append("COALESCE(sf.timestamp, f.timestamp, pf.timestamp) <= ?")
+                params.append(_sql_dt(end_dt))
+            params.append(limit)
+            cursor.execute(
+                f"""
+                SELECT
+                    o.frame_id AS o_frame_id,
+                    o.sub_frame_id AS o_sub_frame_id,
+                    o.text AS ocr_text,
+                    o.confidence AS ocr_confidence,
+                    f.frame_id AS frame_id,
+                    f.timestamp AS frame_timestamp,
+                    f.image_path AS frame_image_path,
+                    f.device_name AS device_name,
+                    f.metadata AS frame_metadata,
+                    f.app_name AS frame_app_name,
+                    f.window_name AS frame_window_name,
+                    f.focused_app_name AS focused_app_name,
+                    f.focused_window_name AS focused_window_name,
+                    sf.sub_frame_id AS sub_frame_id,
+                    sf.timestamp AS sub_timestamp,
+                    sf.app_name AS sub_app_name,
+                    sf.window_name AS sub_window_name,
+                    sf.window_chunk_id,
+                    sf.offset_index,
+                    pf.frame_id AS parent_frame_id,
+                    pf.image_path AS parent_image_path,
+                    pf.metadata AS parent_metadata
+                FROM ocr_text o
+                LEFT JOIN frames f ON o.frame_id = f.frame_id
+                LEFT JOIN sub_frames sf ON o.sub_frame_id = sf.sub_frame_id
+                LEFT JOIN frame_subframe_mapping fsm ON sf.sub_frame_id = fsm.sub_frame_id
+                LEFT JOIN frames pf ON fsm.frame_id = pf.frame_id
+                WHERE {" AND ".join(where)}
+                ORDER BY COALESCE(sf.timestamp, f.timestamp, pf.timestamp) DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+
+        for row in rows:
+            app_name = row["sub_app_name"] or row["frame_app_name"] or row["focused_app_name"] or ""
+            window_name = row["sub_window_name"] or row["frame_window_name"] or row["focused_window_name"] or ""
+            if not _app_window_allowed(app_name, window_name, related_apps, unrelated_apps, window_filters):
+                continue
+            sf_id = row["sub_frame_id"] or row["o_sub_frame_id"]
+            image_path = row["frame_image_path"] or row["parent_image_path"]
+            if sf_id:
+                image_path = _resolve_sub_frame_image_path(
+                    {
+                        "sub_frame_id": sf_id,
+                        "window_chunk_id": row["window_chunk_id"],
+                        "offset_index": row["offset_index"],
+                    }
+                ) or image_path
+            results.append(
+                {
+                    "frame_id": row["frame_id"] or row["parent_frame_id"] or row["o_frame_id"] or sf_id,
+                    "sub_frame_id": sf_id,
+                    "timestamp": _dt_from_any(row["sub_timestamp"] or row["frame_timestamp"]),
+                    "image_path": image_path,
+                    "device_name": row["device_name"],
+                    "metadata": {
+                        **_safe_metadata_dict(row["frame_metadata"] or row["parent_metadata"]),
+                        "sub_frame_id": sf_id,
+                        "parent_frame_id": row["parent_frame_id"],
+                    },
+                    "app_name": app_name,
+                    "window_name": window_name,
+                    "ocr_text": row["ocr_text"] or "",
+                    "ocr_confidence": row["ocr_confidence"] or 0.0,
+                }
+            )
+    except Exception as e:
+        logger.debug(f"Rewind keyword LIKE search failed for '{term}': {e}")
+    return results
+
+
+def _rewind_window_search(
+    term: str,
+    limit: int,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> List[Dict[str, Any]]:
+    if sqlite_storage is None or not term:
+        return []
+    results: List[Dict[str, Any]] = []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            pattern = _like_pattern(term)
+            frame_where = [
+                "(f.app_name LIKE ? ESCAPE '\\' OR f.window_name LIKE ? ESCAPE '\\' "
+                "OR f.focused_app_name LIKE ? ESCAPE '\\' OR f.focused_window_name LIKE ? ESCAPE '\\')"
+            ]
+            frame_params: List[Any] = [pattern, pattern, pattern, pattern]
+            if start_dt:
+                frame_where.append("f.timestamp >= ?")
+                frame_params.append(_sql_dt(start_dt))
+            if end_dt:
+                frame_where.append("f.timestamp <= ?")
+                frame_params.append(_sql_dt(end_dt))
+            frame_params.append(limit)
+            cursor.execute(
+                f"""
+                SELECT f.frame_id, f.timestamp, f.image_path, f.device_name, f.metadata,
+                       f.app_name, f.window_name, f.focused_app_name, f.focused_window_name,
+                       o.text AS ocr_text, o.confidence AS ocr_confidence
+                FROM frames f
+                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
+                WHERE {" AND ".join(frame_where)}
+                ORDER BY f.timestamp DESC
+                LIMIT ?
+                """,
+                tuple(frame_params),
+            )
+            frame_rows = cursor.fetchall()
+
+            sub_where = ["(sf.app_name LIKE ? ESCAPE '\\' OR sf.window_name LIKE ? ESCAPE '\\')"]
+            sub_params: List[Any] = [pattern, pattern]
+            if start_dt:
+                sub_where.append("sf.timestamp >= ?")
+                sub_params.append(_sql_dt(start_dt))
+            if end_dt:
+                sub_where.append("sf.timestamp <= ?")
+                sub_params.append(_sql_dt(end_dt))
+            sub_params.append(limit)
+            cursor.execute(
+                f"""
+                SELECT sf.sub_frame_id, sf.timestamp, sf.app_name, sf.window_name,
+                       sf.window_chunk_id, sf.offset_index, fsm.frame_id AS parent_frame_id,
+                       f.image_path AS parent_image_path, o.text AS ocr_text, o.confidence AS ocr_confidence
+                FROM sub_frames sf
+                LEFT JOIN frame_subframe_mapping fsm ON sf.sub_frame_id = fsm.sub_frame_id
+                LEFT JOIN frames f ON fsm.frame_id = f.frame_id
+                LEFT JOIN ocr_text o ON sf.sub_frame_id = o.sub_frame_id
+                WHERE {" AND ".join(sub_where)}
+                ORDER BY sf.timestamp DESC
+                LIMIT ?
+                """,
+                tuple(sub_params),
+            )
+            sub_rows = cursor.fetchall()
+
+        for row in frame_rows:
+            results.append(
+                {
+                    "frame_id": row["frame_id"],
+                    "timestamp": _dt_from_any(row["timestamp"]),
+                    "image_path": row["image_path"],
+                    "device_name": row["device_name"],
+                    "metadata": _safe_metadata_dict(row["metadata"]),
+                    "app_name": row["app_name"] or row["focused_app_name"] or "",
+                    "window_name": row["window_name"] or row["focused_window_name"] or "",
+                    "ocr_text": row["ocr_text"] or "",
+                    "ocr_confidence": row["ocr_confidence"] or 0.0,
+                }
+            )
+        for row in sub_rows:
+            image_path = _resolve_sub_frame_image_path(dict(row)) or row["parent_image_path"]
+            results.append(
+                {
+                    "frame_id": row["parent_frame_id"] or row["sub_frame_id"],
+                    "sub_frame_id": row["sub_frame_id"],
+                    "timestamp": _dt_from_any(row["timestamp"]),
+                    "image_path": image_path,
+                    "metadata": {
+                        "sub_frame_id": row["sub_frame_id"],
+                        "parent_frame_id": row["parent_frame_id"],
+                    },
+                    "app_name": row["app_name"] or "",
+                    "window_name": row["window_name"] or "",
+                    "ocr_text": row["ocr_text"] or "",
+                    "ocr_confidence": row["ocr_confidence"] or 0.0,
+                }
+            )
+    except Exception as e:
+        logger.debug(f"Rewind window-title search failed for '{term}': {e}")
+    return results
+
+
+def _rewind_activity_sessions_by_terms(
+    terms: List[str],
+    limit: int,
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> List[Dict[str, Any]]:
+    if sqlite_storage is None or not terms:
+        return []
+    sessions: List[Dict[str, Any]] = []
+    try:
+        with sqlite_storage._activity_connection() as conn:
+            cursor = conn.cursor()
+            for term in terms:
+                pattern = _like_pattern(term)
+                where = [
+                    "(label LIKE ? ESCAPE '\\' OR app_name LIKE ? ESCAPE '\\')",
+                    "session_status IN ('committed', 'candidate')",
+                ]
+                params: List[Any] = [pattern, pattern]
+                if start_dt:
+                    where.append("end_time >= ?")
+                    params.append(_sql_dt(start_dt))
+                if end_dt:
+                    where.append("start_time <= ?")
+                    params.append(_sql_dt(end_dt))
+                params.append(limit)
+                cursor.execute(
+                    f"""
+                    SELECT id, app_name, cluster_id, label, start_time, end_time,
+                           frame_count, session_status
+                    FROM activity_sessions
+                    WHERE {" AND ".join(where)}
+                    ORDER BY frame_count DESC, end_time DESC
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                )
+                sessions.extend(dict(row) for row in cursor.fetchall())
+    except Exception as e:
+        logger.debug(f"Rewind activity-session term search failed: {e}")
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for session in sessions:
+        key = (
+            session.get("id"),
+            session.get("app_name"),
+            session.get("label"),
+            session.get("start_time"),
+            session.get("end_time"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(session)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _activity_session_for_hit(hit: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if sqlite_storage is None:
+        return None
+    ts = _dt_from_any(hit.get("timestamp"))
+    if not ts:
+        return None
+    ts_iso = _sql_dt(ts)
+    app_name = hit.get("app_name") or ""
+    sub_frame_id = hit.get("sub_frame_id") or hit.get("metadata", {}).get("sub_frame_id")
+    cluster_id = None
+    try:
+        with sqlite_storage._activity_connection() as conn:
+            cursor = conn.cursor()
+            if sub_frame_id:
+                cursor.execute(
+                    """
+                    SELECT app_name, activity_cluster_id, activity_label, provisional_label
+                    FROM activity_assignments
+                    WHERE sub_frame_id = ?
+                    LIMIT 1
+                    """,
+                    (sub_frame_id,),
+                )
+                assignment = cursor.fetchone()
+                if assignment:
+                    app_name = app_name or assignment["app_name"] or ""
+                    cluster_id = assignment["activity_cluster_id"]
+            clauses = [
+                "start_time <= ?",
+                "end_time >= ?",
+                "session_status IN ('committed', 'candidate')",
+            ]
+            params: List[Any] = [ts_iso, ts_iso]
+            if cluster_id is not None:
+                clauses.append("(cluster_id = ? OR app_name = ?)")
+                params.extend([cluster_id, app_name])
+            elif app_name:
+                clauses.append("app_name = ?")
+                params.append(app_name)
+            cursor.execute(
+                f"""
+                SELECT id, app_name, cluster_id, label, start_time, end_time,
+                       frame_count, session_status
+                FROM activity_sessions
+                WHERE {" AND ".join(clauses)}
+                ORDER BY
+                    CASE WHEN cluster_id = ? THEN 0 ELSE 1 END,
+                    CASE WHEN session_status = 'committed' THEN 0 ELSE 1 END,
+                    frame_count DESC
+                LIMIT 1
+                """,
+                tuple([*params, cluster_id if cluster_id is not None else -1]),
+            )
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+
+            cursor.execute(
+                """
+                SELECT id, app_name, cluster_id, label, start_time, end_time,
+                       frame_count, session_status
+                FROM activity_sessions
+                WHERE start_time <= ? AND end_time >= ?
+                  AND session_status IN ('committed', 'candidate')
+                ORDER BY frame_count DESC
+                LIMIT 1
+                """,
+                (ts_iso, ts_iso),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+    except Exception as e:
+        logger.debug(f"Rewind activity-session lookup failed: {e}")
+        return None
+
+
+def _sub_frames_for_activity_session(session: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    if sqlite_storage is None:
+        return []
+    start = session.get("start_time")
+    end = session.get("end_time")
+    app_name = session.get("app_name") or ""
+    sub_frames: List[Dict[str, Any]] = []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT sf.sub_frame_id, sf.timestamp, sf.app_name, sf.window_name,
+                       sf.window_chunk_id, sf.offset_index, fsm.frame_id AS parent_frame_id
+                FROM sub_frames sf
+                LEFT JOIN frame_subframe_mapping fsm ON sf.sub_frame_id = fsm.sub_frame_id
+                WHERE sf.timestamp >= ? AND sf.timestamp <= ?
+                  AND (? = '' OR sf.app_name = ?)
+                ORDER BY sf.timestamp ASC
+                LIMIT ?
+                """,
+                (start, end, app_name, app_name, limit),
+            )
+            rows = cursor.fetchall()
+        for row in rows:
+            sf = {
+                "sub_frame_id": row["sub_frame_id"],
+                "timestamp": _ts_to_iso(row["timestamp"]),
+                "app_name": row["app_name"] or "",
+                "window_name": row["window_name"] or "",
+                "window_chunk_id": row["window_chunk_id"],
+                "offset_index": row["offset_index"],
+                "parent_frame_id": row["parent_frame_id"],
+            }
+            sf["image_path"] = _resolve_sub_frame_image_path(sf)
+            sub_frames.append(sf)
+    except Exception as e:
+        logger.debug(f"Rewind session sub-frame lookup failed: {e}")
+    return sub_frames
+
+
+def _frames_for_rewind_span(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    if sqlite_storage is None or not start_dt or not end_dt:
+        return []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT f.frame_id, f.timestamp, f.image_path, f.device_name, f.metadata,
+                       f.app_name, f.window_name, f.focused_app_name, f.focused_window_name,
+                       o.text AS ocr_text, o.confidence AS ocr_confidence
+                FROM frames f
+                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
+                WHERE f.timestamp >= ? AND f.timestamp <= ?
+                  AND f.frame_id LIKE 'frame_%'
+                ORDER BY f.timestamp ASC
+                LIMIT ?
+                """,
+                (_sql_dt(start_dt), _sql_dt(end_dt), limit),
+            )
+            rows = cursor.fetchall()
+        return [
+            {
+                "frame_id": row["frame_id"],
+                "timestamp": _dt_from_any(row["timestamp"]),
+                "image_path": row["image_path"],
+                "device_name": row["device_name"],
+                "metadata": _safe_metadata_dict(row["metadata"]),
+                "app_name": row["app_name"] or row["focused_app_name"] or "",
+                "window_name": row["window_name"] or row["focused_window_name"] or "",
+                "ocr_text": row["ocr_text"] or "",
+                "ocr_confidence": row["ocr_confidence"] or 0.0,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.debug(f"Rewind span frame lookup failed: {e}")
+        return []
+
+
+def _ocr_snippets_for_rewind_span(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+    app_name: Optional[str],
+    terms: List[str],
+    limit: int = 6,
+) -> List[str]:
+    if sqlite_storage is None or not start_dt or not end_dt:
+        return []
+    snippets: List[str] = []
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            where = ["COALESCE(sf.timestamp, f.timestamp, pf.timestamp) >= ?",
+                     "COALESCE(sf.timestamp, f.timestamp, pf.timestamp) <= ?"]
+            params: List[Any] = [_sql_dt(start_dt), _sql_dt(end_dt)]
+            if app_name:
+                where.append("(sf.app_name = ? OR f.app_name = ? OR f.focused_app_name = ?)")
+                params.extend([app_name, app_name, app_name])
+            if terms:
+                term_clauses = []
+                for term in terms[:4]:
+                    term_clauses.append("o.text LIKE ? ESCAPE '\\'")
+                    params.append(_like_pattern(term))
+                where.append("(" + " OR ".join(term_clauses) + ")")
+            params.append(limit)
+            cursor.execute(
+                f"""
+                SELECT o.text
+                FROM ocr_text o
+                LEFT JOIN frames f ON o.frame_id = f.frame_id
+                LEFT JOIN sub_frames sf ON o.sub_frame_id = sf.sub_frame_id
+                LEFT JOIN frame_subframe_mapping fsm ON sf.sub_frame_id = fsm.sub_frame_id
+                LEFT JOIN frames pf ON fsm.frame_id = pf.frame_id
+                WHERE {" AND ".join(where)}
+                ORDER BY COALESCE(sf.timestamp, f.timestamp, pf.timestamp) ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            snippets = [_clip_one_line(row["text"], 500) for row in cursor.fetchall() if row["text"]]
+    except Exception as e:
+        logger.debug(f"Rewind span OCR snippet lookup failed: {e}")
+    return _dedupe_strings(snippets, limit=limit)
+
+
+def _clip_rewind_session_window(
+    session_start: Optional[datetime],
+    session_end: Optional[datetime],
+    hits: List[Dict[str, Any]],
+) -> Tuple[Optional[datetime], Optional[datetime], bool]:
+    if not session_start or not session_end:
+        return session_start, session_end, False
+
+    max_minutes = max(int(config.REWIND_SESSION_MAX_MINUTES or 45), 5)
+    max_duration = timedelta(minutes=max_minutes)
+    session_duration = session_end - session_start
+    if session_duration <= max_duration:
+        return session_start, session_end, False
+
+    hit_times = [_dt_from_any(hit.get("timestamp")) for hit in hits]
+    hit_times = [dt for dt in hit_times if dt is not None]
+    padding = timedelta(minutes=max(int(config.REWIND_SESSION_PADDING_MINUTES or 5), 1))
+
+    if hit_times:
+        clipped_start = max(session_start, min(hit_times) - padding)
+        clipped_end = min(session_end, max(hit_times) + padding)
+        if clipped_end <= clipped_start:
+            midpoint = hit_times[0]
+            clipped_start = max(session_start, midpoint - max_duration / 2)
+            clipped_end = min(session_end, clipped_start + max_duration)
+        elif clipped_end - clipped_start > max_duration:
+            midpoint = clipped_start + (clipped_end - clipped_start) / 2
+            clipped_start = max(session_start, midpoint - max_duration / 2)
+            clipped_end = min(session_end, clipped_start + max_duration)
+    else:
+        clipped_start = session_start
+        clipped_end = min(session_end, session_start + max_duration)
+
+    if clipped_end - clipped_start > max_duration:
+        clipped_end = clipped_start + max_duration
+    return clipped_start, clipped_end, True
+
+
+def _session_key(session: Dict[str, Any]) -> Tuple[Any, str, str, str]:
+    return (
+        session.get("id"),
+        session.get("app_name") or "",
+        session.get("start_time") or "",
+        session.get("end_time") or "",
+    )
+
+
+def _segment_from_activity_session(
+    session: Dict[str, Any],
+    hits: List[Dict[str, Any]],
+    query_terms: List[str],
+    retrieval_plan: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw_start_dt = _dt_from_any(session.get("start_time"))
+    raw_end_dt = _dt_from_any(session.get("end_time"))
+    hits = sorted(hits, key=lambda h: float(h.get("_rewind_score") or 0.0), reverse=True)
+    start_dt, end_dt, session_clipped = _clip_rewind_session_window(raw_start_dt, raw_end_dt, hits)
+    clipped_session = dict(session)
+    clipped_session["start_time"] = _ts_to_iso(start_dt)
+    clipped_session["end_time"] = _ts_to_iso(end_dt)
+    sub_frames = _sub_frames_for_activity_session(clipped_session, limit=config.REWIND_SESSION_FRAME_LIMIT)
+    span_frames = _frames_for_rewind_span(start_dt, end_dt, limit=config.REWIND_SESSION_FRAME_LIMIT)
+
+    representative = hits[0] if hits else None
+    if representative is None and sub_frames:
+        sf = sub_frames[0]
+        representative = {
+            "frame_id": sf.get("parent_frame_id") or sf.get("sub_frame_id"),
+            "sub_frame_id": sf.get("sub_frame_id"),
+            "timestamp": _dt_from_any(sf.get("timestamp")),
+            "image_path": sf.get("image_path"),
+            "app_name": sf.get("app_name"),
+            "window_name": sf.get("window_name"),
+            "metadata": {
+                "sub_frame_id": sf.get("sub_frame_id"),
+                "parent_frame_id": sf.get("parent_frame_id"),
+            },
+        }
+    if representative is None and span_frames:
+        representative = span_frames[0]
+
+    snippet_parts = []
+    for hit in hits[:4]:
+        if hit.get("ocr_text"):
+            snippet_parts.append(_clip_one_line(hit.get("ocr_text"), 500))
+    snippet_parts.extend(
+        _ocr_snippets_for_rewind_span(
+            start_dt,
+            end_dt,
+            session.get("app_name"),
+            query_terms,
+            limit=6,
+        )
+    )
+    if not snippet_parts:
+        for frame in span_frames[:3]:
+            if frame.get("ocr_text"):
+                snippet_parts.append(_clip_one_line(frame.get("ocr_text"), 500))
+
+    metadata = {
+        "retrieval_mode": "activity_session",
+        "session_id": session.get("id"),
+        "session_status": session.get("session_status"),
+        "cluster_id": session.get("cluster_id"),
+        "session_frame_count": session.get("frame_count"),
+        "raw_session_start_time": _ts_to_iso(raw_start_dt),
+        "raw_session_end_time": _ts_to_iso(raw_end_dt),
+        "session_clipped": session_clipped,
+        "session_max_minutes": config.REWIND_SESSION_MAX_MINUTES,
+        "hit_count": len(hits),
+        "retrieval_sources": _dedupe_strings(
+            [
+                src
+                for hit in hits
+                for src in (hit.get("metadata", {}).get("retrieval_sources") or [])
+            ],
+            limit=16,
+        ),
+        "retrieval_queries": _dedupe_strings(
+            [
+                q
+                for hit in hits
+                for q in (hit.get("metadata", {}).get("retrieval_queries") or [])
+            ],
+            limit=16,
+        ),
+        "retrieval_plan": {
+            "mode": retrieval_plan.get("mode"),
+            "hops": retrieval_plan.get("hops"),
+            "keyword_terms": retrieval_plan.get("keyword_terms"),
+            "controller_used": retrieval_plan.get("controller_used"),
+        },
+    }
+    rep_metadata = _safe_metadata_dict((representative or {}).get("metadata"))
+    if rep_metadata.get("sub_frame_id") and not any(sf.get("sub_frame_id") == rep_metadata["sub_frame_id"] for sf in sub_frames):
+        sub_frames.insert(
+            0,
+            {
+                "sub_frame_id": rep_metadata["sub_frame_id"],
+                "timestamp": _ts_to_iso((representative or {}).get("timestamp")),
+                "app_name": (representative or {}).get("app_name") or session.get("app_name") or "",
+                "window_name": (representative or {}).get("window_name") or "",
+                "image_path": (representative or {}).get("image_path"),
+            },
+        )
+
+    segment = {
+        "segment_id": f"activity_session_{session.get('id') or uuid.uuid4().hex[:10]}",
+        "frame_id": (representative or {}).get("frame_id"),
+        "timestamp": _ts_to_iso((representative or {}).get("timestamp") or start_dt),
+        "start_time": _ts_to_iso(start_dt),
+        "end_time": _ts_to_iso(end_dt),
+        "title": " · ".join(
+            [p for p in [session.get("label"), session.get("app_name"), (representative or {}).get("window_name")] if p]
+        ) or "Activity session",
+        "app_name": session.get("app_name") or (representative or {}).get("app_name"),
+        "window_name": (representative or {}).get("window_name"),
+        "activity_label": session.get("label"),
+        "image_path": (representative or {}).get("image_path"),
+        "ocr_text": _clip_text("\n".join(_dedupe_strings(snippet_parts, limit=8))),
+        "sub_frames": sub_frames[: config.REWIND_SESSION_FRAME_LIMIT],
+        "metadata": metadata,
+    }
+    return _enrich_rewind_segment(segment)
+
+
+def _segment_from_fallback_hits(
+    hits: List[Dict[str, Any]],
+    retrieval_plan: Dict[str, Any],
+    explicit_start: Optional[datetime],
+    explicit_end: Optional[datetime],
+) -> Dict[str, Any]:
+    hits = sorted(hits, key=lambda h: float(h.get("_rewind_score") or 0.0), reverse=True)
+    representative = hits[0]
+    hit_times = [_dt_from_any(hit.get("timestamp")) for hit in hits]
+    hit_times = [dt for dt in hit_times if dt is not None]
+    padding = timedelta(minutes=max(config.REWIND_SESSION_PADDING_MINUTES, 1))
+    start_dt = (min(hit_times) - padding) if hit_times else _dt_from_any(representative.get("timestamp"))
+    end_dt = (max(hit_times) + padding) if hit_times else _dt_from_any(representative.get("timestamp"))
+    if explicit_start and start_dt:
+        start_dt = max(start_dt, explicit_start)
+    if explicit_end and end_dt:
+        end_dt = min(end_dt, explicit_end)
+
+    sub_frames: List[Dict[str, Any]] = []
+    rep_metadata = _safe_metadata_dict(representative.get("metadata"))
+    if representative.get("sub_frame_id") or rep_metadata.get("sub_frame_id"):
+        sub_frames.append(
+            {
+                "sub_frame_id": representative.get("sub_frame_id") or rep_metadata.get("sub_frame_id"),
+                "timestamp": _ts_to_iso(representative.get("timestamp")),
+                "app_name": representative.get("app_name") or "",
+                "window_name": representative.get("window_name") or "",
+                "image_path": representative.get("image_path"),
+            }
+        )
+    elif representative.get("frame_id"):
+        sub_frames = _sub_frames_for_frame(representative.get("frame_id"))[: config.REWIND_SESSION_FRAME_LIMIT]
+
+    snippet_parts = [
+        _clip_one_line(hit.get("ocr_text"), 500)
+        for hit in hits
+        if hit.get("ocr_text")
+    ]
+    snippet_parts.extend(
+        _ocr_snippets_for_rewind_span(
+            start_dt,
+            end_dt,
+            representative.get("app_name"),
+            retrieval_plan.get("keyword_terms") or [],
+            limit=4,
+        )
+    )
+
+    segment = {
+        "segment_id": f"rewind_span_{uuid.uuid4().hex[:10]}",
+        "frame_id": representative.get("frame_id"),
+        "timestamp": _ts_to_iso(representative.get("timestamp")),
+        "start_time": _ts_to_iso(start_dt),
+        "end_time": _ts_to_iso(end_dt),
+        "title": " · ".join(
+            [p for p in [representative.get("app_name"), representative.get("window_name")] if p]
+        ) or "Timeline span",
+        "app_name": representative.get("app_name"),
+        "window_name": representative.get("window_name"),
+        "activity_label": representative.get("activity_label"),
+        "image_path": representative.get("image_path"),
+        "ocr_text": _clip_text("\n".join(_dedupe_strings(snippet_parts, limit=6))),
+        "sub_frames": sub_frames,
+        "metadata": {
+            "retrieval_mode": "temporal_span",
+            "hit_count": len(hits),
+            "retrieval_sources": _dedupe_strings(
+                [
+                    src
+                    for hit in hits
+                    for src in (hit.get("metadata", {}).get("retrieval_sources") or [])
+                ],
+                limit=16,
+            ),
+            "retrieval_queries": _dedupe_strings(
+                [
+                    q
+                    for hit in hits
+                    for q in (hit.get("metadata", {}).get("retrieval_queries") or [])
+                ],
+                limit=16,
+            ),
+            "retrieval_plan": {
+                "mode": retrieval_plan.get("mode"),
+                "hops": retrieval_plan.get("hops"),
+                "keyword_terms": retrieval_plan.get("keyword_terms"),
+                "controller_used": retrieval_plan.get("controller_used"),
+            },
+        },
+    }
+    return _enrich_rewind_segment(segment)
+
+
+def _group_rewind_hits_into_segments(
+    hits: List[Dict[str, Any]],
+    activity_sessions: List[Dict[str, Any]],
+    retrieval_plan: Dict[str, Any],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    grouped_sessions: Dict[Tuple[Any, str, str, str], Dict[str, Any]] = {}
+    fallback_groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+    for session in activity_sessions:
+        grouped_sessions.setdefault(_session_key(session), {"session": session, "hits": []})
+
+    for hit in sorted(hits, key=lambda h: float(h.get("_rewind_score") or 0.0), reverse=True):
+        session = _activity_session_for_hit(hit)
+        if session:
+            grouped_sessions.setdefault(_session_key(session), {"session": session, "hits": []})["hits"].append(hit)
+            continue
+        ts = _dt_from_any(hit.get("timestamp"))
+        bucket_seconds = max(config.REWIND_SESSION_PADDING_MINUTES * 120, 600)
+        bucket = int(ts.timestamp() // bucket_seconds) if ts else 0
+        fallback_groups.setdefault((hit.get("app_name") or "", bucket), []).append(hit)
+
+    segments: List[Dict[str, Any]] = []
+    for group in grouped_sessions.values():
+        segments.append(
+            _segment_from_activity_session(
+                group["session"],
+                group["hits"],
+                retrieval_plan.get("keyword_terms") or [],
+                retrieval_plan,
+            )
+        )
+
+    for group_hits in fallback_groups.values():
+        segments.append(
+            _segment_from_fallback_hits(
+                group_hits,
+                retrieval_plan,
+                retrieval_plan.get("start_time"),
+                retrieval_plan.get("end_time"),
+            )
+        )
+
+    def score(segment: Dict[str, Any]) -> Tuple[float, str]:
+        metadata = segment.get("metadata") or {}
+        hit_count = float(metadata.get("hit_count") or 0)
+        session_bonus = 10.0 if metadata.get("retrieval_mode") == "activity_session" else 0.0
+        return session_bonus + hit_count, segment.get("start_time") or ""
+
+    segments.sort(key=score, reverse=True)
+    return segments[:limit]
+
+
+def _rag_hit_debug_info(
+    hit: Dict[str, Any],
+    mapped_session: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    metadata = _safe_metadata_dict(hit.get("metadata"))
+    return {
+        "frame_id": hit.get("frame_id"),
+        "sub_frame_id": hit.get("sub_frame_id") or metadata.get("sub_frame_id"),
+        "timestamp": _ts_to_iso(hit.get("timestamp")),
+        "app": hit.get("app_name"),
+        "window": hit.get("window_name"),
+        "rag_score": round(float(hit.get("_local_rag_score") or 0.0), 4),
+        "sources": metadata.get("retrieval_sources") or [],
+        "queries": metadata.get("retrieval_queries") or [],
+        "rank": metadata.get("retrieval_rank"),
+        "details": (metadata.get("rag_details") or [])[:4],
+        "mapped_session_id": (mapped_session or {}).get("id"),
+        "mapped_label": (mapped_session or {}).get("label"),
+        "mapped_app": (mapped_session or {}).get("app_name"),
+    }
+
+
+def _aggregate_rewind_rag_score(hits: List[Dict[str, Any]]) -> float:
+    if not hits:
+        return 0.0
+    scores = sorted(
+        [float(hit.get("_local_rag_score") or 0.0) for hit in hits],
+        reverse=True,
+    )
+    if not scores:
+        return 0.0
+    return min(1.0, scores[0] + sum(scores[1:8]) * 0.15)
+
+
+def _run_rewind_local_rag(plan: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
+    start_dt = plan.get("start_time")
+    end_dt = plan.get("end_time")
+    candidate_limit = min(max(limit * 6, 36), 120)
+    hits_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    if encoder is not None and vector_storage is not None:
+        for q_idx, dense_query in enumerate(plan.get("dense_queries") or []):
+            try:
+                emb = encoder.encode_text(dense_query)
+                for rank, frame in enumerate(
+                    vector_storage.search(
+                        emb,
+                        top_k=candidate_limit,
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        related_apps=plan.get("related_apps"),
+                        unrelated_apps=plan.get("unrelated_apps"),
+                        window_filters=plan.get("window_filters"),
+                    ),
+                    start=1 + q_idx * candidate_limit,
+                ):
+                    _add_rewind_hit(hits_by_key, frame, "dense_image", dense_query, rank)
+                for rank, frame in enumerate(
+                    vector_storage.search_ocr(
+                        emb,
+                        top_k=max(candidate_limit // 2, limit),
+                        start_time=start_dt,
+                        end_time=end_dt,
+                        related_apps=plan.get("related_apps"),
+                        unrelated_apps=plan.get("unrelated_apps"),
+                        window_filters=plan.get("window_filters"),
+                    ),
+                    start=1 + q_idx * candidate_limit,
+                ):
+                    _add_rewind_hit(hits_by_key, frame, "dense_ocr", dense_query, rank)
+            except Exception as e:
+                logger.debug(f"Rewind dense hop failed for '{dense_query}': {e}")
+
+    if sqlite_storage is not None:
+        for q_idx, sparse_query in enumerate(plan.get("sparse_queries") or []):
+            try:
+                for rank, frame in enumerate(
+                    sqlite_storage.search_by_text(sparse_query, limit=max(candidate_limit // 2, limit)),
+                    start=1 + q_idx * candidate_limit,
+                ):
+                    ts = _dt_from_any(frame.get("timestamp"))
+                    if start_dt and ts and ts < start_dt:
+                        continue
+                    if end_dt and ts and ts > end_dt:
+                        continue
+                    sparse_app = frame.get("app_name") or frame.get("focused_app_name")
+                    sparse_window = frame.get("window_name") or frame.get("focused_window_name")
+                    if (sparse_app or sparse_window) and not _app_window_allowed(
+                        sparse_app,
+                        sparse_window,
+                        plan.get("related_apps"),
+                        plan.get("unrelated_apps"),
+                        plan.get("window_filters"),
+                    ):
+                        continue
+                    _add_rewind_hit(hits_by_key, frame, "sparse_fts", sparse_query, rank)
+            except Exception as e:
+                logger.debug(f"Rewind sparse FTS hop failed for '{sparse_query}': {e}")
+
+        for term_idx, term in enumerate(plan.get("keyword_terms") or []):
+            for rank, frame in enumerate(
+                _rewind_keyword_like_search(
+                    term,
+                    limit=max(candidate_limit // 2, limit),
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                    related_apps=plan.get("related_apps"),
+                    unrelated_apps=plan.get("unrelated_apps"),
+                    window_filters=plan.get("window_filters"),
+                ),
+                start=1 + term_idx * candidate_limit,
+            ):
+                _add_rewind_hit(hits_by_key, frame, "keyword_like", term, rank)
+            for rank, frame in enumerate(
+                _rewind_window_search(
+                    term,
+                    limit=max(candidate_limit // 3, limit),
+                    start_dt=start_dt,
+                    end_dt=end_dt,
+                ),
+                start=1 + term_idx * candidate_limit,
+            ):
+                if not _app_window_allowed(
+                    frame.get("app_name"),
+                    frame.get("window_name"),
+                    plan.get("related_apps"),
+                    plan.get("unrelated_apps"),
+                    plan.get("window_filters"),
+                ):
+                    continue
+                _add_rewind_hit(hits_by_key, frame, "window_title", term, rank)
+
+    hits = sorted(
+        hits_by_key.values(),
+        key=lambda hit: (
+            float(hit.get("_local_rag_score") or 0.0),
+            float(hit.get("_rewind_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    logger.info(
+        "Rewind agentic top local RAG hits: %s",
+        [_rag_hit_debug_info(hit) for hit in hits[:15]],
+    )
+    return hits
+
+
+def _attach_rewind_fusion_metadata(
+    segment: Dict[str, Any],
+    *,
+    final_score: float,
+    llm_score: float,
+    rag_score: float,
+    intersection: bool,
+    label_result: Optional[Dict[str, Any]],
+    hits: List[Dict[str, Any]],
+    mapped_session: Optional[Dict[str, Any]],
+    fusion_mode: str,
+) -> Dict[str, Any]:
+    metadata = segment.setdefault("metadata", {})
+    rag_top_hits = [_rag_hit_debug_info(hit, mapped_session) for hit in hits[:8]]
+    metadata.update(
+        {
+            "fusion_mode": fusion_mode,
+            "fusion_score": round(final_score, 4),
+            "llm_label_score": round(llm_score, 4),
+            "llm_label_reason": (label_result or {}).get("llm_label_reason"),
+            "llm_label_score_source": (label_result or {}).get("llm_label_score_source"),
+            "local_rag_score": round(rag_score, 4),
+            "label_rag_intersection": intersection,
+            "rag_hit_count": len(hits),
+            "rag_top_hits": rag_top_hits,
+            "rag_reverse_mapped_session": {
+                "id": (mapped_session or {}).get("id"),
+                "app_name": (mapped_session or {}).get("app_name"),
+                "label": (mapped_session or {}).get("label"),
+                "start_time": (mapped_session or {}).get("start_time"),
+                "end_time": (mapped_session or {}).get("end_time"),
+            }
+            if mapped_session
+            else None,
+        }
+    )
+    return segment
+
+
+def _fuse_rewind_label_and_rag(
+    query: str,
+    plan: Dict[str, Any],
+    label_results: List[Dict[str, Any]],
+    rag_hits: List[Dict[str, Any]],
+    limit: int,
+) -> List[Dict[str, Any]]:
+    grouped_sessions: Dict[Tuple[Any, str, str, str], Dict[str, Any]] = {}
+    fallback_groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+
+    for label_result in label_results:
+        session = label_result.get("session") or {}
+        if not session:
+            continue
+        score = float(label_result.get("llm_label_score") or 0.0)
+        if score < 0.12:
+            continue
+        grouped_sessions.setdefault(
+            _session_key(session),
+            {"session": session, "label_result": label_result, "hits": []},
+        )["label_result"] = label_result
+
+    for hit in rag_hits:
+        session = _activity_session_for_hit(hit)
+        if session:
+            key = _session_key(session)
+            group = grouped_sessions.setdefault(
+                key,
+                {"session": session, "label_result": None, "hits": []},
+            )
+            group["hits"].append(hit)
+            continue
+        ts = _dt_from_any(hit.get("timestamp"))
+        bucket_seconds = max(config.REWIND_SESSION_PADDING_MINUTES * 120, 600)
+        bucket = int(ts.timestamp() // bucket_seconds) if ts else 0
+        fallback_groups.setdefault((hit.get("app_name") or "", bucket), []).append(hit)
+
+    intersections = []
+    scored_segments: List[Tuple[float, Dict[str, Any]]] = []
+    for group in grouped_sessions.values():
+        session = group["session"]
+        hits = sorted(
+            group["hits"],
+            key=lambda hit: float(hit.get("_local_rag_score") or 0.0),
+            reverse=True,
+        )
+        label_result = group.get("label_result")
+        llm_score = float((label_result or {}).get("llm_label_score") or 0.0)
+        rag_score = _aggregate_rewind_rag_score(hits)
+        intersection = bool(label_result and hits)
+        final_score = llm_score * 0.45 + rag_score * 0.45 + (0.10 if intersection else 0.0)
+        if not hits and llm_score < 0.12:
+            continue
+        segment = _segment_from_activity_session(
+            session,
+            hits,
+            plan.get("keyword_terms") or [],
+            plan,
+        )
+        _attach_rewind_fusion_metadata(
+            segment,
+            final_score=final_score,
+            llm_score=llm_score,
+            rag_score=rag_score,
+            intersection=intersection,
+            label_result=label_result,
+            hits=hits,
+            mapped_session=session,
+            fusion_mode="label_rag_fusion" if intersection else ("label_only_session" if label_result else "rag_session_reverse_map"),
+        )
+        if intersection:
+            intersections.append(
+                {
+                    "session": session.get("id"),
+                    "label": session.get("label"),
+                    "app": session.get("app_name"),
+                    "llm_score": round(llm_score, 3),
+                    "rag_score": round(rag_score, 3),
+                    "top_rag": [_rag_hit_debug_info(hit, session) for hit in hits[:3]],
+                }
+            )
+        scored_segments.append((final_score, segment))
+
+    for group_hits in fallback_groups.values():
+        hits = sorted(
+            group_hits,
+            key=lambda hit: float(hit.get("_local_rag_score") or 0.0),
+            reverse=True,
+        )
+        rag_score = _aggregate_rewind_rag_score(hits)
+        final_score = rag_score * 0.45
+        segment = _segment_from_fallback_hits(
+            hits,
+            plan,
+            plan.get("start_time"),
+            plan.get("end_time"),
+        )
+        _attach_rewind_fusion_metadata(
+            segment,
+            final_score=final_score,
+            llm_score=0.0,
+            rag_score=rag_score,
+            intersection=False,
+            label_result=None,
+            hits=hits,
+            mapped_session=None,
+            fusion_mode="rag_only_temporal_span",
+        )
+        scored_segments.append((final_score, segment))
+
+    logger.info("Rewind label/RAG intersections: %s", intersections[:20])
+    scored_segments.sort(
+        key=lambda item: (
+            item[0],
+            item[1].get("start_time") or item[1].get("timestamp") or "",
+        ),
+        reverse=True,
+    )
+    segments = [segment for _, segment in scored_segments[:limit]]
+    for idx, segment in enumerate(segments, start=1):
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        logger.info(
+            "Rewind fused timeline[%02d]: segment=%s mode=%s label=%s app=%s window=%s "
+            "time=%s->%s final=%.3f llm=%.3f rag=%.3f intersect=%s reason=%s rag_top=%s",
+            idx,
+            segment.get("segment_id"),
+            metadata.get("fusion_mode"),
+            segment.get("activity_label"),
+            segment.get("app_name"),
+            segment.get("window_name"),
+            segment.get("start_time"),
+            segment.get("end_time"),
+            float(metadata.get("fusion_score") or 0.0),
+            float(metadata.get("llm_label_score") or 0.0),
+            float(metadata.get("local_rag_score") or 0.0),
+            metadata.get("label_rag_intersection"),
+            metadata.get("llm_label_reason"),
+            metadata.get("rag_top_hits") or [],
+        )
+    return segments
+
+
+def _lookup_frame_record(frame_id: str) -> Optional[Dict[str, Any]]:
+    if sqlite_storage is None or not frame_id:
+        return None
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    f.frame_id,
+                    f.timestamp,
+                    f.image_path,
+                    f.device_name,
+                    f.metadata,
+                    f.app_name,
+                    f.window_name,
+                    f.focused_app_name,
+                    f.focused_window_name,
+                    o.text as ocr_text,
+                    o.confidence as ocr_confidence
+                FROM frames f
+                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
+                WHERE f.frame_id = ?
+                LIMIT 1
+                """,
+                (frame_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "frame_id": row["frame_id"],
+            "timestamp": datetime.fromisoformat(row["timestamp"]),
+            "image_path": row["image_path"],
+            "device_name": row["device_name"],
+            "metadata": json.loads(row["metadata"]) if row["metadata"] else {},
+            "app_name": row["app_name"] or row["focused_app_name"] or "",
+            "window_name": row["window_name"] or row["focused_window_name"] or "",
+            "ocr_text": row["ocr_text"] or "",
+            "ocr_confidence": row["ocr_confidence"] or 0.0,
+        }
+    except Exception as e:
+        logger.debug(f"Task Memory frame lookup failed for {frame_id}: {e}")
+        return None
+
+
+def _sub_frames_for_frame(frame_id: Optional[str]) -> List[Dict[str, Any]]:
+    if sqlite_storage is None or not frame_id:
+        return []
+    sub_frames = []
+    try:
+        for sf in sqlite_storage.get_sub_frames_for_frame(frame_id):
+            sub_frames.append(
+                {
+                    "sub_frame_id": sf.get("sub_frame_id", ""),
+                    "timestamp": _ts_to_iso(sf.get("timestamp")),
+                    "app_name": sf.get("app_name", "") or "",
+                    "window_name": sf.get("window_name", "") or "",
+                    "image_path": _resolve_sub_frame_image_path(sf),
+                }
+            )
+    except Exception as e:
+        logger.debug(f"Task Memory sub-frame lookup failed for {frame_id}: {e}")
+    return sub_frames
+
+
+def _normalize_rewind_segment(segment: Any) -> Dict[str, Any]:
+    if isinstance(segment, BaseModel):
+        data = segment.dict()
+    elif isinstance(segment, dict):
+        data = dict(segment)
+    else:
+        data = {}
+
+    sub_frames = []
+    for sf in data.get("sub_frames") or []:
+        if isinstance(sf, BaseModel):
+            sf_data = sf.dict()
+        elif isinstance(sf, dict):
+            sf_data = dict(sf)
+        else:
+            continue
+        sub_frames.append(
+            {
+                "sub_frame_id": str(sf_data.get("sub_frame_id") or ""),
+                "timestamp": _ts_to_iso(sf_data.get("timestamp")),
+                "app_name": str(sf_data.get("app_name") or ""),
+                "window_name": str(sf_data.get("window_name") or ""),
+                "image_path": sf_data.get("image_path"),
+            }
+        )
+
+    timestamp = _ts_to_iso(data.get("timestamp") or data.get("start_time") or data.get("end_time"))
+    start_time = _ts_to_iso(data.get("start_time") or timestamp)
+    end_time = _ts_to_iso(data.get("end_time") or timestamp)
+    frame_id = data.get("frame_id")
+    segment_id = data.get("segment_id") or frame_id or f"segment_{uuid.uuid4().hex[:10]}"
+
+    metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    normalized = {
+        "segment_id": str(segment_id),
+        "frame_id": str(frame_id) if frame_id else None,
+        "timestamp": timestamp or None,
+        "start_time": start_time or None,
+        "end_time": end_time or None,
+        "title": data.get("title"),
+        "app_name": data.get("app_name") or None,
+        "window_name": data.get("window_name") or None,
+        "activity_label": data.get("activity_label") or None,
+        "image_path": data.get("image_path"),
+        "ocr_text": _clip_text(data.get("ocr_text")),
+        "sub_frames": sub_frames,
+        "metadata": metadata,
+    }
+    return normalized
+
+
+def _enrich_rewind_segment(segment: Any) -> Dict[str, Any]:
+    normalized = _normalize_rewind_segment(segment)
+    frame_record = _lookup_frame_record(normalized.get("frame_id") or "")
+    if frame_record:
+        normalized["timestamp"] = normalized.get("timestamp") or _ts_to_iso(frame_record.get("timestamp"))
+        normalized["start_time"] = normalized.get("start_time") or normalized["timestamp"]
+        normalized["end_time"] = normalized.get("end_time") or normalized["timestamp"]
+        normalized["image_path"] = normalized.get("image_path") or frame_record.get("image_path")
+        normalized["app_name"] = normalized.get("app_name") or frame_record.get("app_name") or None
+        normalized["window_name"] = normalized.get("window_name") or frame_record.get("window_name") or None
+        normalized["ocr_text"] = normalized.get("ocr_text") or _clip_text(frame_record.get("ocr_text"))
+        normalized["metadata"] = normalized.get("metadata") or frame_record.get("metadata") or {}
+
+    if not normalized.get("sub_frames"):
+        normalized["sub_frames"] = _sub_frames_for_frame(normalized.get("frame_id"))
+
+    label_ids = [normalized.get("frame_id") or ""]
+    label_ids.extend(sf.get("sub_frame_id", "") for sf in normalized.get("sub_frames") or [])
+    normalized["activity_label"] = normalized.get("activity_label") or _activity_label_for_ids(label_ids)
+
+    if not normalized.get("title"):
+        title_parts = [
+            normalized.get("activity_label"),
+            normalized.get("app_name"),
+            normalized.get("window_name"),
+        ]
+        normalized["title"] = " · ".join([str(p) for p in title_parts if p]) or (
+            normalized.get("timestamp") or "Timeline evidence"
+        )
+
+    return normalized
+
+
+def _frame_to_rewind_segment(frame: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = frame.get("metadata") if isinstance(frame.get("metadata"), dict) else {}
+    sub_frame_id = frame.get("sub_frame_id") or metadata.get("sub_frame_id")
+    sub_frames = []
+    if sub_frame_id:
+        sub_frames.append(
+            {
+                "sub_frame_id": sub_frame_id,
+                "timestamp": _ts_to_iso(frame.get("timestamp")),
+                "app_name": frame.get("app_name") or "",
+                "window_name": frame.get("window_name") or "",
+                "image_path": frame.get("image_path"),
+            }
+        )
+    segment = {
+        "segment_id": frame.get("frame_id") or f"segment_{uuid.uuid4().hex[:10]}",
+        "frame_id": frame.get("frame_id"),
+        "timestamp": _ts_to_iso(frame.get("timestamp")),
+        "start_time": _ts_to_iso(frame.get("timestamp")),
+        "end_time": _ts_to_iso(frame.get("timestamp")),
+        "app_name": frame.get("app_name") or frame.get("focused_app_name"),
+        "window_name": frame.get("window_name") or frame.get("focused_window_name"),
+        "image_path": frame.get("image_path"),
+        "ocr_text": _clip_text(frame.get("ocr_text")),
+        "sub_frames": sub_frames,
+        "metadata": metadata,
+    }
+    return _enrich_rewind_segment(segment)
+
+
+def _segment_sort_key(segment: Dict[str, Any]) -> str:
+    return str(segment.get("start_time") or segment.get("timestamp") or "")
+
+
+def _merge_rewind_evidence_refs(
+    segments: List[Dict[str, Any]],
+    explicit_refs: Optional[List[Any]] = None,
+) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add_ref(ref: Dict[str, Any]) -> None:
+        key = (
+            ref.get("frame_id") or "",
+            ref.get("sub_frame_id") or "",
+            ref.get("timestamp") or "",
+            ref.get("image_path") or "",
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append(
+            {
+                "frame_id": ref.get("frame_id"),
+                "sub_frame_id": ref.get("sub_frame_id"),
+                "timestamp": ref.get("timestamp"),
+                "image_path": ref.get("image_path"),
+                "app_name": ref.get("app_name"),
+                "window_name": ref.get("window_name"),
+                "activity_label": ref.get("activity_label"),
+                "ocr_snippet": _clip_one_line(ref.get("ocr_snippet") or ref.get("ocr_text"), 600),
+            }
+        )
+
+    for segment in segments:
+        add_ref(
+            {
+                "frame_id": segment.get("frame_id"),
+                "timestamp": segment.get("timestamp") or segment.get("start_time"),
+                "image_path": segment.get("image_path"),
+                "app_name": segment.get("app_name"),
+                "window_name": segment.get("window_name"),
+                "activity_label": segment.get("activity_label"),
+                "ocr_text": segment.get("ocr_text"),
+            }
+        )
+        for sf in segment.get("sub_frames") or []:
+            add_ref(
+                {
+                    "frame_id": segment.get("frame_id"),
+                    "sub_frame_id": sf.get("sub_frame_id"),
+                    "timestamp": sf.get("timestamp") or segment.get("timestamp"),
+                    "image_path": sf.get("image_path"),
+                    "app_name": sf.get("app_name"),
+                    "window_name": sf.get("window_name"),
+                    "activity_label": segment.get("activity_label"),
+                    "ocr_text": segment.get("ocr_text"),
+                }
+            )
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        for frame_ref in metadata.get("timeline_frame_refs") or []:
+            if not isinstance(frame_ref, dict):
+                continue
+            add_ref(
+                {
+                    "frame_id": frame_ref.get("frame_id") or segment.get("frame_id"),
+                    "timestamp": frame_ref.get("timestamp"),
+                    "image_path": frame_ref.get("image_path"),
+                    "app_name": segment.get("app_name"),
+                    "window_name": segment.get("window_name"),
+                    "activity_label": segment.get("activity_label"),
+                    "ocr_text": segment.get("ocr_text"),
+                }
+            )
+
+    for ref in explicit_refs or []:
+        ref_data = ref.dict() if isinstance(ref, BaseModel) else dict(ref)
+        add_ref(ref_data)
+
+    return refs
+
+
+def _format_segment_time(segment: Dict[str, Any]) -> str:
+    start = segment.get("start_time") or segment.get("timestamp") or ""
+    end = segment.get("end_time") or segment.get("timestamp") or ""
+    if not end or end == start:
+        return start
+    return f"{start} -> {end}"
+
+
+def _format_timeline_evidence(segments: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for idx, segment in enumerate(sorted(segments, key=_segment_sort_key), start=1):
+        lines.append(f"{idx}. Time: {_format_segment_time(segment)}")
+        if segment.get("title"):
+            lines.append(f"   Title: {segment['title']}")
+        if segment.get("activity_label"):
+            lines.append(f"   Activity: {segment['activity_label']}")
+        app_window = " / ".join(
+            [p for p in [segment.get("app_name"), segment.get("window_name")] if p]
+        )
+        if app_window:
+            lines.append(f"   Window: {app_window}")
+        if segment.get("frame_id"):
+            lines.append(f"   Frame: {segment['frame_id']}")
+        if segment.get("image_path"):
+            lines.append(f"   Representative frame ref: {segment['image_path']}")
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        frame_refs = [ref for ref in metadata.get("timeline_frame_refs") or [] if isinstance(ref, dict)]
+        if frame_refs:
+            ref_times = [str(ref.get("timestamp") or ref.get("frame_id") or "") for ref in frame_refs[:6]]
+            more = f"; +{len(frame_refs) - 6} more" if len(frame_refs) > 6 else ""
+            lines.append(f"   Timeline frames: {'; '.join(ref_times)}{more}")
+        ocr = _clip_one_line(segment.get("ocr_text"), 700)
+        if ocr:
+            lines.append(f"   OCR snippet: {ocr}")
+        sub_frames = segment.get("sub_frames") or []
+        if sub_frames:
+            sub_parts = []
+            for sf in sub_frames[:6]:
+                label = " / ".join([p for p in [sf.get("app_name"), sf.get("window_name")] if p])
+                sub_parts.append(f"{sf.get('sub_frame_id')} ({label or 'window'})")
+            more = f"; +{len(sub_frames) - 6} more" if len(sub_frames) > 6 else ""
+            lines.append(f"   Window evidence: {'; '.join(sub_parts)}{more}")
+    return "\n".join(lines) if lines else "(No timeline evidence selected.)"
+
+
+def _format_evidence_refs(refs: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for idx, ref in enumerate(refs[:40], start=1):
+        target = ref.get("sub_frame_id") or ref.get("frame_id") or ref.get("image_path") or "evidence"
+        lines.append(f"{idx}. Ref: {target}")
+        if ref.get("timestamp"):
+            lines.append(f"   Time: {ref['timestamp']}")
+        app_window = " / ".join([p for p in [ref.get("app_name"), ref.get("window_name")] if p])
+        if app_window:
+            lines.append(f"   Window: {app_window}")
+        if ref.get("activity_label"):
+            lines.append(f"   Activity: {ref['activity_label']}")
+        if ref.get("image_path"):
+            lines.append(f"   Frame ref: {ref['image_path']}")
+        if ref.get("ocr_snippet"):
+            lines.append(f"   OCR snippet: {_clip_one_line(ref['ocr_snippet'], 500)}")
+    return "\n".join(lines) if lines else "(No evidence refs.)"
+
+
+def _fallback_task_memory_markdown(
+    title: str,
+    source_query: str,
+    segments: List[Dict[str, Any]],
+) -> str:
+    lines = [
+        f"# {title}",
+        "",
+        "## Source Query",
+        source_query or "(empty)",
+        "",
+        "## Timeline Evidence",
+    ]
+    for segment in sorted(segments, key=_segment_sort_key):
+        ocr = _clip_one_line(segment.get("ocr_text"), 260)
+        label = segment.get("activity_label") or segment.get("title") or "activity"
+        app_window = " / ".join(
+            [p for p in [segment.get("app_name"), segment.get("window_name")] if p]
+        )
+        suffix = f" - {app_window}" if app_window else ""
+        lines.append(f"- `{_format_segment_time(segment)}` {label}{suffix}")
+        if ocr:
+            lines.append(f"  OCR: {ocr}")
+    lines.extend(
+        [
+            "",
+            "## Working Context",
+            "The selected evidence above is the persisted context for continuing this task.",
+            "",
+            "## Open Questions",
+            "- What changed between the selected evidence segments?",
+            "- Which file, window, or browser tab should be inspected next?",
+            "- What is the next concrete action?",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _derive_task_memory_title(source_query: str, segments: List[Dict[str, Any]]) -> str:
+    query = _clip_one_line(source_query, 80)
+    if query:
+        return query
+    for segment in segments:
+        if segment.get("title"):
+            return _clip_one_line(segment["title"], 80)
+    return "Untitled Task Memory"
+
+
+def _load_rewind_images(segments: List[Dict[str, Any]], limit: int = 8) -> tuple[List[Any], List[Any]]:
+    if limit <= 0:
+        return [], []
+    images: List[Any] = []
+    timestamps: List[Any] = []
+    seen_paths = set()
+    for segment in sorted(segments, key=_segment_sort_key):
+        candidates = [(segment.get("image_path"), segment.get("timestamp") or segment.get("start_time"))]
+        metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
+        for ref in metadata.get("timeline_frame_refs") or []:
+            if not isinstance(ref, dict):
+                continue
+            candidates.append((ref.get("image_path"), ref.get("timestamp")))
+        for sf in segment.get("sub_frames") or []:
+            candidates.append((sf.get("image_path"), sf.get("timestamp") or segment.get("timestamp")))
+        for path, ts in candidates:
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            image = _load_image_from_path(path)
+            if image is None:
+                continue
+            images.append(image)
+            timestamps.append(_parse_optional_dt(ts) or ts)
+            if len(images) >= limit:
+                return images, timestamps
+    return images, timestamps
+
+
+def _call_rewind_ai(
+    prompt: str,
+    system_prompt: str,
+    segments: List[Dict[str, Any]],
+    image_limit: int = 8,
+    timeout_seconds: Optional[float] = None,
+) -> str:
+    ai = vlm or ApiVLM()
+    images, timestamps = _load_rewind_images(segments, limit=image_limit)
+    if images:
+        return ai._call_vlm(
+            prompt,
+            images,
+            num_images=len(images),
+            image_timestamps=timestamps,
+            system_prompt=system_prompt,
+            timeout_seconds=timeout_seconds,
+        )
+    return ai._call_vlm_text_only(
+        prompt,
+        system_prompt=system_prompt,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _search_rewind_segments_legacy(
+    query: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    top_k: int = 12,
+) -> List[Dict[str, Any]]:
+    limit = min(max(int(top_k or 12), 1), 30)
+    start_dt = _parse_optional_dt(start_time)
+    end_dt = _parse_optional_dt(end_time)
+    results: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add_frames(frames: List[Dict[str, Any]]) -> None:
+        for frame in frames:
+            fid = frame.get("frame_id")
+            if not fid or fid in seen:
+                continue
+            ts = frame.get("timestamp")
+            ts_dt = ts if isinstance(ts, datetime) else _parse_optional_dt(_ts_to_iso(ts))
+            if start_dt and ts_dt and ts_dt < start_dt:
+                continue
+            if end_dt and ts_dt and ts_dt > end_dt:
+                continue
+            seen.add(fid)
+            results.append(frame)
+            if len(results) >= limit:
+                return
+
+    if query.strip() and encoder is not None and vector_storage is not None:
+        try:
+            emb = encoder.encode_text(query.strip())
+            add_frames(
+                vector_storage.search(
+                    emb,
+                    top_k=limit,
+                    start_time=start_dt,
+                    end_time=end_dt,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"Rewind dense evidence search failed: {e}")
+
+    if query.strip() and sqlite_storage is not None and len(results) < limit:
+        try:
+            add_frames(sqlite_storage.search_by_text(query.strip(), limit=limit))
+        except Exception as e:
+            logger.debug(f"Rewind sparse evidence search failed: {e}")
+
+    if sqlite_storage is not None and len(results) < limit and (start_dt or end_dt):
+        try:
+            start = start_dt or (end_dt - timedelta(hours=1))
+            end = end_dt or (start_dt + timedelta(hours=1))
+            add_frames(
+                sqlite_storage.get_frames_in_timerange(
+                    start_time=start,
+                    end_time=end,
+                    limit=limit,
+                    only_full_screen=True,
+                )
+            )
+        except Exception as e:
+            logger.debug(f"Rewind time-range evidence search failed: {e}")
+
+    if sqlite_storage is not None and len(results) < limit:
+        try:
+            add_frames(sqlite_storage.get_recent_frames(limit=limit))
+        except Exception as e:
+            logger.debug(f"Rewind recent evidence fallback failed: {e}")
+
+    return [_frame_to_rewind_segment(frame) for frame in results[:limit]]
+
+
+def _search_rewind_segments(
+    query: str,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    top_k: int = 12,
+) -> List[Dict[str, Any]]:
+    limit = min(max(int(top_k or 12), 1), 30)
+    if not config.REWIND_ENABLE_AGENTIC_SEARCH:
+        return _search_rewind_segments_legacy(query, start_time, end_time, top_k)
+
+    explicit_start = _parse_optional_dt(start_time)
+    explicit_end = _parse_optional_dt(end_time)
+    plan = _build_rewind_retrieval_plan(query, explicit_start, explicit_end)
+    start_dt = plan.get("start_time")
+    end_dt = plan.get("end_time")
+    candidate_limit = min(max(limit * 6, 36), 120)
+
+    logger.info(
+        "Rewind agentic search plan: "
+        f"dense={plan.get('dense_queries')} sparse={plan.get('sparse_queries')} "
+        f"terms={plan.get('keyword_terms')} time={start_dt}->{end_dt} "
+        f"include_apps={plan.get('related_apps')} exclude_apps={plan.get('unrelated_apps')} "
+        f"window_filters={plan.get('window_filters')}"
+    )
+
+    candidate_sessions = _candidate_activity_sessions_for_plan(plan, limit=candidate_limit)
+    label_results: List[Dict[str, Any]] = []
+    rag_hits: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        label_future = (
+            executor.submit(
+                _score_rewind_label_candidates,
+                query,
+                plan,
+                candidate_sessions,
+                candidate_limit,
+            )
+            if candidate_sessions
+            else None
+        )
+        rag_future = executor.submit(_run_rewind_local_rag, plan, limit)
+        try:
+            rag_hits = rag_future.result()
+        except Exception as e:
+            logger.warning(f"Rewind local RAG loop failed: {e}")
+        if label_future is not None:
+            try:
+                label_results = label_future.result()
+            except Exception as e:
+                logger.warning(f"Rewind label scoring loop failed: {e}")
+
+    if rag_hits or label_results:
+        segments = _fuse_rewind_label_and_rag(
+            query,
+            plan,
+            label_results,
+            rag_hits,
+            limit=limit,
+        )
+        if segments:
+            return segments
+
+    if sqlite_storage is not None and (start_dt or end_dt):
+        try:
+            start = start_dt or (end_dt - timedelta(hours=1))
+            end = end_dt or (start_dt + timedelta(hours=1))
+            fallback_frames = _frames_for_rewind_span(start, end, limit=limit)
+            fallback_hits: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for rank, frame in enumerate(fallback_frames, start=1):
+                _add_rewind_hit(fallback_hits, frame, "time_range_fallback", query, rank)
+            segments = _group_rewind_hits_into_segments(
+                list(fallback_hits.values()),
+                [],
+                plan,
+                limit=limit,
+            )
+            if segments:
+                return segments
+        except Exception as e:
+            logger.debug(f"Rewind agentic time fallback failed: {e}")
+
+    return _search_rewind_segments_legacy(query, start_time, end_time, top_k)
+
+
+def _generate_task_memory_markdown(
+    title: str,
+    source_query: str,
+    segments: List[Dict[str, Any]],
+) -> str:
+    evidence = _format_timeline_evidence(segments)
+    system_prompt = (
+        "你是 VisualMem 的 Task Memory 生成器。你必须基于选中的 timeline evidence "
+        "生成可持久化的工作上下文，帮助用户继续任务。回答使用 Markdown，中文为主，"
+        "必须保留关键时间段、窗口/文件线索、已完成动作、未解决问题和下一步。"
+    )
+    prompt = f"""Source Query:
+{source_query}
+
+Timeline Evidence:
+{evidence}
+
+Generate a concise Task Memory Markdown document with these sections:
+1. Task Summary
+2. Evidence Timeline
+3. Current State
+4. Open Questions
+5. Recommended Next Steps"""
+
+    try:
+        markdown = _call_rewind_ai(prompt, system_prompt, segments, image_limit=6)
+        if markdown and not markdown.startswith(("API调用失败", "错误:")):
+            return markdown
+        logger.warning(f"Task Memory generation fell back after model response: {markdown[:120] if markdown else ''}")
+    except Exception as e:
+        logger.warning(f"Task Memory generation fallback: {e}")
+    return _fallback_task_memory_markdown(title, source_query, segments)
+
+
+@app.post("/api/rewind/search_segments", response_model=RewindSearchResponse)
+def rewind_search_segments(req: RewindSearchRequest):
+    if sqlite_storage is None and vector_storage is None:
+        raise HTTPException(status_code=500, detail="Storage is not initialized")
+    segments = _search_rewind_segments(
+        query=req.query,
+        start_time=req.start_time,
+        end_time=req.end_time,
+        top_k=req.top_k,
+    )
+    return RewindSearchResponse(query=req.query, segments=segments)
+
+
+@app.post("/api/rewind/timeline_frames", response_model=RewindTimelineFramesResponse)
+def rewind_timeline_frames(req: RewindTimelineFramesRequest):
+    if sqlite_storage is None:
+        raise HTTPException(status_code=500, detail="SQLite storage is not initialized")
+
+    start_dt = _parse_optional_dt(req.start_time)
+    end_dt = _parse_optional_dt(req.end_time)
+    if not start_dt or not end_dt:
+        raise HTTPException(status_code=400, detail="start_time and end_time are required")
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+
+    limit = min(max(int(req.limit or 36), 1), 120)
+    offset = max(int(req.offset or 0), 0)
+    start_iso = _sql_dt(start_dt)
+    end_iso = _sql_dt(end_dt)
+
+    try:
+        with sqlite_storage._connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM frames f
+                WHERE f.timestamp >= ? AND f.timestamp <= ?
+                  AND f.frame_id LIKE 'frame_%'
+                  AND f.image_path IS NOT NULL AND f.image_path != ''
+                """,
+                (start_iso, end_iso),
+            )
+            total_count = cursor.fetchone()["cnt"]
+
+            cursor.execute(
+                """
+                SELECT
+                    f.frame_id,
+                    f.timestamp,
+                    f.image_path,
+                    o.text AS ocr_text
+                FROM frames f
+                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
+                WHERE f.timestamp >= ? AND f.timestamp <= ?
+                  AND f.frame_id LIKE 'frame_%'
+                  AND f.image_path IS NOT NULL AND f.image_path != ''
+                ORDER BY f.timestamp ASC
+                LIMIT ? OFFSET ?
+                """,
+                (start_iso, end_iso, limit, offset),
+            )
+            rows = cursor.fetchall()
+
+        frames: List[Dict[str, Any]] = []
+        for row in rows:
+            fid = row["frame_id"]
+            sub_list = []
+            for sf in sqlite_storage.get_sub_frames_for_frame(fid):
+                sub_list.append(
+                    {
+                        "sub_frame_id": sf["sub_frame_id"],
+                        "timestamp": _ts_to_iso(sf.get("timestamp")),
+                        "app_name": sf.get("app_name", "") or "",
+                        "window_name": sf.get("window_name", "") or "",
+                        "image_path": _resolve_sub_frame_image_path(sf),
+                    }
+                )
+            frames.append(
+                {
+                    "frame_id": fid,
+                    "timestamp": _ts_to_iso(row["timestamp"]),
+                    "image_path": row["image_path"],
+                    "ocr_text": row["ocr_text"] or "",
+                    "sub_frames": sub_list,
+                }
+            )
+
+        return RewindTimelineFramesResponse(
+            start_time=_ts_to_iso(start_dt),
+            end_time=_ts_to_iso(end_dt),
+            offset=offset,
+            limit=limit,
+            total_count=total_count,
+            frames=frames,
+        )
+    except Exception as e:
+        logger.error(f"Failed to load Rewind timeline frames: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to load timeline frames: {e}")
+
+
+@app.post("/api/rewind/build_context", response_model=TaskMemoryResponse)
+def rewind_build_context(req: BuildRewindContextRequest):
+    if not req.source_query.strip() and not req.selected_segments:
+        raise HTTPException(status_code=400, detail="source_query or selected_segments is required")
+
+    if req.selected_segments:
+        segments = [_enrich_rewind_segment(segment) for segment in req.selected_segments]
+    else:
+        segments = _search_rewind_segments(
+            query=req.source_query,
+            start_time=req.start_time,
+            end_time=req.end_time,
+            top_k=req.top_k,
+        )
+
+    if not segments:
+        raise HTTPException(status_code=404, detail="No timeline evidence found for Task Memory")
+
+    title = req.title.strip() if req.title and req.title.strip() else _derive_task_memory_title(req.source_query, segments)
+    markdown = _generate_task_memory_markdown(title, req.source_query, segments)
+    now = _now_iso()
+    task_memory_id = f"tm_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    memory = {
+        "task_memory_id": task_memory_id,
+        "title": title,
+        "markdown": markdown,
+        "source_query": req.source_query,
+        "selected_segments": segments,
+        "evidence_refs": _merge_rewind_evidence_refs(segments, req.evidence_refs),
+        "created_at": now,
+        "updated_at": now,
+    }
+    saved = _save_task_memory(memory)
+    return TaskMemoryResponse(**saved)
+
+
+@app.get("/api/rewind/task_memories", response_model=TaskMemoryListResponse)
+def rewind_list_task_memories():
+    items = []
+    for memory in _list_task_memories():
+        items.append(
+            TaskMemoryListItem(
+                task_memory_id=memory["task_memory_id"],
+                title=memory["title"],
+                source_query=memory["source_query"],
+                created_at=memory["created_at"],
+                updated_at=memory["updated_at"],
+                selected_segment_count=len(memory.get("selected_segments") or []),
+            )
+        )
+    return TaskMemoryListResponse(memories=items)
+
+
+@app.get("/api/rewind/task_memories/{task_memory_id}", response_model=TaskMemoryResponse)
+def rewind_get_task_memory(task_memory_id: str):
+    return TaskMemoryResponse(**_load_task_memory(task_memory_id))
+
+
+@app.patch("/api/rewind/task_memories/{task_memory_id}", response_model=TaskMemoryResponse)
+def rewind_update_task_memory(task_memory_id: str, req: TaskMemoryPatchRequest):
+    memory = _load_task_memory(task_memory_id)
+    if req.title is not None:
+        title = req.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title cannot be empty")
+        memory["title"] = title
+    if req.markdown is not None:
+        memory["markdown"] = req.markdown
+    memory["updated_at"] = _now_iso()
+    return TaskMemoryResponse(**_save_task_memory(memory))
+
+
+@app.post("/api/rewind/task_memories/{task_memory_id}/ask", response_model=TaskMemoryAskResponse)
+def rewind_ask_task_memory(task_memory_id: str, req: TaskMemoryAskRequest):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    memory = _load_task_memory(task_memory_id)
+    segments = [_enrich_rewind_segment(segment) for segment in memory.get("selected_segments") or []]
+    markdown = req.markdown if req.markdown is not None else memory.get("markdown", "")
+    evidence_refs = _merge_rewind_evidence_refs(segments, memory.get("evidence_refs") or [])
+    evidence = (
+        f"{_format_timeline_evidence(segments)}\n\n"
+        f"Persisted Evidence Refs:\n{_format_evidence_refs(evidence_refs)}"
+    )
+    system_prompt = (
+        "你是 VisualMem 的任务继续助手。你必须基于 Task Memory 和它绑定的 "
+        "timeline evidence 回答。如果信息不足，明确说不确定。回答要偏行动导向："
+        "下一步做什么、检查什么文件/窗口/证据、有哪些未解决问题。"
+    )
+    prompt = f"""Task Memory:
+{markdown}
+
+Timeline Evidence:
+{evidence}
+
+Question:
+{req.question}
+
+    Answer requirements:
+- Cite relevant timestamps or time ranges from Timeline Evidence.
+- Prefer concrete next actions over generic advice.
+- If the evidence does not support a claim, say that it is uncertain."""
+
+    timeout_seconds = max(float(getattr(config, "REWIND_ASK_TIMEOUT_SECONDS", 90) or 90), 10.0)
+    started_at = time_module.time()
+    logger.info(
+        "Task Memory ask started: task_memory_id=%s question_chars=%d markdown_chars=%d "
+        "segments=%d evidence_refs=%d image_limit=%d timeout=%.0fs",
+        task_memory_id,
+        len(req.question or ""),
+        len(markdown or ""),
+        len(segments),
+        len(evidence_refs),
+        0,
+        timeout_seconds,
+    )
+    try:
+        answer = _call_rewind_ai(
+            prompt,
+            system_prompt,
+            segments,
+            image_limit=0,
+            timeout_seconds=timeout_seconds,
+        )
+        if answer.startswith(("API调用失败", "错误:")):
+            logger.warning("Task Memory ask model returned failure: %s", answer[:240])
+            answer = (
+                "AI 调用失败或超时，当前没有拿到可用回答。\n\n"
+                f"错误信息：{_clip_one_line(answer, 500)}\n\n"
+                "可以稍后重试，或先减少选中的 evidence segment 后重新 Build Task Memory。"
+            )
+    except Exception as e:
+        logger.warning(f"Task Memory ask failed: {e}")
+        answer = f"无法调用 AI 继续分析：{e}"
+    finally:
+        logger.info(
+            "Task Memory ask finished: task_memory_id=%s elapsed=%.2fs",
+            task_memory_id,
+            time_module.time() - started_at,
+        )
+
+    return TaskMemoryAskResponse(
+        task_memory_id=task_memory_id,
+        answer=answer,
+        evidence_refs=evidence_refs,
+    )
 
 
 def _load_image_from_path(path_str: str):

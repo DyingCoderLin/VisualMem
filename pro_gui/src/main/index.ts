@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut, screen } from 'electron'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -45,6 +45,10 @@ function setupIPC(): void {
     }
   })
 
+  ipcMain.handle('screen-get-all-displays', () => {
+    return screen.getAllDisplays()
+  })
+
   // 获取项目根目录
   ipcMain.handle('get-project-root', () => {
     return findProjectRoot()
@@ -74,9 +78,8 @@ function createWindow(): void {
   if (isDev) {
     // 开发模式：连接到 Vite 开发服务器
     mainWindow.loadURL('http://localhost:5173')
-    // 开发模式下默认打开开发者工具，除非明确禁用
-    // 使用 OPEN_DEVTOOLS=false npm run dev 来禁用
-    if (process.env.OPEN_DEVTOOLS !== 'false') {
+    // 开发模式下默认不打开开发者工具；需要时用 Cmd/Ctrl+Shift+I 或 OPEN_DEVTOOLS=true 启动。
+    if (process.env.OPEN_DEVTOOLS === 'true') {
       mainWindow.webContents.openDevTools()
     }
   } else {

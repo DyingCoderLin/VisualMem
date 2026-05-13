@@ -6,6 +6,9 @@ declare global {
       desktopCapturer: {
         getSources: (options: any) => Promise<any[]>
       }
+      screen?: {
+        getAllDisplays: () => Promise<any[]>
+      }
       getProjectRoot: () => Promise<string>
     }
   }

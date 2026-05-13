@@ -37,6 +37,14 @@ const Sidebar: React.FC<SidebarProps> = ({ currentView, onViewChange }) => {
             日报
           </div>
         </li>
+        <li>
+          <div
+            className={`nav-item ${currentView === 'rewind' ? 'active' : ''}`}
+            onClick={() => onViewChange('rewind')}
+          >
+            Rewind
+          </div>
+        </li>
         {/* <li>
           <div
             className={`nav-item ${currentView === 'tags' ? 'active' : ''}`}
@@ -61,4 +69,3 @@ const Sidebar: React.FC<SidebarProps> = ({ currentView, onViewChange }) => {
 }
 
 export default Sidebar
-

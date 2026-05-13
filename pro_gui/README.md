@@ -48,6 +48,12 @@ npm run dev
 2. Vite 开发服务器（前端热重载）
 3. 自动连接到 Python 后端（http://localhost:8080）
 
+开发模式默认不自动打开 Chrome DevTools。需要调试时可按 `Cmd+Shift+I` / `Ctrl+Shift+I` 手动切换，或使用：
+
+```bash
+npm run dev:devtools
+```
+
 ## 构建
 
 ```bash
@@ -88,4 +94,3 @@ UI 采用深色主题 + 黄色强调色的设计系统：
 - 文本色：`#FFFFFF` (主要), `#A0A0A0` (次要)
 
 详细样式定义见 `src/renderer/src/styles/theme.css`
-

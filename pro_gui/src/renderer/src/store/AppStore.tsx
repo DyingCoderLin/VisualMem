@@ -3,7 +3,7 @@ import { apiClient } from '../services/api'
 import type { FrontendTheme } from '../services/api'
 import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
 
-export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings' | 'daily'
+export type ViewType = 'timeline' | 'realtime' | 'rewind' | 'tags' | 'settings' | 'daily'
 
 export interface SearchResult {
   answer: string

@@ -1,4 +1,4 @@
-/** Mirrors `logs/daily_report_YYYY-MM-DD.json` from the reporting pipeline. */
+/** Mirrors `REPORT_LOG_DIR/daily_report_YYYY-MM-DD.json` from the reporting pipeline. */
 
 export interface AppUsageRow {
   app: string

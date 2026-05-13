@@ -28,6 +28,10 @@ class WindowFrame(BaseModel):
     window_name: str
     image: Image  # PIL 图像对象
     image_hash: int = 0  # Hash for quick comparison
+    x: Optional[int] = None
+    y: Optional[int] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
     ocr_text: Optional[str] = None
     ocr_text_json: Optional[str] = None
     ocr_confidence: float = 0.0
@@ -55,6 +59,7 @@ class ScreenObject(BaseModel):
     # Full screen capture
     full_screen_image: Image
     full_screen_hash: int = 0  # Hash for quick comparison
+    monitor_bounds: Optional[Dict[str, Any]] = None
     
     # Individual window captures
     windows: List[WindowFrame] = Field(default_factory=list)
@@ -111,5 +116,4 @@ class VLMAnalysis(BaseModel):
     layout_summary: str
     entities: List[str]
     embedding: Optional[List[float]] = None
-
 

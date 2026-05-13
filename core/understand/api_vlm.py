@@ -199,7 +199,8 @@ class ApiVLM(AbstractVLM):
         images: list, 
         num_images: int = None, 
         image_timestamps: list[datetime] = None,
-        system_prompt: str = None
+        system_prompt: str = None,
+        timeout_seconds: Optional[float] = None,
     ) -> str:
         """
         调用VLM API（支持多图片和时间戳）
@@ -270,7 +271,7 @@ class ApiVLM(AbstractVLM):
                 self.api_uri,
                 headers=headers,
                 json=payload,
-                timeout=360,  # 多图片可能需要更长时间
+                timeout=timeout_seconds or 360,  # 多图片可能需要更长时间
                 verify=False  # 如果是自签名证书
             )
             
@@ -313,7 +314,12 @@ class ApiVLM(AbstractVLM):
             logger.error(f"Unexpected error: {e}")
             return f"错误: {str(e)}"
     
-    def _call_vlm_text_only(self, prompt: str, system_prompt: str = None) -> str:
+    def _call_vlm_text_only(
+        self,
+        prompt: str,
+        system_prompt: str = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> str:
         """
         纯文本查询（不带图片）
         
@@ -369,7 +375,7 @@ class ApiVLM(AbstractVLM):
                 self.api_uri,
                 headers=headers,
                 json=payload,
-                timeout=120,
+                timeout=timeout_seconds or 120,
                 verify=False
             )
             

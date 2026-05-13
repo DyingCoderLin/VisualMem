@@ -13,8 +13,9 @@ Usage:
   python scripts/daily_report.py --date 2026-03-24 -v          # DEBUG logs
   python scripts/daily_report.py --date 2026-03-24 --print-json   # also dump full JSON to stdout
 
-By default: writes logs/daily_report_<date>.json only. Stderr prints path + LLM token
-totals + pipeline_ms (no report body). Use --print-json to stream full JSON to stdout.
+By default: writes <STORAGE_ROOT>/reports/daily_report_<date>.json only. Stderr
+prints path + LLM token totals + pipeline_ms (no report body). Use --print-json
+to stream full JSON to stdout.
 
 Debug logs: set LOG_LEVEL=DEBUG in .env or use -v (must run before imports).
 
@@ -42,7 +43,7 @@ if "-v" in sys.argv or "--verbose" in sys.argv:
 
 
 def _write_report_json(result: dict, date: str, *, print_json: bool) -> None:
-    """Always write full JSON to REPORT_LOG_DIR (default logs/); optional stdout."""
+    """Always write full JSON to REPORT_LOG_DIR; optional stdout."""
     from config import config as _cfg
 
     text = json.dumps(result, ensure_ascii=False, indent=2) + "\n"

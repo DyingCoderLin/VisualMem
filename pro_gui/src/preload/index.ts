@@ -7,6 +7,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
       return await ipcRenderer.invoke('desktop-capturer-get-sources', options)
     }
   },
+  screen: {
+    getAllDisplays: async () => {
+      return await ipcRenderer.invoke('screen-get-all-displays')
+    }
+  },
   getProjectRoot: async () => {
     return await ipcRenderer.invoke('get-project-root')
   }

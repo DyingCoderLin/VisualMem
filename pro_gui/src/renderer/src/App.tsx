@@ -6,6 +6,7 @@ import RealTimeTracing from './pages/RealTimeTracing.tsx'
 import SmartTags from './pages/SmartTags'
 import Settings from './pages/Settings'
 import DailyReportView from './pages/DailyReportView'
+import RewindView from './pages/RewindView'
 import SearchResults from './components/SearchResults'
 import { SearchResult } from './components/SearchBar'
 import { AppStoreProvider, useAppStore } from './store/AppStore'
@@ -25,7 +26,7 @@ function AppContent() {
         <TopBar onSearchResult={setSearchResult} />
         <div className="content-area">
           {/* 全局搜索结果 - 仅在非实时追踪页面显示 */}
-          {searchResult && currentView !== 'realtime' && currentView !== 'daily' && (
+          {searchResult && currentView !== 'realtime' && currentView !== 'daily' && currentView !== 'rewind' && (
             <div className="global-search-results-wrapper">
               <SearchResults 
                 result={searchResult} 
@@ -40,13 +41,21 @@ function AppContent() {
             <div style={{ display: currentView === 'realtime' ? 'contents' : 'none' }}>
               <RealTimeTracing />
             </div>
-            {currentView === 'tags' && <SmartTags />}
-            {currentView === 'settings' && <Settings />}
-            {currentView === 'daily' && (
-              <div className="daily-report-view-container">
-                <DailyReportView />
-              </div>
-            )}
+            <div style={{ display: currentView === 'rewind' ? 'contents' : 'none' }}>
+              <RewindView />
+            </div>
+            <div style={{ display: currentView === 'tags' ? 'contents' : 'none' }}>
+              <SmartTags />
+            </div>
+            <div style={{ display: currentView === 'settings' ? 'contents' : 'none' }}>
+              <Settings />
+            </div>
+            <div
+              className="daily-report-view-container"
+              style={{ display: currentView === 'daily' ? undefined : 'none' }}
+            >
+              <DailyReportView />
+            </div>
           </div>
         </div>
       </div>
@@ -63,4 +72,3 @@ function App() {
 }
 
 export default App
-

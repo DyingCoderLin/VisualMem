@@ -10,7 +10,7 @@ Reference: screenpipe's capture_screenshot_by_window.rs
 """
 import datetime
 import hashlib
-from typing import Optional, List, Set
+from typing import Any, Dict, Optional, List, Set
 from PIL import Image
 from io import BytesIO
 from dataclasses import dataclass
@@ -40,6 +40,34 @@ def calculate_image_hash(image: Image.Image) -> int:
     img_bytes = small.tobytes()
     # Use 15 hex chars (60 bits) to ensure it fits in SQLite's signed 64-bit INTEGER
     return int(hashlib.md5(img_bytes).hexdigest()[:15], 16)
+
+
+def _rect_from_values(x: Any, y: Any, width: Any, height: Any) -> Optional[Dict[str, float]]:
+    try:
+        width_f = float(width)
+        height_f = float(height)
+        if width_f <= 0 or height_f <= 0:
+            return None
+        return {
+            "x": float(x),
+            "y": float(y),
+            "width": width_f,
+            "height": height_f,
+        }
+    except Exception:
+        return None
+
+
+def _overlap_ratio(a: Dict[str, float], b: Dict[str, float]) -> float:
+    left = max(a["x"], b["x"])
+    top = max(a["y"], b["y"])
+    right = min(a["x"] + a["width"], b["x"] + b["width"])
+    bottom = min(a["y"] + a["height"], b["y"] + b["height"])
+    if right <= left or bottom <= top:
+        return 0.0
+    overlap = (right - left) * (bottom - top)
+    area = a["width"] * a["height"]
+    return overlap / area if area > 0 else 0.0
 
 
 def should_skip_window(app_name: str, title: str) -> bool:
@@ -172,6 +200,18 @@ class RustWindowCapturer(AbstractCapturer):
             full_screen = self._bytes_to_pil(screen_result.get_image_bytes())
             full_screen = self._resize_image(full_screen)
             full_screen_hash = calculate_image_hash(full_screen)
+            monitor_bounds = {
+                "x": int(screen_result.monitor.x),
+                "y": int(screen_result.monitor.y),
+                "width": int(screen_result.monitor.width),
+                "height": int(screen_result.monitor.height),
+            }
+            monitor_rect = _rect_from_values(
+                monitor_bounds["x"],
+                monitor_bounds["y"],
+                monitor_bounds["width"],
+                monitor_bounds["height"],
+            )
             
             # Process windows
             windows: List[WindowFrame] = []
@@ -182,6 +222,15 @@ class RustWindowCapturer(AbstractCapturer):
                     # Note: xcap doesn't provide is_focused, so we capture all
                     
                     try:
+                        window_rect = _rect_from_values(
+                            getattr(w.info, "x", 0),
+                            getattr(w.info, "y", 0),
+                            getattr(w.info, "width", 0),
+                            getattr(w.info, "height", 0),
+                        )
+                        if monitor_rect and window_rect and _overlap_ratio(window_rect, monitor_rect) < 0.20:
+                            continue
+
                         window_image = self._bytes_to_pil(w.get_image_bytes())
                         window_image = self._resize_image(window_image)
                         window_hash = calculate_image_hash(window_image)
@@ -191,6 +240,10 @@ class RustWindowCapturer(AbstractCapturer):
                             window_name=w.info.title,
                             image=window_image,
                             image_hash=window_hash,  # 内存中的 hash，用于快速比较
+                            x=int(getattr(w.info, "x", 0)),
+                            y=int(getattr(w.info, "y", 0)),
+                            width=int(getattr(w.info, "width", window_image.width)),
+                            height=int(getattr(w.info, "height", window_image.height)),
                             timestamp=timestamp
                         ))
                     except Exception as e:
@@ -209,6 +262,7 @@ class RustWindowCapturer(AbstractCapturer):
                 timestamp=timestamp,
                 full_screen_image=full_screen,
                 full_screen_hash=full_screen_hash,
+                monitor_bounds=monitor_bounds,
                 windows=windows,
                 focused_app_name=focused_app or None,
                 focused_window_name=focused_win or None,
@@ -600,6 +654,10 @@ if not _USE_RUST:
                             window_name=win_info.title,
                             image=window_image,
                             image_hash=window_hash,  # 内存中的 hash，用于快速比较
+                            x=win_info.x,
+                            y=win_info.y,
+                            width=win_info.width,
+                            height=win_info.height,
                             timestamp=timestamp
                         ))
                     
@@ -614,6 +672,12 @@ if not _USE_RUST:
                     timestamp=timestamp,
                     full_screen_image=full_screen,
                     full_screen_hash=full_screen_hash,
+                    monitor_bounds={
+                        "x": 0,
+                        "y": 0,
+                        "width": full_screen.width,
+                        "height": full_screen.height,
+                    },
                     windows=windows,
                     focused_app_name=focused_app or None,
                     focused_window_name=focused_win or None,
