@@ -84,31 +84,31 @@ class QueryWorker(QObject):
         self._simple_mode_initialized = True
     
     def _ensure_vector_mode_initialized(self):
-    """确保 Vector 模式组件已初始化（延迟加载编码器模型）"""
-    if self.gui_mode == "remote":
-        # 远程模式下不在本地加载编码器 / LanceDB
-        return
-    if self._vector_mode_initialized:
-        return
-    
-    self.progress_signal.emit(f"正在加载编码器模型 {config.EMBEDDING_MODEL}... (首次加载较慢)")
-    from core.encoder import create_encoder
-    from core.storage.lancedb_storage import LanceDBStorage
-    from core.retrieval.image_retriever import ImageRetriever
-    
-    self.encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
-    self.progress_signal.emit(f"正在初始化 LanceDB 存储 ({config.LANCEDB_PATH})...")
-    self.storage = LanceDBStorage(
-        db_path=config.LANCEDB_PATH,
-        embedding_dim=self.encoder.embedding_dim
-    )
-    self.retriever = ImageRetriever(
-        encoder=self.encoder,
-        storage=self.storage,
-        top_k=10
-    )
-    self._vector_mode_initialized = True
-    self.progress_signal.emit(f"编码器模型 {config.EMBEDDING_MODEL} 加载完成")
+        """确保 Vector 模式组件已初始化（延迟加载编码器模型）"""
+        if self.gui_mode == "remote":
+            # 远程模式下不在本地加载编码器 / LanceDB
+            return
+        if self._vector_mode_initialized:
+            return
+
+        self.progress_signal.emit(f"正在加载编码器模型 {config.EMBEDDING_MODEL}... (首次加载较慢)")
+        from core.encoder import create_encoder
+        from core.storage.lancedb_storage import LanceDBStorage
+        from core.retrieval.image_retriever import ImageRetriever
+
+        self.encoder = create_encoder(model_name=config.EMBEDDING_MODEL)
+        self.progress_signal.emit(f"正在初始化 LanceDB 存储 ({config.LANCEDB_PATH})...")
+        self.storage = LanceDBStorage(
+            db_path=config.LANCEDB_PATH,
+            embedding_dim=self.encoder.embedding_dim
+        )
+        self.retriever = ImageRetriever(
+            encoder=self.encoder,
+            storage=self.storage,
+            top_k=10
+        )
+        self._vector_mode_initialized = True
+        self.progress_signal.emit(f"编码器模型 {config.EMBEDDING_MODEL} 加载完成")
     
     def _ensure_storage_only(self):
         """只初始化存储（不加载 CLIP 模型，用于不需要向量检索的查询）"""
@@ -1099,4 +1099,3 @@ OCR Text Extracted from Screenshots (first is current screen, others are histori
         result += "="*60 + "\n"
         result += f"分析了 {len(ocr_texts)} 条OCR文本记录\n"
         return result
-

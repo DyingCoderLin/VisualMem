@@ -1,4 +1,14 @@
 /venv/*
+node_modules/
+pro_gui/node_modules/
+out/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
 *.pyc
 logs/*
 *.db
@@ -40,5 +50,10 @@ Gemini*
 /visualmem_storage_exp52/*
 /visualmem_storage_exp54/*
 /scripts/eval/*
+<<<<<<< HEAD
 /visualmem_storage_test/*
 /rewind_ui/*
+=======
+/rewind_ui/*
+/visualmem_storage_test/*
+>>>>>>> main

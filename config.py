@@ -198,6 +198,10 @@ class Config:
     # API base address (only needs host:port, endpoint path will be automatically added based on VLM_BACKEND_TYPE)
     VLM_API_URI = os.environ.get("VLM_API_URI", "http://localhost:8081")
     VLM_API_MODEL = os.environ.get("VLM_API_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+    # Experimental direct local-model VLM backend path. The production runtime
+    # currently uses ApiVLM; this keeps LocalVLM import/instantiation safe for
+    # extension work without changing default behavior.
+    LOCAL_VLM_MODEL_PATH = os.environ.get("LOCAL_VLM_MODEL_PATH", "")
 
     # ============================================
     # Runtime Parameters

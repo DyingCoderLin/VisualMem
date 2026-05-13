@@ -15,7 +15,6 @@ from transformers.modeling_outputs import ModelOutput
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
 from transformers.cache_utils import Cache
-from transformers.utils.generic import check_model_inputs
 from qwen_vl_utils.vision_process import process_vision_info
 
 logger = logging.getLogger(__name__)
@@ -30,7 +29,6 @@ FPS = 1
 MAX_FRAMES = 64
 FRAME_MAX_PIXELS = 768 * IMAGE_FACTOR * IMAGE_FACTOR
 MAX_TOTAL_PIXELS = 10 * FRAME_MAX_PIXELS
-PAD_TOKEN = "<|endoftext|>"
 
 # Define output structure for embeddings
 @dataclass
@@ -81,7 +79,6 @@ class Qwen3VLForEmbedding(Qwen3VLPreTrainedModel):
         return self.model.visual
 
     # Forward pass through model with input parameters
-    # @check_model_inputs
     def forward(self,
                 input_ids: torch.LongTensor = None,
                 attention_mask: Optional[torch.Tensor] = None,

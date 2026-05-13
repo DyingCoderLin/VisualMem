@@ -294,21 +294,11 @@ def _vector_rag(
         print(f"sparse_queries: {sparse_queries}")
         print(f"time_range: {time_range}")
 
-<<<<<<< HEAD
     # Merge explicit time range and LLM time range
     start_time, end_time = _merge_time_range(explicit_start, explicit_end, time_range)
     if start_time or end_time:
         print(f"⏰ Time Range: {start_time} - {end_time}")
         print("🔍 Using LanceDB Pre-filtering for vector retrieval...")
-=======
-    # Extract time range (for LanceDB Pre-filtering)
-    start_time = None
-    end_time = None
-    if time_range:
-        start_time, end_time = time_range
-        print(f"Time Range: {start_time} - {end_time}")
-        print("Using LanceDB Pre-filtering for vector retrieval...")
->>>>>>> main
 
     # Define helper function: Dense search
     def _dense_search_task():
