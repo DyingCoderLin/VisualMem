@@ -40,13 +40,18 @@ function AppContent() {
             <div style={{ display: currentView === 'realtime' ? 'contents' : 'none' }}>
               <RealTimeTracing />
             </div>
-            {currentView === 'tags' && <SmartTags />}
-            {currentView === 'settings' && <Settings />}
-            {currentView === 'daily' && (
-              <div className="daily-report-view-container">
-                <DailyReportView />
-              </div>
-            )}
+            <div style={{ display: currentView === 'tags' ? 'contents' : 'none' }}>
+              <SmartTags />
+            </div>
+            <div style={{ display: currentView === 'settings' ? 'contents' : 'none' }}>
+              <Settings />
+            </div>
+            <div
+              className="daily-report-view-container"
+              style={{ display: currentView === 'daily' ? undefined : 'none' }}
+            >
+              <DailyReportView />
+            </div>
           </div>
         </div>
       </div>
@@ -63,4 +68,3 @@ function App() {
 }
 
 export default App
-

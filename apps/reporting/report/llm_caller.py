@@ -40,30 +40,18 @@ async def drain_litellm_async_logging() -> None:
     await GLOBAL_LOGGING_WORKER.flush()
     await GLOBAL_LOGGING_WORKER.clear_queue()
 
-# LiteLLM requires "provider/model". Bare names (e.g. minimax-m2.5) raise BadRequestError.
-# OpenAI-compatible gateways (e.g. SJTU /v1) use openai/<id>. Native MiniMax API uses minimax/MiniMax-*.
-_BARE_MODEL_ALIASES = {
-    "minimax-m2.5": "openai/minimax-m2.5",
-    "minimax-m2": "openai/minimax-m2",
-    "minimax-m2.1": "openai/minimax-m2.1",
-    "qwen3coder": "openai/qwen3coder",
-}
-
-
 def normalize_litellm_model(model: str) -> str:
-    """Map common bare model ids to provider/model form for litellm."""
-    if not model or "/" in model:
-        return model
-    key = model.strip().lower()
-    resolved = _BARE_MODEL_ALIASES.get(key)
-    if resolved:
-        logger.debug(
-            "Normalized model id: %r -> %r (litellm requires provider/model)",
-            model,
-            resolved,
-        )
-        return resolved
-    return model
+    """Default bare model ids to OpenAI-compatible provider form for LiteLLM."""
+    raw = (model or "").strip()
+    if not raw or "/" in raw:
+        return raw
+    normalized = f"openai/{raw}"
+    logger.debug(
+        "Normalized model id: %r -> %r (bare ids default to OpenAI-compatible API)",
+        model,
+        normalized,
+    )
+    return normalized
 
 
 class LLMCaller:

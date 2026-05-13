@@ -338,8 +338,12 @@ class Config:
         REPORT_DATA_API_BASE = GUI_REMOTE_BACKEND_URL.rstrip("/")
     else:
         REPORT_DATA_API_BASE = "http://localhost:18080"
-    # Reduce: read prior daily_report_*.json from this directory (project-relative ok).
-    REPORT_LOG_DIR = _resolve_path(os.environ.get("REPORT_LOG_DIR", "logs"))
+    # Reduce: read prior daily_report_*.json from this storage-bound directory.
+    # Defaults to <STORAGE_ROOT>/reports so test/prod storage roots do not share reports.
+    REPORT_LOG_DIR = _resolve_path(os.environ.get(
+        "REPORT_LOG_DIR",
+        os.path.join(STORAGE_ROOT, "reports"),
+    ))
     # How many calendar days to walk backward when looking for prior report files.
     REPORT_HISTORY_DAYS = int(os.environ.get("REPORT_HISTORY_DAYS", "14"))
     # ============================================
