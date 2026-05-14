@@ -2,11 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import ImagePreview from '../components/ImagePreview'
 import MarkdownRenderer from '../components/MarkdownRenderer'
 import { apiClient } from '../services/api'
+import { useAppStore } from '../store/AppStore'
 import type {
   RewindSegment,
   RewindTimelineFrame,
   TaskMemory,
-  TaskMemoryAskResponse,
   TaskMemoryListItem
 } from '../services/api'
 
@@ -41,15 +41,15 @@ const formatLocalInput = (date: Date): string => {
 }
 
 const segmentTime = (segment: RewindSegment): string => {
-  const start = segment.start_time || segment.timestamp
-  const end = segment.end_time
+  const { start, end } = segmentRange(segment)
   if (!end || end === start) return formatTimestamp(start)
   return `${formatTimestamp(start)} - ${formatTimestamp(end)}`
 }
 
 const segmentDuration = (segment: RewindSegment): string => {
-  const start = new Date(segment.start_time || segment.timestamp || '').getTime()
-  const end = new Date(segment.end_time || segment.timestamp || '').getTime()
+  const range = segmentRange(segment)
+  const start = new Date(range.start || '').getTime()
+  const end = new Date(range.end || '').getTime()
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return ''
   const minutes = Math.round((end - start) / 60000)
   if (minutes < 60) return `${minutes}m`
@@ -73,9 +73,60 @@ const evidenceAppWindow = (segment: RewindSegment): string => {
 }
 
 const segmentSortValue = (segment: RewindSegment): number => {
-  const value = segment.end_time || segment.timestamp || segment.start_time || ''
+  const range = segmentRange(segment)
+  const value = range.end || range.start || segment.timestamp || ''
   const parsed = new Date(value).getTime()
   return Number.isFinite(parsed) ? parsed : 0
+}
+
+const segmentRange = (segment: RewindSegment): { start: string; end: string } => {
+  const rawStart = segment.start_time || segment.timestamp || ''
+  const rawEnd = segment.end_time || segment.timestamp || rawStart
+  const startMs = new Date(rawStart).getTime()
+  const endMs = new Date(rawEnd).getTime()
+  if (Number.isFinite(startMs) && Number.isFinite(endMs) && startMs > endMs) {
+    return { start: rawEnd, end: rawStart }
+  }
+  return { start: rawStart, end: rawEnd }
+}
+
+const normalizeSegmentTime = (segment: RewindSegment): RewindSegment => {
+  const { start, end } = segmentRange(segment)
+  if (start === (segment.start_time || segment.timestamp || '') && end === (segment.end_time || segment.timestamp || start)) {
+    return segment
+  }
+  return { ...segment, start_time: start, end_time: end }
+}
+
+const segmentIdentity = (segment: RewindSegment): string => {
+  if (segment.segment_id) return `segment:${segment.segment_id}`
+  if (segment.frame_id) return `frame:${segment.frame_id}`
+  const { start, end } = segmentRange(segment)
+  return ['span', segment.app_name || '', segment.window_name || '', start, end, evidenceLabel(segment)].join('|')
+}
+
+const dedupeRewindSegments = (items: RewindSegment[]): RewindSegment[] => {
+  const seen = new Set<string>()
+  const deduped: RewindSegment[] = []
+  for (const segment of items) {
+    const key = segmentIdentity(segment)
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(segment)
+  }
+  return deduped
+}
+
+const dedupeTimelineFrames = (frames: RewindTimelineFrame[]): RewindTimelineFrame[] => {
+  const seen = new Set<string>()
+  const deduped: RewindTimelineFrame[] = []
+  for (const frame of frames) {
+    const key = frame.frame_id || `${frame.timestamp}-${frame.image_path || ''}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(frame)
+  }
+  return deduped
 }
 
 const toApiTimestamp = (value: string): string | undefined => {
@@ -152,6 +203,7 @@ const LoadingLabel = ({ label }: { label: string }) => (
 )
 
 function RewindView() {
+  const { setRewindAskContext } = useAppStore()
   const [sourceQuery, setSourceQuery] = useState('')
   const [startTimeLocal, setStartTimeLocal] = useState('')
   const [endTimeLocal, setEndTimeLocal] = useState('')
@@ -171,12 +223,10 @@ function RewindView() {
   const [activeMemory, setActiveMemory] = useState<TaskMemory | null>(null)
   const [draftTitle, setDraftTitle] = useState('')
   const [draftMarkdown, setDraftMarkdown] = useState('')
-  const [question, setQuestion] = useState('')
-  const [askResult, setAskResult] = useState<TaskMemoryAskResponse | null>(null)
+  const [isEditingMemoryMarkdown, setIsEditingMemoryMarkdown] = useState(false)
   const [isSearching, setIsSearching] = useState(false)
   const [isBuilding, setIsBuilding] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
-  const [isAsking, setIsAsking] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const appOptions = useMemo(() => {
@@ -188,27 +238,25 @@ function RewindView() {
   }, [segments])
 
   const visibleSegments = useMemo(() => {
-    return segments
-      .filter((segment) => {
-        const apps = segmentApps(segment)
-        if (selectedApps.size > 0) {
-          const hasSelectedApp = apps.some((app) => selectedApps.has(app))
-          if (appFilterMode === 'include' && !hasSelectedApp) return false
-          if (appFilterMode === 'exclude' && hasSelectedApp) return false
-        }
-        if (selectedActivities.size > 0) {
-          const activities = segmentActivities(segment)
-          if (!activities.some((activity) => selectedActivities.has(activity))) return false
-        }
-        return true
-      })
-      .sort((a, b) => segmentSortValue(b) - segmentSortValue(a))
+    const filtered = segments.filter((segment) => {
+      const apps = segmentApps(segment)
+      if (selectedApps.size > 0) {
+        const hasSelectedApp = apps.some((app) => selectedApps.has(app))
+        if (appFilterMode === 'include' && !hasSelectedApp) return false
+        if (appFilterMode === 'exclude' && hasSelectedApp) return false
+      }
+      if (selectedActivities.size > 0) {
+        const activities = segmentActivities(segment)
+        if (!activities.some((activity) => selectedActivities.has(activity))) return false
+      }
+      return true
+    })
+    return dedupeRewindSegments(filtered).sort((a, b) => segmentSortValue(b) - segmentSortValue(a))
   }, [appFilterMode, segments, selectedActivities, selectedApps])
 
   const selectedSegments = useMemo(() => {
-    return segments
-      .filter((segment, index) => selectedIds.has(segmentKey(segment, index)))
-      .sort((a, b) => segmentSortValue(b) - segmentSortValue(a))
+    const filtered = segments.filter((segment, index) => selectedIds.has(segmentKey(segment, index)))
+    return dedupeRewindSegments(filtered).sort((a, b) => segmentSortValue(b) - segmentSortValue(a))
   }, [segments, selectedIds])
 
   const activeSegment = useMemo(() => {
@@ -276,8 +324,7 @@ function RewindView() {
 
   useEffect(() => {
     if (!activeSegment?.start_time && !activeSegment?.timestamp) return
-    const start = activeSegment.start_time || activeSegment.timestamp
-    const end = activeSegment.end_time || activeSegment.timestamp || start
+    const { start, end } = segmentRange(activeSegment)
     if (!start || !end) return
 
     const timeout = window.setTimeout(async () => {
@@ -289,7 +336,8 @@ function RewindView() {
           offset: timelineOffset,
           limit: TIMELINE_PAGE_SIZE
         })
-        setTimelineFrames(response.frames)
+        const frames = dedupeTimelineFrames(response.frames)
+        setTimelineFrames(frames)
         setTimelineTotal(response.total_count)
       } catch (err) {
         const message = err instanceof Error ? err.message : 'Failed to load segment timeline.'
@@ -306,9 +354,20 @@ function RewindView() {
     setActiveMemory(memory)
     setDraftTitle(memory.title)
     setDraftMarkdown(memory.markdown)
-    setAskResult(null)
-    setQuestion('')
+    setIsEditingMemoryMarkdown(false)
   }
+
+  useEffect(() => {
+    setRewindAskContext(
+      activeMemory
+        ? {
+            taskMemoryId: activeMemory.task_memory_id,
+            title: draftTitle || activeMemory.title,
+            markdown: draftMarkdown
+          }
+        : null
+    )
+  }, [activeMemory, draftMarkdown, draftTitle, setRewindAskContext])
 
   const getSearchTimeRange = (): { start_time?: string; end_time?: string } | null => {
     if (startTimeLocal && endTimeLocal) {
@@ -387,12 +446,13 @@ function RewindView() {
         end_time: timeRange.end_time,
         top_k: 12
       })
-      setSegments(response.segments)
-      setSelectedIds(new Set(response.segments.map((segment, index) => segmentKey(segment, index))))
-      setActiveSegmentId(response.segments[0] ? segmentKey(response.segments[0], 0) : null)
+      const normalizedSegments = dedupeRewindSegments(response.segments.map(normalizeSegmentTime))
+      setSegments(normalizedSegments)
+      setSelectedIds(new Set(normalizedSegments.map((segment, index) => segmentKey(segment, index))))
+      setActiveSegmentId(normalizedSegments[0] ? segmentKey(normalizedSegments[0], 0) : null)
       setSelectedApps(new Set())
       setSelectedActivities(new Set())
-      if (response.segments.length === 0) {
+      if (normalizedSegments.length === 0) {
         setError('No timeline evidence found.')
       }
     } catch (err) {
@@ -490,7 +550,7 @@ function RewindView() {
     try {
       const memory = await apiClient.buildRewindContext({
         source_query: getMemorySourceQuery(),
-        selected_segments: selectedSegments,
+        selected_segments: selectedSegments.map(normalizeSegmentTime),
         start_time: timeRange.start_time,
         end_time: timeRange.end_time
       })
@@ -510,9 +570,10 @@ function RewindView() {
       const memory = await apiClient.getTaskMemory(taskMemoryId)
       applyMemory(memory)
       setSourceQuery(memory.source_query)
-      setSegments(memory.selected_segments)
-      setSelectedIds(new Set(memory.selected_segments.map((segment, index) => segmentKey(segment, index))))
-      setActiveSegmentId(memory.selected_segments[0] ? segmentKey(memory.selected_segments[0], 0) : null)
+      const normalizedSegments = dedupeRewindSegments(memory.selected_segments.map(normalizeSegmentTime))
+      setSegments(normalizedSegments)
+      setSelectedIds(new Set(normalizedSegments.map((segment, index) => segmentKey(segment, index))))
+      setActiveSegmentId(normalizedSegments[0] ? segmentKey(normalizedSegments[0], 0) : null)
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to open Task Memory.'
       setError(message)
@@ -541,36 +602,6 @@ function RewindView() {
       setError(message)
     } finally {
       setIsSaving(false)
-    }
-  }
-
-  const handleAsk = async () => {
-    if (!activeMemory) return
-    const currentQuestion = question.trim()
-    if (!currentQuestion) {
-      setError('Enter a question first.')
-      return
-    }
-
-    setIsAsking(true)
-    setError(null)
-    setAskResult(null)
-    try {
-      const response = await apiClient.askTaskMemory(activeMemory.task_memory_id, {
-        question: currentQuestion,
-        markdown: draftMarkdown
-      })
-      setAskResult(response)
-    } catch (err) {
-      const message =
-        err instanceof DOMException && err.name === 'AbortError'
-          ? 'Ask timed out. The AI service did not return in time; try again or reduce the selected evidence.'
-          : err instanceof Error
-            ? err.message
-            : 'Ask failed.'
-      setError(message)
-    } finally {
-      setIsAsking(false)
     }
   }
 
@@ -933,35 +964,31 @@ function RewindView() {
 
         {activeMemory ? (
           <>
-            <div className="rewind-markdown-editor">
-              <textarea
-                value={draftMarkdown}
-                onChange={(event) => setDraftMarkdown(event.target.value)}
-                spellCheck={false}
-              />
-            </div>
-
-            <div className="rewind-ask-panel">
-              <div className="rewind-section-header">
-                <span>Ask with this memory</span>
-              </div>
-              <div className="rewind-ask-row">
-                <textarea
-                  value={question}
-                  onChange={(event) => setQuestion(event.target.value)}
-                  placeholder="What should I do next?"
-                />
+            <div className="rewind-memory-document">
+              <div className="rewind-memory-document-header">
+                <span>Memory Preview</span>
                 <button
-                  className={`btn btn-primary rewind-loading-button${isAsking ? ' is-loading' : ''}`}
-                  onClick={handleAsk}
-                  disabled={isAsking}
+                  className="rewind-icon-button"
+                  onClick={() => setIsEditingMemoryMarkdown((editing) => !editing)}
                 >
-                  {isAsking ? <LoadingLabel label="Asking" /> : 'Ask'}
+                  {isEditingMemoryMarkdown ? 'Preview' : 'Edit'}
                 </button>
               </div>
-              {askResult && (
-                <div className="rewind-answer">
-                  <MarkdownRenderer content={askResult.answer} />
+              {isEditingMemoryMarkdown ? (
+                <div className="rewind-markdown-editor">
+                  <textarea
+                    value={draftMarkdown}
+                    onChange={(event) => setDraftMarkdown(event.target.value)}
+                    spellCheck={false}
+                  />
+                </div>
+              ) : (
+                <div className="rewind-markdown-preview">
+                  {draftMarkdown.trim() ? (
+                    <MarkdownRenderer content={draftMarkdown} />
+                  ) : (
+                    <div className="rewind-empty-state">This memory is empty.</div>
+                  )}
                 </div>
               )}
             </div>

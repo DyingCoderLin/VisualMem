@@ -18,7 +18,7 @@ interface SearchBarProps {
 }
 
 const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
-  const [query, setQuery] = useState('')
+  const [queryByView, setQueryByView] = useState<Record<string, string>>({})
   const [isSearching, setIsSearching] = useState(false)
   const searchRequestRef = useRef<AbortController | null>(null)
 
@@ -31,14 +31,41 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
     recordingMode,
     setRecordingMode,
     currentView,
-    setRealtimeSearchResult
+    setRealtimeSearchResult,
+    rewindAskContext,
+    isRewindAsking,
+    askRewindMemory
   } = useAppStore()
+  const query = queryByView[currentView] || ''
+  const isRewindMode = currentView === 'rewind'
+  const isAskEnabledView = currentView === 'timeline' || currentView === 'realtime' || currentView === 'rewind'
+  const isBusy = isRewindMode ? isRewindAsking : isSearching
+  const searchPlaceholder = isRewindMode
+    ? rewindAskContext
+      ? 'Ask with this memory...'
+      : 'Build or select a Task Memory first'
+    : isAskEnabledView
+      ? 'Ask VisualMem...'
+      : 'Ask is available in Timeline, Real-time, or Rewind'
+
+  const updateQuery = (value: string) => {
+    setQueryByView((prev) => ({
+      ...prev,
+      [currentView]: value
+    }))
+  }
 
   const handleSearch = async () => {
     if (!query.trim()) return
+    if (!isAskEnabledView) return
 
-    if (isSearching) {
+    if (isBusy) {
       console.log('Search already in progress, ignoring duplicate request')
+      return
+    }
+
+    if (isRewindMode) {
+      await askRewindMemory(query.trim())
       return
     }
 
@@ -110,7 +137,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
   }
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !isSearching) {
+    if (e.key === 'Enter' && !isBusy) {
       e.preventDefault()
       handleSearch()
     }
@@ -131,10 +158,11 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
           <input
             type="text"
             className="search-input"
-            placeholder="Ask VisualMem..."
+            placeholder={searchPlaceholder}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => updateQuery(e.target.value)}
             onKeyPress={handleKeyPress}
+            disabled={!isAskEnabledView || (isRewindMode && !rewindAskContext)}
           />
         </div>
 
@@ -200,9 +228,9 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
         <button
           className="btn btn-primary"
           onClick={handleSearch}
-          disabled={isSearching}
+          disabled={isBusy || !isAskEnabledView || (isRewindMode && !rewindAskContext)}
         >
-          {isSearching ? 'Searching...' : 'Search'}
+          {isBusy ? (isRewindMode ? 'Asking...' : 'Searching...') : (isRewindMode ? 'Ask' : 'Search')}
         </button>
       </div>
     </>

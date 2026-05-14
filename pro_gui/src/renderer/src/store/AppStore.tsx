@@ -1,6 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
 import { apiClient } from '../services/api'
-import type { FrontendTheme } from '../services/api'
+import type { FrontendTheme, TaskMemoryAskResponse } from '../services/api'
 import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
 
 export type ViewType = 'timeline' | 'realtime' | 'rewind' | 'tags' | 'settings' | 'daily'
@@ -19,6 +19,12 @@ export interface SearchResult {
 interface DateRange {
   earliest_date: string | null
   latest_date: string | null
+}
+
+export interface RewindAskContext {
+  taskMemoryId: string
+  title: string
+  markdown: string
 }
 
 interface AppStoreContextType {
@@ -50,6 +56,14 @@ interface AppStoreContextType {
   // Search state
   realtimeSearchResult: SearchResult | null
   setRealtimeSearchResult: (result: SearchResult | null) => void
+
+  // Rewind Task Memory ask state
+  rewindAskContext: RewindAskContext | null
+  setRewindAskContext: (context: RewindAskContext | null) => void
+  rewindAskResult: TaskMemoryAskResponse | null
+  rewindAskError: string | null
+  isRewindAsking: boolean
+  askRewindMemory: (question: string) => Promise<void>
 }
 
 const AppStoreContext = createContext<AppStoreContextType | undefined>(undefined)
@@ -86,6 +100,10 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = useState(0)
   const [currentView, setCurrentView] = useState<ViewType>('timeline')
   const [realtimeSearchResult, setRealtimeSearchResult] = useState<SearchResult | null>(null)
+  const [rewindAskContextState, setRewindAskContextState] = useState<RewindAskContext | null>(null)
+  const [rewindAskResult, setRewindAskResult] = useState<TaskMemoryAskResponse | null>(null)
+  const [rewindAskError, setRewindAskError] = useState<string | null>(null)
+  const [isRewindAsking, setIsRewindAsking] = useState(false)
 
   useEffect(() => {
     const root = document.documentElement
@@ -136,6 +154,47 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   const refreshTimeline = useCallback(() => {
     setTimelineRefreshTrigger(prev => prev + 1)
   }, [])
+
+  const setRewindAskContext = useCallback((context: RewindAskContext | null) => {
+    setRewindAskContextState((prev) => {
+      if ((prev?.taskMemoryId || null) !== (context?.taskMemoryId || null)) {
+        setRewindAskResult(null)
+        setRewindAskError(null)
+      }
+      return context
+    })
+  }, [])
+
+  const askRewindMemory = useCallback(async (question: string) => {
+    const trimmed = question.trim()
+    if (!trimmed) return
+    if (!rewindAskContextState) {
+      setRewindAskResult(null)
+      setRewindAskError('Build or select a Task Memory first.')
+      return
+    }
+
+    setIsRewindAsking(true)
+    setRewindAskResult(null)
+    setRewindAskError(null)
+    try {
+      const response = await apiClient.askTaskMemory(rewindAskContextState.taskMemoryId, {
+        question: trimmed,
+        markdown: rewindAskContextState.markdown
+      })
+      setRewindAskResult(response)
+    } catch (error) {
+      const message =
+        error instanceof DOMException && error.name === 'AbortError'
+          ? 'Ask timed out. The AI service did not return in time; try again with a narrower Task Memory.'
+          : error instanceof Error
+            ? error.message
+            : 'Ask failed.'
+      setRewindAskError(message)
+    } finally {
+      setIsRewindAsking(false)
+    }
+  }, [rewindAskContextState])
 
   const waitForModelsReady = useCallback(async (timeoutMs: number = 300000) => {
     const startedAt = Date.now()
@@ -240,7 +299,13 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     currentView,
     setCurrentView,
     realtimeSearchResult,
-    setRealtimeSearchResult
+    setRealtimeSearchResult,
+    rewindAskContext: rewindAskContextState,
+    setRewindAskContext,
+    rewindAskResult,
+    rewindAskError,
+    isRewindAsking,
+    askRewindMemory
   }
 
   return (

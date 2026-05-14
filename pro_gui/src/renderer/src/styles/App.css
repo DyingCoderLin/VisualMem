@@ -101,6 +101,63 @@
   z-index: 50;
 }
 
+.rewind-ask-results-wrapper {
+  max-height: 42%;
+}
+
+.markdown-answer-dropdown {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background-color: var(--bg-panel);
+}
+
+.markdown-answer-dropdown.minimized {
+  min-height: auto;
+}
+
+.markdown-answer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--spacing-md);
+  padding: var(--spacing-md);
+  border-bottom: 1px solid var(--border-dim);
+  flex-shrink: 0;
+}
+
+.markdown-answer-title {
+  color: var(--text-accent);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+}
+
+.markdown-answer-subtitle {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  max-width: min(720px, 70vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.markdown-answer-body {
+  padding: var(--spacing-md);
+  overflow-y: auto;
+  line-height: 1.55;
+}
+
+.markdown-answer-loading,
+.markdown-answer-error {
+  color: var(--text-secondary);
+  font-size: var(--font-size-base);
+}
+
+.markdown-answer-error {
+  color: var(--danger);
+}
+
 .view-container {
   flex: 1;
   overflow: hidden;
@@ -1506,12 +1563,40 @@
   font-size: var(--font-size-sm);
 }
 
-.rewind-markdown-editor {
+.rewind-memory-document {
   flex: 1;
   min-height: 0;
   display: flex;
-  padding: var(--spacing-md);
+  flex-direction: column;
+}
+
+.rewind-memory-document-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
   border-bottom: 1px solid var(--border-dim);
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+}
+
+.rewind-markdown-preview,
+.rewind-markdown-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--spacing-md);
+}
+
+.rewind-markdown-preview .markdown-content {
+  line-height: 1.65;
+}
+
+.rewind-markdown-editor {
+  display: flex;
 }
 
 .rewind-markdown-editor textarea {

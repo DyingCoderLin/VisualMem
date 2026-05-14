@@ -10,7 +10,7 @@ Responsibilities:
 """
 
 from datetime import datetime, time, timezone, timedelta
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Set
 import base64
 import io
 import os
@@ -3173,6 +3173,19 @@ _REWIND_RAG_SOURCE_WEIGHTS = {
     "time_range_fallback": 0.45,
 }
 
+_REWIND_SEMANTIC_TERM_MAP = {
+    "女朋友": ["朋友", "聊天", "聊天记录"],
+    "女友": ["女朋友", "朋友", "聊天"],
+    "男朋友": ["朋友", "聊天", "聊天记录"],
+    "男友": ["男朋友", "朋友", "聊天"],
+    "对象": ["朋友", "聊天"],
+    "朋友": ["聊天"],
+    "聊天记录": ["聊天", "对话", "消息"],
+    "聊天": ["聊天记录", "对话", "消息"],
+    "对话": ["聊天", "消息"],
+    "消息": ["聊天", "对话"],
+}
+
 
 def _dedupe_strings(values: List[Any], limit: int = 20) -> List[str]:
     seen = set()
@@ -3210,10 +3223,20 @@ def _rewind_keyword_terms(query: str, sparse_queries: Optional[List[str]] = None
         cleaned = _clean_rewind_keyword(candidate)
         if cleaned:
             terms.append(cleaned)
+            compact = re.sub(r"\s+", "", cleaned)
+            for marker, expansions in _REWIND_SEMANTIC_TERM_MAP.items():
+                if marker in compact:
+                    terms.append(marker)
+                    terms.extend(expansions)
         for token in re.findall(r"[\u4e00-\u9fffA-Za-z0-9_@#.\-]{2,}", str(candidate or "")):
             token = _clean_rewind_keyword(token)
             if len(token) >= 2:
                 terms.append(token)
+                compact_token = re.sub(r"\s+", "", token)
+                for marker, expansions in _REWIND_SEMANTIC_TERM_MAP.items():
+                    if marker in compact_token:
+                        terms.append(marker)
+                        terms.extend(expansions)
     return _dedupe_strings(terms, limit=12)
 
 
@@ -3395,6 +3418,15 @@ def _candidate_activity_sessions_for_plan(
     include_apps, exclude_apps, _include_windows, _exclude_windows = _rewind_filter_app_sets(plan)
     keyword_terms = plan.get("keyword_terms") or []
     sessions: List[Dict[str, Any]] = []
+    fetch_limit = min(max(limit, 20), 160)
+
+    term_sessions = _rewind_activity_sessions_by_terms(
+        keyword_terms,
+        limit=fetch_limit,
+        start_dt=start_dt,
+        end_dt=end_dt,
+    )
+    sessions.extend(term_sessions)
 
     try:
         with sqlite_storage._activity_connection() as conn:
@@ -3416,14 +3448,7 @@ def _candidate_activity_sessions_for_plan(
                 where.append(f"app_name NOT IN ({placeholders})")
                 params.extend(sorted(exclude_apps))
 
-            if not include_apps and keyword_terms:
-                term_clauses = []
-                for term in keyword_terms[:6]:
-                    term_clauses.append("(label LIKE ? ESCAPE '\\' OR app_name LIKE ? ESCAPE '\\')")
-                    params.extend([_like_pattern(term), _like_pattern(term)])
-                where.append("(" + " OR ".join(term_clauses) + ")")
-
-            params.append(min(max(limit, 20), 160))
+            params.append(fetch_limit)
             cursor.execute(
                 f"""
                 SELECT id, app_name, cluster_id, label, start_time, end_time,
@@ -3438,10 +3463,9 @@ def _candidate_activity_sessions_for_plan(
                 """,
                 tuple(params),
             )
-            sessions = [dict(row) for row in cursor.fetchall()]
+            sessions.extend(dict(row) for row in cursor.fetchall())
     except Exception as e:
         logger.debug(f"Rewind candidate activity-session collection failed: {e}")
-        return []
 
     candidates: List[Dict[str, Any]] = []
     seen = set()
@@ -3461,7 +3485,7 @@ def _candidate_activity_sessions_for_plan(
     logger.info(
         "Rewind agentic candidate sessions: "
         f"count={len(candidates)} include_apps={sorted(include_apps)} "
-        f"exclude_apps={sorted(exclude_apps)}"
+        f"exclude_apps={sorted(exclude_apps)} term_seeded={len(term_sessions)}"
     )
     for idx, candidate in enumerate(candidates[:20], start=1):
         logger.info(
@@ -3526,7 +3550,7 @@ def _fallback_rewind_label_score(
     haystack = " ".join([app, label, *windows]).lower()
     terms = [str(term or "").strip().lower() for term in plan.get("keyword_terms") or [] if str(term or "").strip()]
 
-    score = 0.05
+    score = 0.02
     reasons: List[str] = []
     if include_apps and app in include_apps:
         score += 0.35
@@ -3571,8 +3595,21 @@ def _fallback_rewind_label_score(
 
     frame_count = float(session.get("frame_count") or 0)
     if frame_count > 0:
-        score += min(frame_count / 500.0, 0.1)
+        score += min(frame_count / 1000.0, 0.04)
     return min(score, 1.0), "; ".join(reasons) or "fallback_prior"
+
+
+def _rewind_label_score_is_confident(
+    label_result: Optional[Dict[str, Any]],
+    score: float,
+) -> bool:
+    if not label_result or score < 0.12:
+        return False
+    source = str(label_result.get("llm_label_score_source") or "")
+    reason = str(label_result.get("llm_label_reason") or "")
+    if source == "cloud_llm":
+        return True
+    return reason and reason != "fallback_prior"
 
 
 def _score_rewind_label_candidates(
@@ -4285,9 +4322,27 @@ def _frames_for_rewind_span(
                 """
                 SELECT f.frame_id, f.timestamp, f.image_path, f.device_name, f.metadata,
                        f.app_name, f.window_name, f.focused_app_name, f.focused_window_name,
-                       o.text AS ocr_text, o.confidence AS ocr_confidence
+                       COALESCE(
+                           (
+                               SELECT o.text
+                               FROM ocr_text o
+                               WHERE o.frame_id = f.frame_id
+                               ORDER BY o.id ASC
+                               LIMIT 1
+                           ),
+                           ''
+                       ) AS ocr_text,
+                       COALESCE(
+                           (
+                               SELECT o.confidence
+                               FROM ocr_text o
+                               WHERE o.frame_id = f.frame_id
+                               ORDER BY o.id ASC
+                               LIMIT 1
+                           ),
+                           0.0
+                       ) AS ocr_confidence
                 FROM frames f
-                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
                 WHERE f.timestamp >= ? AND f.timestamp <= ?
                   AND f.frame_id LIKE 'frame_%'
                 ORDER BY f.timestamp ASC
@@ -4361,19 +4416,29 @@ def _ocr_snippets_for_rewind_span(
     return _dedupe_strings(snippets, limit=limit)
 
 
+def _ordered_rewind_time_span(
+    start_dt: Optional[datetime],
+    end_dt: Optional[datetime],
+) -> Tuple[Optional[datetime], Optional[datetime], bool]:
+    if start_dt and end_dt and start_dt > end_dt:
+        return end_dt, start_dt, True
+    return start_dt, end_dt, False
+
+
 def _clip_rewind_session_window(
     session_start: Optional[datetime],
     session_end: Optional[datetime],
     hits: List[Dict[str, Any]],
 ) -> Tuple[Optional[datetime], Optional[datetime], bool]:
+    session_start, session_end, was_reordered = _ordered_rewind_time_span(session_start, session_end)
     if not session_start or not session_end:
-        return session_start, session_end, False
+        return session_start, session_end, was_reordered
 
     max_minutes = max(int(config.REWIND_SESSION_MAX_MINUTES or 45), 5)
     max_duration = timedelta(minutes=max_minutes)
     session_duration = session_end - session_start
     if session_duration <= max_duration:
-        return session_start, session_end, False
+        return session_start, session_end, was_reordered
 
     hit_times = [_dt_from_any(hit.get("timestamp")) for hit in hits]
     hit_times = [dt for dt in hit_times if dt is not None]
@@ -4396,12 +4461,16 @@ def _clip_rewind_session_window(
 
     if clipped_end - clipped_start > max_duration:
         clipped_end = clipped_start + max_duration
+    clipped_start, clipped_end, _ = _ordered_rewind_time_span(clipped_start, clipped_end)
     return clipped_start, clipped_end, True
 
 
 def _session_key(session: Dict[str, Any]) -> Tuple[Any, str, str, str]:
+    session_id = session.get("id")
+    if session_id is not None and str(session_id) != "":
+        return ("id", str(session_id), "", "")
     return (
-        session.get("id"),
+        None,
         session.get("app_name") or "",
         session.get("start_time") or "",
         session.get("end_time") or "",
@@ -4544,6 +4613,7 @@ def _segment_from_fallback_hits(
         start_dt = max(start_dt, explicit_start)
     if explicit_end and end_dt:
         end_dt = min(end_dt, explicit_end)
+    start_dt, end_dt, _ = _ordered_rewind_time_span(start_dt, end_dt)
 
     sub_frames: List[Dict[str, Any]] = []
     rep_metadata = _safe_metadata_dict(representative.get("metadata"))
@@ -4907,9 +4977,22 @@ def _fuse_rewind_label_and_rag(
         )
         label_result = group.get("label_result")
         llm_score = float((label_result or {}).get("llm_label_score") or 0.0)
+        if label_result is None:
+            alignment_score, alignment_reason = _fallback_rewind_label_score(query, plan, session)
+            if alignment_score >= 0.12:
+                label_result = {
+                    "llm_label_score": alignment_score,
+                    "llm_label_reason": alignment_reason,
+                    "llm_label_score_source": "fallback_rag_alignment",
+                    "fallback_label_score": alignment_score,
+                    "fallback_label_reason": alignment_reason,
+                }
+                llm_score = alignment_score
         rag_score = _aggregate_rewind_rag_score(hits)
-        intersection = bool(label_result and hits)
-        final_score = llm_score * 0.45 + rag_score * 0.45 + (0.10 if intersection else 0.0)
+        label_confident = _rewind_label_score_is_confident(label_result, llm_score)
+        intersection = bool(label_confident and hits)
+        rag_weight = 0.45 if label_confident else 0.12
+        final_score = llm_score * 0.45 + rag_score * rag_weight + (0.10 if intersection else 0.0)
         if not hits and llm_score < 0.12:
             continue
         segment = _segment_from_activity_session(
@@ -5096,10 +5179,19 @@ def _normalize_rewind_segment(segment: Any) -> Dict[str, Any]:
     timestamp = _ts_to_iso(data.get("timestamp") or data.get("start_time") or data.get("end_time"))
     start_time = _ts_to_iso(data.get("start_time") or timestamp)
     end_time = _ts_to_iso(data.get("end_time") or timestamp)
+    start_dt, end_dt, reordered = _ordered_rewind_time_span(
+        _dt_from_any(start_time),
+        _dt_from_any(end_time),
+    )
+    if reordered:
+        start_time = _ts_to_iso(start_dt)
+        end_time = _ts_to_iso(end_dt)
     frame_id = data.get("frame_id")
     segment_id = data.get("segment_id") or frame_id or f"segment_{uuid.uuid4().hex[:10]}"
 
     metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    if reordered:
+        metadata = {**metadata, "time_order_normalized": True}
     normalized = {
         "segment_id": str(segment_id),
         "frame_id": str(frame_id) if frame_id else None,
@@ -5185,6 +5277,44 @@ def _segment_sort_key(segment: Dict[str, Any]) -> str:
     return str(segment.get("start_time") or segment.get("timestamp") or "")
 
 
+def _rewind_segment_identity(segment: Dict[str, Any]) -> str:
+    segment_id = segment.get("segment_id")
+    if segment_id:
+        return f"segment:{segment_id}"
+    frame_id = segment.get("frame_id")
+    if frame_id:
+        return f"frame:{frame_id}"
+    return "|".join(
+        [
+            "span",
+            str(segment.get("app_name") or ""),
+            str(segment.get("window_name") or ""),
+            str(segment.get("start_time") or ""),
+            str(segment.get("end_time") or ""),
+        ]
+    )
+
+
+def _dedupe_rewind_segments(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: Set[str] = set()
+    deduped: List[Dict[str, Any]] = []
+    removed: List[str] = []
+    for segment in segments:
+        key = _rewind_segment_identity(segment)
+        if key in seen:
+            removed.append(key)
+            continue
+        seen.add(key)
+        deduped.append(segment)
+    if removed:
+        logger.info(
+            "Deduped Rewind segments: removed=%d duplicate_keys=%s",
+            len(removed),
+            removed[:20],
+        )
+    return deduped
+
+
 def _merge_rewind_evidence_refs(
     segments: List[Dict[str, Any]],
     explicit_refs: Optional[List[Any]] = None,
@@ -5266,9 +5396,27 @@ def _merge_rewind_evidence_refs(
 def _format_segment_time(segment: Dict[str, Any]) -> str:
     start = segment.get("start_time") or segment.get("timestamp") or ""
     end = segment.get("end_time") or segment.get("timestamp") or ""
+    start_text = _format_rewind_prompt_time(start)
+    end_text = _format_rewind_prompt_time(end)
     if not end or end == start:
-        return start
-    return f"{start} -> {end}"
+        return start_text
+    return f"{start_text} -> {end_text}"
+
+
+def _format_rewind_prompt_time(value: Any) -> str:
+    if value is None:
+        return ""
+    raw = _ts_to_iso(value)
+    if not raw:
+        return ""
+    try:
+        dt = _dt_from_any(raw)
+        if not dt:
+            return raw
+        local_dt = dt.astimezone()
+        return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z%z")
+    except Exception:
+        return raw
 
 
 def _format_timeline_evidence(segments: List[Dict[str, Any]]) -> str:
@@ -5291,7 +5439,10 @@ def _format_timeline_evidence(segments: List[Dict[str, Any]]) -> str:
         metadata = segment.get("metadata") if isinstance(segment.get("metadata"), dict) else {}
         frame_refs = [ref for ref in metadata.get("timeline_frame_refs") or [] if isinstance(ref, dict)]
         if frame_refs:
-            ref_times = [str(ref.get("timestamp") or ref.get("frame_id") or "") for ref in frame_refs[:6]]
+            ref_times = [
+                _format_rewind_prompt_time(ref.get("timestamp")) or str(ref.get("frame_id") or "")
+                for ref in frame_refs[:6]
+            ]
             more = f"; +{len(frame_refs) - 6} more" if len(frame_refs) > 6 else ""
             lines.append(f"   Timeline frames: {'; '.join(ref_times)}{more}")
         ocr = _clip_one_line(segment.get("ocr_text"), 700)
@@ -5302,7 +5453,9 @@ def _format_timeline_evidence(segments: List[Dict[str, Any]]) -> str:
             sub_parts = []
             for sf in sub_frames[:6]:
                 label = " / ".join([p for p in [sf.get("app_name"), sf.get("window_name")] if p])
-                sub_parts.append(f"{sf.get('sub_frame_id')} ({label or 'window'})")
+                sf_time = _format_rewind_prompt_time(sf.get("timestamp"))
+                time_suffix = f", {sf_time}" if sf_time else ""
+                sub_parts.append(f"{sf.get('sub_frame_id')} ({label or 'window'}{time_suffix})")
             more = f"; +{len(sub_frames) - 6} more" if len(sub_frames) > 6 else ""
             lines.append(f"   Window evidence: {'; '.join(sub_parts)}{more}")
     return "\n".join(lines) if lines else "(No timeline evidence selected.)"
@@ -5314,7 +5467,7 @@ def _format_evidence_refs(refs: List[Dict[str, Any]]) -> str:
         target = ref.get("sub_frame_id") or ref.get("frame_id") or ref.get("image_path") or "evidence"
         lines.append(f"{idx}. Ref: {target}")
         if ref.get("timestamp"):
-            lines.append(f"   Time: {ref['timestamp']}")
+            lines.append(f"   Time: {_format_rewind_prompt_time(ref['timestamp'])}")
         app_window = " / ".join([p for p in [ref.get("app_name"), ref.get("window_name")] if p])
         if app_window:
             lines.append(f"   Window: {app_window}")
@@ -5629,6 +5782,7 @@ def rewind_search_segments(req: RewindSearchRequest):
         end_time=req.end_time,
         top_k=req.top_k,
     )
+    segments = _dedupe_rewind_segments(segments)
     return RewindSearchResponse(query=req.query, segments=segments)
 
 
@@ -5641,8 +5795,13 @@ def rewind_timeline_frames(req: RewindTimelineFramesRequest):
     end_dt = _parse_optional_dt(req.end_time)
     if not start_dt or not end_dt:
         raise HTTPException(status_code=400, detail="start_time and end_time are required")
-    if start_dt > end_dt:
-        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+    start_dt, end_dt, reordered = _ordered_rewind_time_span(start_dt, end_dt)
+    if reordered:
+        logger.warning(
+            "Rewind timeline frame request had inverted time range; normalized start/end: %s -> %s",
+            req.start_time,
+            req.end_time,
+        )
 
     limit = min(max(int(req.limit or 36), 1), 120)
     offset = max(int(req.offset or 0), 0)
@@ -5670,9 +5829,17 @@ def rewind_timeline_frames(req: RewindTimelineFramesRequest):
                     f.frame_id,
                     f.timestamp,
                     f.image_path,
-                    o.text AS ocr_text
+                    COALESCE(
+                        (
+                            SELECT o.text
+                            FROM ocr_text o
+                            WHERE o.frame_id = f.frame_id
+                            ORDER BY o.id ASC
+                            LIMIT 1
+                        ),
+                        ''
+                    ) AS ocr_text
                 FROM frames f
-                LEFT JOIN ocr_text o ON f.frame_id = o.frame_id
                 WHERE f.timestamp >= ? AND f.timestamp <= ?
                   AND f.frame_id LIKE 'frame_%'
                   AND f.image_path IS NOT NULL AND f.image_path != ''

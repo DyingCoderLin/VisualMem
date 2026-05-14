@@ -8,12 +8,21 @@ import Settings from './pages/Settings'
 import DailyReportView from './pages/DailyReportView'
 import RewindView from './pages/RewindView'
 import SearchResults from './components/SearchResults'
+import MarkdownAnswerDropdown from './components/MarkdownAnswerDropdown'
 import { SearchResult } from './components/SearchBar'
 import { AppStoreProvider, useAppStore } from './store/AppStore'
 
 function AppContent() {
-  const { currentView, setCurrentView } = useAppStore()
+  const {
+    currentView,
+    setCurrentView,
+    rewindAskContext,
+    rewindAskResult,
+    rewindAskError,
+    isRewindAsking
+  } = useAppStore()
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
+  const hasRewindAskOutput = Boolean(isRewindAsking || rewindAskResult || rewindAskError)
 
   const handleClearSearch = () => {
     setSearchResult(null)
@@ -26,10 +35,27 @@ function AppContent() {
         <TopBar onSearchResult={setSearchResult} />
         <div className="content-area">
           {/* 全局搜索结果 - 仅在非实时追踪页面显示 */}
-          {searchResult && currentView !== 'realtime' && currentView !== 'daily' && currentView !== 'rewind' && (
-            <div className="global-search-results-wrapper">
+          {searchResult && (
+            <div
+              className="global-search-results-wrapper"
+              style={{ display: currentView === 'timeline' ? undefined : 'none' }}
+            >
               <SearchResults 
                 result={searchResult} 
+              />
+            </div>
+          )}
+          {hasRewindAskOutput && (
+            <div
+              className="global-search-results-wrapper rewind-ask-results-wrapper"
+              style={{ display: currentView === 'rewind' ? undefined : 'none' }}
+            >
+              <MarkdownAnswerDropdown
+                title="Ask with this memory"
+                subtitle={rewindAskContext?.title}
+                content={rewindAskResult?.answer}
+                error={rewindAskError}
+                isLoading={isRewindAsking}
               />
             </div>
           )}
