@@ -3,7 +3,7 @@ name = "screencap_rs"
 version = "0.1.0"
 edition = "2021"
 description = "Cross-platform screen and window capture with Python bindings"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 name = "screencap_rs"

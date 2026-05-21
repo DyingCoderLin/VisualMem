@@ -3,7 +3,6 @@
 音频 Embedding 模块
 
 用于说话人识别（Speaker Diarization）
-参考 screenpipe 的 speaker embedding 逻辑
 """
 
 from typing import List, Optional
@@ -156,4 +155,3 @@ def compare_speaker_embeddings(emb1: np.ndarray, emb2: np.ndarray) -> float:
     similarity = dot_product / (norm1 * norm2)
     # 归一化到 0-1
     return (similarity + 1) / 2
-

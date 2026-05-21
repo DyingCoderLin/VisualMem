@@ -6,8 +6,6 @@
 1. Dense Search: 纯语义搜索
 2. Sparse Search: FTS (BM25) 关键词搜索
 3. Hybrid Search: 混合搜索 + Reranker
-
-模仿 screenpipe 的 RAG 实现
 """
 
 import sys

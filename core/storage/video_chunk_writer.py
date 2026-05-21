@@ -5,8 +5,6 @@ Video Chunk Writer Module
 Writes frames to MP4 video files for efficient storage.
 This is purely for storage compression - embedding is still done per-frame.
 FFmpeg is used to extract frames when querying.
-
-Reference: screenpipe's video.rs
 """
 import os
 import io

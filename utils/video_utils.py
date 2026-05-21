@@ -5,8 +5,6 @@ Video Utilities Module
 Provides utilities for extracting frames from video chunks at query time.
 Used to retrieve individual frames from MP4 storage when needed for
 VLM analysis or display.
-
-Reference: screenpipe's video_utils.rs
 """
 import os
 import subprocess

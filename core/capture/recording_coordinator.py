@@ -9,8 +9,6 @@ Orchestrates the complete capture-to-storage pipeline:
 4. Run OCR on changed frames
 5. Generate embeddings
 6. Store metadata and mappings to database
-
-Reference: screenpipe's core.rs for the recording coordination pattern
 """
 import uuid
 import asyncio

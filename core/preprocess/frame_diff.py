@@ -7,7 +7,6 @@ Implements independent frame difference detection for:
 2. Individual application windows
 
 Uses a combination of histogram comparison and SSIM for accuracy.
-Reference: screenpipe's utils.rs compare_images_histogram and compare_images_ssim
 """
 import numpy as np
 from typing import Dict, Optional, Tuple, List
@@ -120,7 +119,7 @@ def compare_histograms(hist1: np.ndarray, hist2: np.ndarray, metric: str = "hell
         Difference score (0.0 = identical, higher = more different)
     """
     if metric == "hellinger":
-        # Hellinger distance (similar to screenpipe)
+        # Hellinger distance
         # Range: [0, 1] where 0 = identical, 1 = completely different
         return np.sqrt(0.5 * np.sum((np.sqrt(hist1) - np.sqrt(hist2)) ** 2))
     

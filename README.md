@@ -97,6 +97,9 @@ Ready to set up VisualMem? Follow our step-by-step guide:
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
+## License
+
+VisualMem is licensed under the Apache License 2.0. See [LICENSE](./LICENSE).
+
 ---
 *VisualMem - Recording reality, one pixel at a time.*
-

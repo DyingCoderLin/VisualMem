@@ -8,8 +8,6 @@
 3. 存储到 LanceDB 用于语义搜索
 4. 创建 FTS 索引用于关键词搜索
 5. 支持 Dense、Sparse、Hybrid 三种检索方式
-
-模仿 screenpipe 的 RAG 实现
 """
 
 import sys

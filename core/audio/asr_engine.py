@@ -1,8 +1,6 @@
 # core/audio/asr_engine.py
 """
 ASR (Automatic Speech Recognition) 引擎
-
-参考 screenpipe 的 audio transcription 逻辑
 """
 
 from typing import Optional
@@ -55,7 +53,6 @@ class WhisperASR(ASREngine):
     使用 Whisper 的 ASR 引擎
     
     Whisper 是 OpenAI 的开源语音识别模型
-    参考 screenpipe 使用 whisper.cpp
     """
     
     def __init__(self, model_size: str = "base", language: str = "zh"):
@@ -164,4 +161,3 @@ def create_asr_engine(engine_type: str = "whisper", **kwargs) -> ASREngine:
     else:
         logger.warning(f"Unknown ASR engine: {engine_type}, using dummy")
         return DummyASR()
-

@@ -5,8 +5,6 @@ Window-level screen capture module
 Captures both full screen and individual application windows.
 Uses Rust bindings (screencap_rs) for cross-platform support (macOS, Windows, Linux).
 Falls back to pure Python implementation on Linux if Rust module not available.
-
-Reference: screenpipe's capture_screenshot_by_window.rs
 """
 import datetime
 import hashlib

@@ -1,7 +1,7 @@
 """
 文本检索器 - 支持 Dense、Sparse、Hybrid 三种检索方式
 
-模仿 screenpipe 和 LanceDB 的混合搜索实现
+基于 LanceDB 的混合搜索实现
 - Dense: 纯向量语义搜索
 - Sparse: FTS (BM25) 关键词搜索
 - Hybrid: 结合 Dense + Sparse，使用 Reranker 重排序

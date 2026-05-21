@@ -1,7 +1,6 @@
 //! Cross-platform screen and window capture module with Python bindings
 //!
 //! Supports: macOS, Windows, Linux
-//! Reference: screenpipe's capture_screenshot_by_window.rs
 
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
@@ -19,7 +18,7 @@ static SKIP_KEYWORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     HashSet::from([
         "bit", "vpn", "trash", "private", "incognito", "wallpaper",
         "settings", "keepass", "recorder", "vaults", "obs studio",
-        "screenpipe", "visualmem",
+        "visualmem",
     ])
 });
 

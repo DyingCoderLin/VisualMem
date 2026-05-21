@@ -97,5 +97,9 @@ VisualMem 不仅仅是一个录屏工具，它是你的**第二大脑**：
 
 欢迎提交 Issue 或 Pull Request 来完善这个项目。
 
+## 许可证
+
+VisualMem 使用 Apache License 2.0 许可。详见 [LICENSE](./LICENSE)。
+
 ---
 *VisualMem - 记录现实，一次一个像素。*
