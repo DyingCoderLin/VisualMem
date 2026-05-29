@@ -26,6 +26,7 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
     isRecording,
     isWarmingUp,
     isModelLoading,
+    ensureModelsReady,
     startRecording,
     stopRecording,
     recordingMode,
@@ -51,6 +52,11 @@ const SearchBar: React.FC<SearchBarProps> = ({ onSearchResult }) => {
 
     setIsSearching(true)
     try {
+      await ensureModelsReady()
+      if (abortController.signal.aborted) {
+        return
+      }
+
       let startTime = undefined as string | undefined
       let endTime = undefined as string | undefined
 

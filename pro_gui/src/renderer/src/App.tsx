@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import { useState } from 'react'
 import Sidebar from './components/Sidebar'
 import TopBar from './components/TopBar'
 import TimelineView from './pages/TimelineView'
@@ -13,10 +13,6 @@ import { AppStoreProvider, useAppStore } from './store/AppStore'
 function AppContent() {
   const { currentView, setCurrentView } = useAppStore()
   const [searchResult, setSearchResult] = useState<SearchResult | null>(null)
-
-  const handleClearSearch = () => {
-    setSearchResult(null)
-  }
 
   return (
     <div className="app-container">

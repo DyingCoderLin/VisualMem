@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react'
+import React from 'react'
 import { apiClient } from '../services/api'
 
 interface Frame {

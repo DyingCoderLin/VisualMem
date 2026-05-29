@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut } from 'el
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
-import { existsSync, writeFileSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import * as http from 'http'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -14,8 +14,8 @@ let mainWindow: BrowserWindow | null = null
 let pythonProcess: ChildProcess | null = null
 let isDownloading = false
 let isLoadingModel = false  // 模型正在加载到内存
-let isStartingUp = true
 const BACKEND_PORT = 18080
+let backendFailureLogPrinted = false
 
 // 禁用 Chromium 会发起外部 HTTPS 的内置功能，避免在控制台打印 SSL handshake failed / net_error -101
 app.commandLine.appendSwitch('disable-features', [
@@ -131,6 +131,30 @@ function findProjectRoot(): string {
   return isDev ? join(__dirname, '../../..') : join(__dirname, '../../../..')
 }
 
+function printBackendFailureLog(rootDir: string): void {
+  if (backendFailureLogPrinted) {
+    return
+  }
+  backendFailureLogPrinted = true
+
+  const logPath = join(rootDir, 'logs', 'backend_server.log')
+  console.error(`\nBackend startup failed. Last log lines from: ${logPath}`)
+
+  if (!existsSync(logPath)) {
+    console.error('Backend log file was not created.')
+    return
+  }
+
+  try {
+    const content = readFileSync(logPath, 'utf8')
+    const lines = content.trimEnd().split(/\r?\n/)
+    const tail = lines.slice(-80).join('\n')
+    console.error(tail || '(backend log is empty)')
+  } catch (error) {
+    console.error('Failed to read backend log:', error)
+  }
+}
+
 function checkBackendHealth(): Promise<boolean> {
   return new Promise((resolve) => {
     // 使用 127.0.0.1 而不是 localhost，避免 IPv6 连接问题
@@ -185,6 +209,7 @@ function checkBackendHealth(): Promise<boolean> {
 
 async function waitForBackend(maxRetries: number = 180, interval: number = 1000): Promise<boolean> {
   console.log('\nWaiting for backend to be ready...')
+  const rootDir = findProjectRoot()
   
   let retries = 0
   // 在下载或加载模型时不计入超时
@@ -195,23 +220,14 @@ async function waitForBackend(maxRetries: number = 180, interval: number = 1000)
       return true
     }
     
-    if (isDownloading || isLoadingModel) {
-      // 在下载或加载模型时，不增加重试计数器
-      // 每30秒打印一次状态
-      if (retries % 30 === 0 && retries > 0) {
-        if (isDownloading) {
-          console.log('⏳ Still downloading model...')
-        } else if (isLoadingModel) {
-          console.log('⏳ Still loading model into memory (this may take 1-2 minutes on first run)...')
-        }
-      }
-    } else {
+    if (!isDownloading && !isLoadingModel) {
       retries++
     }
     
     // Check if process is still alive
     if (pythonProcess && pythonProcess.exitCode !== null) {
-      console.error(`❌ Backend process exited with code ${pythonProcess.exitCode}. Check logs/backend_server.log for details.`)
+      console.error(`Backend process exited with code ${pythonProcess.exitCode}.`)
+      printBackendFailureLog(rootDir)
       return false
     }
     
@@ -245,6 +261,7 @@ function startPythonBackend(): Promise<void> {
     return new Promise((resolve, reject) => {
       console.log('Starting Python backend...')
       console.log(`Backend logs are written directly by Python to: ${join(rootDir, 'logs', 'backend_server.log')}`)
+      backendFailureLogPrinted = false
 
       pythonProcess = spawn('python', [pythonScript], {
         cwd: rootDir,
@@ -260,49 +277,35 @@ function startPythonBackend(): Promise<void> {
       // Python now writes logs directly to file (not through this pipe).
       // We still read stdout/stderr to detect startup phases and drain the pipe
       // so the buffer never fills up and blocks the Python process.
-      const handleOutput = (data: Buffer, isStderr: boolean) => {
-        const str = data.toString()
-        if (isStartingUp) {
-          if (isStderr) {
-            process.stderr.write(data)
-          } else {
-            process.stdout.write(data)
-          }
-        }
+      const handleOutput = (data: Buffer) => {
+        const str = data.toString('utf8')
 
         if (str.includes('Starting download')) {
-          if (!isDownloading) {
-            isDownloading = true
-            console.log('⏳ Detected model download, waiting for it to complete...')
-          }
+          isDownloading = true
         }
 
         if (str.includes('download complete!')) {
-          console.log('✅ A model download has finished!')
+          isDownloading = false
         }
 
         if (str.includes('Loading encoder') && str.includes('[1/')) {
-          console.log('🚀 All pre-flight downloads finished. Backend is now loading models into memory...')
-          console.log('⏳ This may take 1-2 minutes on first run (loading 2B+ parameter model)...')
           isDownloading = false
           isLoadingModel = true
         }
 
         if (str.includes('All backend components initialized successfully!')) {
-          console.log('✅ All models loaded successfully!')
           isLoadingModel = false
-          isStartingUp = false
         }
       }
 
       if (pythonProcess.stdout) {
-        pythonProcess.stdout.on('data', (data) => handleOutput(data, false))
+        pythonProcess.stdout.on('data', (data) => handleOutput(data))
         // Drain stdout continuously — do NOT pipe to a file (Python writes its own log).
         // Just consuming 'data' events is enough to keep the pipe buffer from filling up.
         pythonProcess.stdout.resume()
       }
       if (pythonProcess.stderr) {
-        pythonProcess.stderr.on('data', (data) => handleOutput(data, true))
+        pythonProcess.stderr.on('data', (data) => handleOutput(data))
         pythonProcess.stderr.resume()
       }
 
@@ -313,6 +316,9 @@ function startPythonBackend(): Promise<void> {
 
       pythonProcess.on('exit', (code) => {
         console.log(`Python backend exited with code ${code}`)
+        if (code !== 0) {
+          printBackendFailureLog(rootDir)
+        }
         pythonProcess = null
         // 如果后端退出，前端也退出
         app.quit()

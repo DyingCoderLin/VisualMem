@@ -41,6 +41,8 @@ from core.storage.temp_frame_buffer import TempFrameBuffer, FrameInfo
 from core.storage.ffmpeg_utils import (
     FFmpegFrameCompressor,
     FFmpegFrameExtractor,
+    find_ffmpeg_path,
+    find_ffprobe_path,
     get_video_frame_as_base64,
 )
 from core.retrieval.query_llm_utils import rewrite_and_time, filter_by_time
@@ -698,6 +700,13 @@ def _recover_temp_frames():
     global temp_frame_buffer, ffmpeg_compressor, sqlite_storage
     if not sqlite_storage or not ffmpeg_compressor or not temp_frame_buffer:
         return
+
+    if not ffmpeg_compressor.ffmpeg_path:
+        logger.warning(
+            "Skipping leftover temp frame recovery because FFmpeg is not available. "
+            "Install FFmpeg and restart VisualMem to recover and compress these frames."
+        )
+        return
         
     try:
         from collections import defaultdict
@@ -823,12 +832,7 @@ def _init_components():
 
     global ocr_engine, region_ocr_engine
     if ocr_engine is None and config.ENABLE_OCR:
-        try:
-            ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
-            logger.info(f"OCR engine initialized ({config.OCR_ENGINE_TYPE}).")
-        except Exception as e:
-            logger.warning(f"Failed to init OCR engine, fallback to dummy: {e}")
-            ocr_engine = create_ocr_engine("dummy")
+        _init_ocr_engine()
 
     _init_region_ocr_engine()
 
@@ -1011,6 +1015,57 @@ def _init_region_ocr_engine() -> None:
         region_ocr_engine = None
 
 
+def _init_ocr_engine() -> None:
+    """Initialize OCR once; fail fast when unavailable."""
+    global ocr_engine
+
+    if not config.ENABLE_OCR or ocr_engine is not None:
+        return
+
+    logger.info(f"Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
+    ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
+    if getattr(ocr_engine, "engine_name", "") == "dummy":
+        raise RuntimeError(
+            "OCR is enabled but OCR_ENGINE_TYPE resolved to dummy. "
+            "Configure a real OCR engine."
+        )
+    logger.info(f"OCR engine initialized: {ocr_engine.engine_name}")
+
+
+def _require_runtime_dependencies() -> None:
+    """Fail startup when required external runtime dependencies are missing."""
+    missing = []
+    if not find_ffmpeg_path():
+        missing.append(
+            "FFmpeg executable not found. Install FFmpeg and make sure it is available in PATH."
+        )
+    if not find_ffprobe_path():
+        missing.append(
+            "FFprobe executable not found. Install FFmpeg/FFprobe and make sure it is available in PATH."
+        )
+
+    if missing:
+        raise RuntimeError("Required video dependency check failed:\n- " + "\n- ".join(missing))
+
+    if config.ENABLE_OCR:
+        try:
+            _init_ocr_engine()
+        except Exception as e:
+            raise RuntimeError(
+                "OCR is enabled but no usable OCR engine could be initialized. "
+                "Install/configure Windows OCR (`python -m pip install winocr`, "
+                "OCR_ENGINE_TYPE=windows_ocr), or install Tesseract for pytesseract."
+            ) from e
+
+
+def _ensure_models_ready(_operation: str) -> None:
+    """Load shared ML models before any operation that needs embeddings."""
+    if _models_loaded:
+        return
+
+    _init_models()
+
+
 def _init_models():
     """
     Load heavy ML models: encoder, reranker, OCR engine.
@@ -1032,7 +1087,7 @@ def _init_models():
         )
 
         try:
-            # 0. Pre-flight check: Ensure models are downloaded
+            # 0. Ensure model files exist before loading them into memory.
             ensure_model_downloaded(config.EMBEDDING_MODEL, "Image Encoder")
             if config.ENABLE_RERANK:
                 ensure_model_downloaded(config.RERANK_MODEL, "Reranker Model")
@@ -1068,12 +1123,8 @@ def _init_models():
 
             # 4. Initialize OCR engine (if enabled)
             if config.ENABLE_OCR:
-                logger.info(f"[model 4/4] Initializing OCR engine ({config.OCR_ENGINE_TYPE})...")
-                try:
-                    ocr_engine = create_ocr_engine(config.OCR_ENGINE_TYPE, lang="chi_sim+eng")
-                except Exception as e:
-                    logger.warning(f"Failed to init OCR engine ({config.OCR_ENGINE_TYPE}), fallback to dummy: {e}")
-                    ocr_engine = create_ocr_engine("dummy")
+                logger.info("[model 4/4] Initializing OCR engine...")
+                _init_ocr_engine()
                 _init_region_ocr_engine()
             else:
                 logger.info("[model 4/4] OCR engine disabled (ENABLE_OCR=False)")
@@ -1189,13 +1240,14 @@ def _init_infra():
 def _init_all_components():
     """
     Initialize all components. Respects MODEL_LAZY_LOAD config:
-    - When true: only loads infra at startup, models loaded on-demand
+    - When true: loads infra at startup, models loaded into memory on-demand
     - When false: loads everything eagerly at startup (original behavior)
     """
+    _require_runtime_dependencies()
     _init_infra()
 
     if config.MODEL_LAZY_LOAD:
-        logger.info("MODEL_LAZY_LOAD=true: Deferring ML model loading until recording starts.")
+        logger.info("MODEL_LAZY_LOAD=true: Deferring ML model loading until search or recording starts.")
     else:
         logger.info("MODEL_LAZY_LOAD=false: Loading ML models eagerly at startup...")
         _init_models()
@@ -1463,7 +1515,7 @@ def get_frontend_config():
 async def load_models_api():
     """
     On-demand loading of heavy ML models (encoder, reranker, OCR).
-    Called by frontend before starting recording when MODEL_LAZY_LOAD=true.
+    Called by frontend before search or recording when MODEL_LAZY_LOAD=true.
     Returns immediately if models are already loaded.
     """
     try:
@@ -1603,6 +1655,8 @@ def store_frame(req: StoreFrameRequest):
 
     _t0 = time_module.time()
     logger.info(f"store_frame: START {req.frame_id}")
+
+    _ensure_models_ready("/api/store_frame")
 
     assert encoder is not None
     assert vector_storage is not None
@@ -2438,6 +2492,8 @@ def query_rag_with_time(req: QueryRagWithTimeRequest):
     Perform RAG query with time range filtering, rerank, and VLM analysis.
     Mirrors CLI / GUI RAG-with-time behavior, but returns JSON for remote GUI.
     """
+    _ensure_models_ready("/api/query_rag_with_time")
+
     # 组件已在启动时预加载，直接使用
     assert encoder is not None
     assert vector_storage is not None

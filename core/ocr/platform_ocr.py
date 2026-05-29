@@ -140,6 +140,11 @@ class WindowsOCR(OCREngine):
         try:
             import winocr
             self._winocr = winocr
+            if not (
+                hasattr(winocr, "recognize_pil_sync")
+                or hasattr(winocr, "recognize_pil")
+            ):
+                raise ImportError("installed winocr does not expose recognize_pil APIs")
             logger.info(f"Windows OCR initialized with lang={lang}")
         except ImportError:
             raise ImportError(
@@ -147,22 +152,25 @@ class WindowsOCR(OCREngine):
                 "  pip install winocr"
             )
 
+    def _recognize_pil(self, image: Image.Image) -> dict:
+        if hasattr(self._winocr, "recognize_pil_sync"):
+            return self._winocr.recognize_pil_sync(image, lang=self.lang)
+
+        import asyncio
+
+        async def _run():
+            result = await self._winocr.recognize_pil(image, lang=self.lang)
+            if hasattr(self._winocr, "picklify"):
+                return self._winocr.picklify(result)
+            return result
+
+        return asyncio.run(_run())
+
     def recognize(self, image: Image.Image) -> OCRResult:
         """Run Windows UWP OCR on a PIL Image."""
-        import asyncio
-        import io
-
         start = time.perf_counter()
         try:
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-
-            loop = asyncio.new_event_loop()
-            result = loop.run_until_complete(
-                self._winocr.recognize_png(png_bytes, lang=self.lang)
-            )
-            loop.close()
+            result = self._recognize_pil(image)
 
             texts = []
             words = []

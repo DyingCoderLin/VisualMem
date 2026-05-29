@@ -4,10 +4,17 @@
   "description": "VisualMem Professional - Advanced Electron UI",
   "main": "out/main/index.js",
   "scripts": {
+    "postinstall": "node scripts/ensure-electron.cjs",
+    "ensure:electron": "node scripts/ensure-electron.cjs",
+    "predev": "node scripts/ensure-electron.cjs",
     "dev": "electron-vite dev",
-    "dev:no-devtools": "OPEN_DEVTOOLS=false electron-vite dev",
+    "predev:no-devtools": "node scripts/ensure-electron.cjs",
+    "dev:no-devtools": "node scripts/dev-no-devtools.cjs",
+    "prebuild": "node scripts/ensure-electron.cjs",
     "build": "electron-vite build",
+    "prepreview": "node scripts/ensure-electron.cjs",
     "preview": "electron-vite preview",
+    "prestart": "node scripts/ensure-electron.cjs",
     "start": "electron ."
   },
   "keywords": [

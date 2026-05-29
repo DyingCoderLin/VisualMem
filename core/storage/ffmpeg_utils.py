@@ -22,6 +22,11 @@ from utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+def _decode_process_output(data: bytes) -> str:
+    """Decode subprocess output without failing on Windows local-codepage bytes."""
+    return data.decode("utf-8", errors="replace")
+
+
 def _find_executable(name: str, common_paths: List[str]) -> Optional[str]:
     """Find an executable in a cross-platform way."""
     path = shutil.which(name)
@@ -33,10 +38,10 @@ def _find_executable(name: str, common_paths: List[str]) -> Optional[str]:
         result = subprocess.run(
             [lookup_cmd, name],
             capture_output=True,
-            text=True
         )
         if result.returncode == 0:
-            first_match = result.stdout.strip().splitlines()[0].strip()
+            stdout = _decode_process_output(result.stdout)
+            first_match = stdout.strip().splitlines()[0].strip()
             if first_match:
                 return first_match
     except Exception:
@@ -78,6 +83,22 @@ def find_ffprobe_path() -> Optional[str]:
 # Cache paths
 _FFMPEG_PATH = find_ffmpeg_path()
 _FFPROBE_PATH = find_ffprobe_path()
+_FFMPEG_MISSING_LOGGED = False
+_FFPROBE_MISSING_LOGGED = False
+
+
+def _log_ffmpeg_missing_once() -> None:
+    global _FFMPEG_MISSING_LOGGED
+    if not _FFMPEG_MISSING_LOGGED:
+        logger.error("FFmpeg not available")
+        _FFMPEG_MISSING_LOGGED = True
+
+
+def _log_ffprobe_missing_once() -> None:
+    global _FFPROBE_MISSING_LOGGED
+    if not _FFPROBE_MISSING_LOGGED:
+        logger.error("FFprobe not available")
+        _FFPROBE_MISSING_LOGGED = True
 
 
 class FFmpegFrameCompressor:
@@ -101,7 +122,7 @@ class FFmpegFrameCompressor:
         self.ffmpeg_path = _FFMPEG_PATH
         
         if not self.ffmpeg_path:
-            logger.error("FFmpeg not found. Video compression will not work.")
+            _log_ffmpeg_missing_once()
     
     def compress_from_files(
         self,
@@ -119,7 +140,7 @@ class FFmpegFrameCompressor:
             True if successful
         """
         if not self.ffmpeg_path:
-            logger.error("FFmpeg not available")
+            _log_ffmpeg_missing_once()
             return False
         
         if not input_files:
@@ -197,7 +218,7 @@ class FFmpegFrameCompressor:
             True if successful
         """
         if not self.ffmpeg_path:
-            logger.error("FFmpeg not available")
+            _log_ffmpeg_missing_once()
             return False
         
         if not images:
@@ -273,7 +294,7 @@ class FFmpegFrameExtractor:
         self.ffprobe_path = _FFPROBE_PATH
         
         if not self.ffmpeg_path:
-            logger.error("FFmpeg not found. Frame extraction will not work.")
+            _log_ffmpeg_missing_once()
     
     def get_video_info(self, video_path: str) -> Optional[dict]:
         """
@@ -283,7 +304,7 @@ class FFmpegFrameExtractor:
             Dict with fps, duration, frame_count, width, height
         """
         if not self.ffprobe_path:
-            logger.error("FFprobe not available")
+            _log_ffprobe_missing_once()
             return None
         
         try:
@@ -348,7 +369,7 @@ class FFmpegFrameExtractor:
             PIL Image or None if failed
         """
         if not self.ffmpeg_path:
-            logger.error("FFmpeg not available")
+            _log_ffmpeg_missing_once()
             return None
         
         if not os.path.exists(video_path):

@@ -36,7 +36,6 @@ class RecordingService {
   private liveRecording: boolean = false
   private frameCounter: number = 0 // 计数器：0-10，每成功发送 10 帧后刷新数据
   private statusListeners: ((status: RecordingStatus) => void)[] = []
-  private pendingRequests: Set<AbortController> = new Set() // 跟踪正在进行的请求
 
   // 发送队列：每个显示器独立一条队列 + 一个并行 in-flight HTTP 请求。
   //

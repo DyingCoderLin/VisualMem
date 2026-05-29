@@ -68,10 +68,16 @@ class PytesseractOCR(OCREngine):
         try:
             import pytesseract
             self.pytesseract = pytesseract
+            self.pytesseract.get_tesseract_version()
             logger.info(f"Pytesseract OCR initialized with lang={lang}")
         except ImportError:
             logger.error("pytesseract not installed. Run: pip install pytesseract")
             raise
+        except Exception as e:
+            raise RuntimeError(
+                "Tesseract executable is not installed or not in PATH. "
+                "Install Tesseract or use OCR_ENGINE_TYPE=windows_ocr."
+            ) from e
     
     def recognize(self, image: Image.Image) -> OCRResult:
         """
@@ -160,6 +166,28 @@ def create_ocr_engine(engine_type: str = "pytesseract", **kwargs) -> OCREngine:
     """
     import platform as _platform
 
+    def _windows_lang(lang: Optional[str]) -> str:
+        if not lang:
+            return "zh-Hans-CN"
+        normalized = lang.strip()
+        lower = normalized.lower()
+        if "chi_sim" in lower or "zh-hans" in lower:
+            return "zh-Hans-CN"
+        if "chi_tra" in lower or "zh-hant" in lower:
+            return "zh-Hant-TW"
+        if lower in {"eng", "en", "en-us"}:
+            return "en-US"
+        return normalized
+
+    def _pytesseract_or_raise() -> OCREngine:
+        try:
+            return PytesseractOCR(**kwargs)
+        except Exception as e:
+            raise RuntimeError(
+                "No usable OCR engine is available. "
+                "Install winocr for Windows OCR or install Tesseract for pytesseract."
+            ) from e
+
     if engine_type == "auto":
         system = _platform.system()
         if system == "Darwin":
@@ -171,10 +199,10 @@ def create_ocr_engine(engine_type: str = "pytesseract", **kwargs) -> OCREngine:
         elif system == "Windows":
             try:
                 from .platform_ocr import WindowsOCR
-                return WindowsOCR(lang=kwargs.get("lang", "zh-Hans-CN"))
-            except ImportError:
-                logger.warning("winocr not available, falling back to pytesseract")
-        return PytesseractOCR(**kwargs)
+                return WindowsOCR(lang=_windows_lang(kwargs.get("lang")))
+            except ImportError as e:
+                logger.warning(f"Windows OCR not available ({e}), falling back to pytesseract")
+        return _pytesseract_or_raise()
 
     if engine_type == "apple_vision":
         from .platform_ocr import AppleVisionOCR
@@ -182,13 +210,12 @@ def create_ocr_engine(engine_type: str = "pytesseract", **kwargs) -> OCREngine:
 
     if engine_type == "windows_ocr":
         from .platform_ocr import WindowsOCR
-        return WindowsOCR(lang=kwargs.get("lang", "zh-Hans-CN"))
+        return WindowsOCR(lang=_windows_lang(kwargs.get("lang")))
 
     if engine_type == "pytesseract":
         return PytesseractOCR(**kwargs)
     elif engine_type == "dummy":
         return DummyOCR()
     else:
-        logger.warning(f"Unknown OCR engine: {engine_type}, using dummy")
-        return DummyOCR()
+        raise ValueError(f"Unknown OCR engine: {engine_type}")
 

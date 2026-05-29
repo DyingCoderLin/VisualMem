@@ -169,7 +169,6 @@ const TimelineView: React.FC = () => {
   const [loading, setLoading] = useState(false)
   const [hasMore, setHasMore] = useState(true)
   const [previewImage, setPreviewImage] = useState<{ url: string; timestamp: string } | null>(null)
-  const [projectRoot, setProjectRoot] = useState<string>('')
   
   // 使用全局状态
   const { dateRange, timelineRefreshTrigger, refreshTimeline } = useAppStore()
@@ -194,18 +193,6 @@ const TimelineView: React.FC = () => {
   // 无论那天有没有数据，只要检查过，这个指针就往前推
   const cursorDateRef = useRef<Date | null>(null)
   
-  // 获取项目根目录
-  useEffect(() => {
-    const fetchProjectRoot = async () => {
-      if (window.electronAPI && window.electronAPI.getProjectRoot) {
-        const root = await window.electronAPI.getProjectRoot()
-        // console.log('Project root:', root)
-        setProjectRoot(root)
-      }
-    }
-    fetchProjectRoot()
-  }, [])
-
   // 同步 ref 和 state
   useEffect(() => {
     loadingRef.current = loading

@@ -46,15 +46,19 @@ Choose the requirement file based on your OS:
   ```bash
   pip install -r requirements_macos.txt
   ```
-- **Linux / Windows**:
+- **Linux + CUDA**:
   ```bash
   pip install -r requirements_linux_cuda.txt
+  ```
+- **Windows + CUDA**:
+  ```bash
+  pip install -r requirements_windows_cuda.txt
   ```
 
 > [!NOTE]
 > `opencv-python-headless` is required for UIED region detection.
-> It is already included in both `requirements_macos.txt` and `requirements_linux_cuda.txt`.
-> Despite the filename, `requirements_linux_cuda.txt` is also the shared dependency file for Windows.
+> It is already included in all OS-specific requirement files.
+> `requirements_linux_cuda.txt` includes `pytesseract`; `requirements_windows_cuda.txt` includes `winocr`.
 
 ### 4. Build `screencap_rs` for Per-Window Capture
 
@@ -94,6 +98,10 @@ cp env.example .env
 ```
 
 Edit the `.env` file to configure your storage and retrieval preferences.
+
+**FFmpeg for Video Compression (Required):**
+
+VisualMem uses the `ffmpeg` and `ffprobe` executables to compress captured frames into MP4 video chunks and to recover leftover temporary frames after an abnormal shutdown. The backend will fail fast at startup if they are not available. Install FFmpeg for your system or environment, then make sure `ffmpeg` and `ffprobe` are available in the `PATH` used to launch VisualMem.
 
 **Rerank Configuration (Optional):**
 If you have enough VRAM (8GB+), you can enable a second-stage reranker for better accuracy:

@@ -3,4 +3,5 @@ dist/
 dist-electron/
 out/
 *.local
+.npmrc
 .DS_Store

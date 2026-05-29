@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react'
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef, ReactNode } from 'react'
 import { apiClient } from '../services/api'
 import type { FrontendTheme } from '../services/api'
 import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
@@ -34,6 +34,7 @@ interface AppStoreContextType {
   /** 首次截图 + store_frame drain，尚未进入稳态 interval */
   isWarmingUp: boolean
   isModelLoading: boolean
+  ensureModelsReady: () => Promise<void>
   recordingMode: RecordingMode
   startRecording: () => Promise<void>
   stopRecording: () => Promise<void>
@@ -86,6 +87,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   const [timelineRefreshTrigger, setTimelineRefreshTrigger] = useState(0)
   const [currentView, setCurrentView] = useState<ViewType>('timeline')
   const [realtimeSearchResult, setRealtimeSearchResult] = useState<SearchResult | null>(null)
+  const modelLoadPromiseRef = useRef<Promise<void> | null>(null)
 
   useEffect(() => {
     const root = document.documentElement
@@ -149,6 +151,40 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     throw new Error('Timed out waiting for models to finish loading')
   }, [])
 
+  const ensureModelsReady = useCallback(async () => {
+    if (modelLoadPromiseRef.current) {
+      return modelLoadPromiseRef.current
+    }
+
+    modelLoadPromiseRef.current = (async () => {
+      let showLoading = false
+      try {
+        const modelsStatus = await apiClient.getModelsStatus()
+        if (modelsStatus.loaded) {
+          return
+        }
+
+        showLoading = true
+        setIsModelLoading(true)
+        if (modelsStatus.loading) {
+          await waitForModelsReady()
+        } else {
+          const result = await apiClient.loadModels()
+          if (result.status === 'loading') {
+            await waitForModelsReady()
+          }
+        }
+      } finally {
+        if (showLoading) {
+          setIsModelLoading(false)
+        }
+        modelLoadPromiseRef.current = null
+      }
+    })()
+
+    return modelLoadPromiseRef.current
+  }, [waitForModelsReady])
+
   const applyRecordingStatus = useCallback((status: RecordingStatus) => {
     setIsWarmingUp(status.isWarmup)
     setIsRecording(status.isLiveRecording)
@@ -174,26 +210,14 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
   // 开始录制（先确保模型已加载）
   const startRecording = useCallback(async () => {
     try {
-      // Check if models are loaded, if not, load them first
-      const modelsStatus = await apiClient.getModelsStatus()
-      if (!modelsStatus.loaded) {
-        setIsModelLoading(true)
-        try {
-          const result = await apiClient.loadModels()
-          if (result.status === 'loading') {
-            await waitForModelsReady()
-          }
-        } finally {
-          setIsModelLoading(false)
-        }
-      }
+      await ensureModelsReady()
       await recordingService.start()
       // setIsRecording 将通过 subscribeStatus 自动更新
     } catch (error) {
       setIsModelLoading(false)
       console.error('Failed to start recording:', error)
     }
-  }, [waitForModelsReady])
+  }, [ensureModelsReady])
 
   // 停止录制
   const stopRecording = useCallback(async () => {
@@ -231,6 +255,7 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
     isRecording,
     isWarmingUp,
     isModelLoading,
+    ensureModelsReady,
     recordingMode,
     startRecording,
     stopRecording,
