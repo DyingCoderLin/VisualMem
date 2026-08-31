@@ -82,6 +82,13 @@ class LifeModule:
 
 
 @dataclass
+class GoalCoaching:
+    progress_assessment: str = ""
+    suggestions: List[str] = field(default_factory=list)
+    push_message: str = ""
+
+
+@dataclass
 class DailyReport:
     date: str
     work_module: WorkModule = field(default_factory=WorkModule)
@@ -90,6 +97,7 @@ class DailyReport:
     today_summary: List[str] = field(default_factory=list)
     # [{ "app": str, "purpose_keywords": [str, ...] }] from Reduce LLM
     app_purpose: List[Dict[str, Any]] = field(default_factory=list)
+    goal_coaching: GoalCoaching = field(default_factory=GoalCoaching)
     raw_markdown: str = ""
 
 

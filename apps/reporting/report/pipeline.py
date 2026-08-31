@@ -26,6 +26,7 @@ from apps.reporting.report.metrics_semantics import METRICS_SEMANTICS_FOR_JSON
 from apps.reporting.report.models import (
     Chunk,
     DailyReport,
+    GoalCoaching,
     LifeModule,
     LLMResult,
     MapChunkResult,
@@ -40,7 +41,9 @@ from apps.reporting.report.prompts import (
     REDUCE_SYSTEM_PROMPT,
     REDUCE_USER_TEMPLATE,
     reduce_language_addon,
+    reduce_personality_addon,
 )
+from apps.reporting.report.preferences import report_preferences
 from utils.logger import setup_logger
 
 logger = setup_logger("report.pipeline")
@@ -77,6 +80,11 @@ class ReportPipeline:
         Returns:
             {"report": DailyReport, "pipeline_stats": PipelineStats}
         """
+        tone = report_preferences.resolve_tone()
+        planning_style = report_preferences.resolve_planning_style()
+        prefs_data = report_preferences.get_all()
+        long_term_goals: List[str] = prefs_data.get("long_term_goals") or []
+        soul_md = report_preferences.read_soul()
         pipeline_t0 = time.monotonic()
 
         start = f"{date}T00:00:00"
@@ -201,7 +209,7 @@ class ReportPipeline:
             )
         report = await self._run_reduce_phase(
             map_results, chunks, day_data, daily_goal, prior_reports_text,
-            language,
+            language, long_term_goals, soul_md, tone, planning_style,
         )
         base_rows = build_app_usage_minutes_only(day_data)
         app_usage_summary = merge_app_usage_with_llm_purpose(
@@ -390,6 +398,10 @@ class ReportPipeline:
         daily_goal: str,
         prior_reports_text: str,
         language: str,
+        long_term_goals: List[str],
+        soul_md: str,
+        tone: str,
+        planning_style: str,
     ) -> DailyReport:
         """Single-pass Reduce: all summaries → one LLM call → structured report."""
         app_hints = format_app_usage_hints_for_reduce(day_data)
@@ -412,6 +424,8 @@ class ReportPipeline:
             metrics_semantics=METRICS_SEMANTICS_FOR_JSON,
             app_usage_hints=app_hints,
             daily_goal=daily_goal or "(none provided)",
+            long_term_goals="\n".join(f"- {g}" for g in long_term_goals) if long_term_goals else "(尚未设置长期目标)",
+            soul_md=soul_md.strip() or "(尚无 soul.md)",
             map_summaries=map_summaries,
             focus_metrics=focus_text,
             activity_breakdown=breakdown_text,
@@ -419,7 +433,7 @@ class ReportPipeline:
             prior_reports=prior_reports_text,
         )
 
-        system_prompt = REDUCE_SYSTEM_PROMPT + "\n\n" + reduce_language_addon(language)
+        system_prompt = REDUCE_SYSTEM_PROMPT + "\n\n" + reduce_language_addon(language) + "\n\n" + reduce_personality_addon(tone, planning_style)
 
         result = await self.llm.call(
             model=config.REPORT_REDUCE_MODEL,
@@ -564,12 +578,22 @@ class ReportPipeline:
         if not isinstance(ap, list):
             ap = []
 
+        gc_raw = data.get("goal_coaching", {})
+        if not isinstance(gc_raw, dict):
+            gc_raw = {}
+        goal_coaching = GoalCoaching(
+            progress_assessment=gc_raw.get("progress_assessment", ""),
+            suggestions=[str(s).strip() for s in (gc_raw.get("suggestions") or []) if str(s).strip()],
+            push_message=gc_raw.get("push_message", ""),
+        )
+
         return DailyReport(
             date="",
             work_module=work,
             life_module=life,
             today_summary=today_summary,
             app_purpose=ap,
+            goal_coaching=goal_coaching,
         )
 
     def _empty_result(
@@ -612,6 +636,11 @@ def _report_to_dict(report: DailyReport) -> Dict[str, Any]:
             "intervention_suggestions": report.life_module.intervention_suggestions,
         },
         "today_summary": report.today_summary,
+        "goal_coaching": {
+            "progress_assessment": report.goal_coaching.progress_assessment,
+            "suggestions": report.goal_coaching.suggestions,
+            "push_message": report.goal_coaching.push_message,
+        },
         "raw_markdown": report.raw_markdown,
     }
 

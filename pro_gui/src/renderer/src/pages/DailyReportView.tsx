@@ -1,6 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { apiClient } from '../services/api'
-import type { DailyReportPayload } from '../types/dailyReport'
+import type {
+  AssistantTone,
+  DailyReportPayload,
+  PlanningStyle,
+  ReportPreferences
+} from '../types/dailyReport'
 import '../styles/DailyReport.css'
 
 function localISODate(): string {
@@ -37,6 +42,23 @@ function CalendarGlyph() {
   )
 }
 
+function SettingsGearGlyph() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden>
+      <path
+        d="M12 15a3 3 0 100-6 3 3 0 000 6z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+      />
+      <path
+        d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"
+        stroke="currentColor"
+        strokeWidth="1.5"
+      />
+    </svg>
+  )
+}
+
 function BulletList({ items }: { items: string[] }) {
   if (!items?.length) return <p className="daily-report-date-empty">暂无内容</p>
   return (
@@ -48,9 +70,240 @@ function BulletList({ items }: { items: string[] }) {
   )
 }
 
+/* ------------------------------------------------------------------ */
+/* Preferences Panel                                                  */
+/* ------------------------------------------------------------------ */
+
+const TONE_OPTIONS: { value: AssistantTone; label: string }[] = [
+  { value: 'soft', label: '柔和' },
+  { value: 'normal', label: '正常' },
+  { value: 'push', label: 'Push' },
+]
+
+const PLANNING_OPTIONS: { value: PlanningStyle; label: string; desc: string }[] = [
+  { value: 'detailed-present', label: '注重细致的当下', desc: '具体时段 · 可执行微行动' },
+  { value: 'rough-overall', label: '粗略的总体规划', desc: '主题与方向 · 少细节' },
+]
+
+function PreferencesPanel({
+  prefs,
+  prefsSaving,
+  soulLoading,
+  selectedDate,
+  onRefreshPrefs,
+  onSetPrefsSaving,
+  onUpdateDateGoal,
+  onGenerateSoul,
+}: {
+  prefs: ReportPreferences | null
+  prefsSaving: boolean
+  soulLoading: boolean
+  selectedDate: string | null
+  onRefreshPrefs: () => Promise<void>
+  onSetPrefsSaving: (v: boolean) => void
+  onUpdateDateGoal: (date: string, goal: string) => void
+  onGenerateSoul: () => Promise<void>
+}) {
+  const [goalsText, setGoalsText] = useState('')
+  const [dateGoalDraft, setDateGoalDraft] = useState('')
+  const [tone, setTone] = useState<AssistantTone>('normal')
+  const [planning, setPlanning] = useState<PlanningStyle>('detailed-present')
+  const [showSoul, setShowSoul] = useState(false)
+  const [localError, setLocalError] = useState<string | null>(null)
+  const prevGoalsRef = useRef('')
+  const prevToneRef = useRef<AssistantTone>('normal')
+  const prevPlanningRef = useRef<PlanningStyle>('detailed-present')
+
+  useEffect(() => {
+    if (!prefs) return
+    setGoalsText(prefs.long_term_goals.join('\n'))
+    setDateGoalDraft(prefs.date_goals[selectedDate || ''] || '')
+    setTone(prefs.assistant_tone)
+    setPlanning(prefs.planning_style)
+    prevGoalsRef.current = prefs.long_term_goals.join('\n')
+    prevToneRef.current = prefs.assistant_tone
+    prevPlanningRef.current = prefs.planning_style
+  }, [prefs, selectedDate])
+
+  const hasChanges =
+    goalsText !== prevGoalsRef.current ||
+    tone !== prevToneRef.current ||
+    planning !== prevPlanningRef.current
+
+  const handleSave = async () => {
+    setLocalError(null)
+    try {
+      onSetPrefsSaving(true)
+      const goalsParsed = goalsText
+        .split('\n')
+        .map((g) => g.trim())
+        .filter(Boolean)
+      await apiClient.patchReportPreferences({
+        long_term_goals: goalsParsed,
+        assistant_tone: tone,
+        planning_style: planning,
+      })
+      await onRefreshPrefs()
+      prevGoalsRef.current = goalsText
+      prevToneRef.current = tone
+      prevPlanningRef.current = planning
+    } catch (e) {
+      setLocalError(e instanceof Error ? e.message : '保存失败')
+    } finally {
+      onSetPrefsSaving(false)
+    }
+  }
+
+  const handleSaveDateGoal = async () => {
+    if (!selectedDate) return
+    onUpdateDateGoal(selectedDate, dateGoalDraft.trim())
+  }
+
+  const handleGenerateSoul = async () => {
+    setLocalError(null)
+    try {
+      await onGenerateSoul()
+    } catch (e) {
+      setLocalError(e instanceof Error ? e.message : '生成 soul.md 失败')
+    }
+  }
+
+  return (
+    <div className="daily-report-settings-panel">
+      <div className="daily-report-settings-header">
+        <span className="daily-report-settings-title">偏好设置</span>
+      </div>
+
+      {/* Long-term goals */}
+      <div className="daily-report-setting-group">
+        <label className="daily-report-setting-label">长期目标</label>
+        <textarea
+          className="daily-report-textarea"
+          rows={4}
+          placeholder="每行一个目标，如：&#10;- 完成 VisualMem 前端重构&#10;- 每周运动 3 次"
+          value={goalsText}
+          onChange={(e) => setGoalsText(e.target.value)}
+        />
+      </div>
+
+      {/* Date-specific goal */}
+      {selectedDate && (
+        <div className="daily-report-setting-group">
+          <label className="daily-report-setting-label">当日目标（{selectedDate}）</label>
+          <div className="daily-report-date-goal-row">
+            <input
+              className="daily-report-date-goal-input"
+              type="text"
+              placeholder="今日想要重点完成的事…"
+              value={dateGoalDraft}
+              onChange={(e) => setDateGoalDraft(e.target.value)}
+            />
+            <button
+              type="button"
+              className="daily-report-small-btn"
+              onClick={handleSaveDateGoal}
+            >
+              保存
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Assistant tone */}
+      <div className="daily-report-setting-group">
+        <label className="daily-report-setting-label">助手语气</label>
+        <div className="daily-report-option-group">
+          {TONE_OPTIONS.map((opt) => (
+            <label key={opt.value} className="daily-report-option-btn">
+              <input
+                type="radio"
+                name="tone"
+                checked={tone === opt.value}
+                onChange={() => setTone(opt.value)}
+                className="daily-report-radio-hidden"
+              />
+              {opt.label}
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* Planning style */}
+      <div className="daily-report-setting-group">
+        <label className="daily-report-setting-label">规划风格</label>
+        <div className="daily-report-option-group">
+          {PLANNING_OPTIONS.map((opt) => (
+            <label key={opt.value} className="daily-report-option-btn" title={opt.desc}>
+              <input
+                type="radio"
+                name="planning"
+                checked={planning === opt.value}
+                onChange={() => setPlanning(opt.value)}
+                className="daily-report-radio-hidden"
+              />
+              <span>{opt.label}</span>
+              <span className="daily-report-option-desc">{opt.desc}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      {/* Save prefs button */}
+      <div className="daily-report-setting-actions">
+        <button
+          type="button"
+          className="daily-report-save-btn"
+          disabled={!hasChanges || prefsSaving}
+          onClick={handleSave}
+        >
+          {prefsSaving ? '保存中…' : '保存偏好'}
+        </button>
+      </div>
+
+      {/* Soul.md */}
+      <div className="daily-report-setting-group">
+        <label className="daily-report-setting-label">soul.md（助手灵魂）</label>
+        <p className="daily-report-setting-hint">
+          根据长期目标和助手性格，自动生成助手的"灵魂"文档。生成后会在每次日报中引用。
+        </p>
+        <button
+          type="button"
+          className="daily-report-small-btn"
+          disabled={soulLoading}
+          onClick={handleGenerateSoul}
+        >
+          {soulLoading ? '生成中…' : '生成 / 更新 soul.md'}
+        </button>
+        {prefs?.soul_md && (
+          <div className="daily-report-soul-actions">
+            <span className="daily-report-soul-time">
+              更新于 {prefs.soul_updated_at ? new Date(prefs.soul_updated_at).toLocaleString('zh-CN') : '未知'}
+            </span>
+            <button
+              type="button"
+              className="daily-report-tiny-btn"
+              onClick={() => setShowSoul((v: boolean) => !v)}
+            >
+              {showSoul ? '收起' : '查看'} soul.md
+            </button>
+          </div>
+        )}
+        {showSoul && prefs?.soul_md && (
+          <pre className="daily-report-soul-content">{prefs.soul_md}</pre>
+        )}
+      </div>
+
+      {localError && <div className="daily-report-error">{localError}</div>}
+    </div>
+  )
+}
+
+/* ------------------------------------------------------------------ */
+/* Main View                                                          */
+/* ------------------------------------------------------------------ */
+
 const DailyReportView: React.FC = () => {
   const [dates, setDates] = useState<string[]>([])
-  /** 列表拉取完成且已根据列表选好默认日期后再展示详情 */
   const [listLoaded, setListLoaded] = useState(false)
   const [selectedDate, setSelectedDate] = useState<string | null>(null)
   const [report, setReport] = useState<DailyReportPayload | null>(null)
@@ -59,7 +312,60 @@ const DailyReportView: React.FC = () => {
   const [genError, setGenError] = useState<string | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
 
-  /** `onlyDates`: 只刷新侧边栏列表，不改动当前选中日期（生成日报后调用） */
+  /* Preferences state */
+  const [prefs, setPrefs] = useState<ReportPreferences | null>(null)
+  const [prefsSaving, setPrefsSaving] = useState(false)
+  const [soulLoading, setSoulLoading] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
+
+  /* Load preferences */
+  useEffect(() => {
+    let cancelled = false
+    apiClient.getReportPreferences()
+      .then((p) => {
+        if (!cancelled) setPrefs(p)
+      })
+      .catch((e) => {
+        console.warn('[DailyReportView] load preferences failed', e)
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  /* Refresh preferences after mutations */
+  const refreshPrefs = useCallback(async () => {
+    try {
+      const p = await apiClient.getReportPreferences()
+      setPrefs(p)
+    } catch (e) {
+      console.warn('[DailyReportView] refresh prefs failed', e)
+    }
+  }, [])
+
+  /* Preferences mutation handlers */
+  const handlePrefsSaving = useCallback((v: boolean) => {
+    setPrefsSaving(v)
+  }, [])
+
+  const handleUpdateDateGoal = useCallback((date: string, goal: string) => {
+    apiClient.setDateGoal(date, goal).then(() => {
+      refreshPrefs()
+    }).catch((e) => {
+      console.warn('[DailyReportView] setDateGoal failed', e)
+    })
+  }, [refreshPrefs])
+
+  const handleGenerateSoul = useCallback(async () => {
+    setSoulLoading(true)
+    try {
+      await apiClient.generateSoul()
+      await refreshPrefs()
+    } finally {
+      setSoulLoading(false)
+    }
+  }, [refreshPrefs])
+
+  /* ---------- Existing report logic ---------- */
+
   const refreshList = useCallback(async (options?: { onlyDates?: boolean }) => {
     const { dates: d } = await apiClient.listDailyReports()
     setDates(d)
@@ -79,8 +385,6 @@ const DailyReportView: React.FC = () => {
 
   useEffect(() => {
     refreshList().catch((e) => {
-      // 录制停止时后端会阻塞 drain/flush，期间 listDailyReports 可能超时被 abort。
-      // 这是预期行为，UI 下次 focus 会再刷一次，不要把 AbortError 当成真实错误弹出。
       if (e instanceof DOMException && e.name === 'AbortError') {
         console.warn('[DailyReportView] listDailyReports aborted (likely during recording stop flush)')
         return
@@ -89,7 +393,6 @@ const DailyReportView: React.FC = () => {
     })
   }, [refreshList])
 
-  /** 仅当该日在列表中（磁盘上确有 JSON）时才请求详情，避免对「今天」无脑 GET 导致 404 */
   const selectedHasReport = useMemo(
     () => (selectedDate != null ? dates.includes(selectedDate) : false),
     [dates, selectedDate]
@@ -118,7 +421,6 @@ const DailyReportView: React.FC = () => {
       } catch (e) {
         if (cancelled) return
         if (e instanceof DOMException && e.name === 'AbortError') {
-          // 同 refreshList：录制停止期间后端短暂繁忙，静默即可
           return
         }
         setReport(null)
@@ -156,6 +458,7 @@ const DailyReportView: React.FC = () => {
 
   const wm = report?.report?.work_module
   const lm = report?.report?.life_module
+  const gc = report?.report?.goal_coaching
   const focusScore = lm?.focus_score
   const statusNote = report?.status
   const statusMessage = report?.message
@@ -199,18 +502,42 @@ const DailyReportView: React.FC = () => {
                 onChange={(e) => setSelectedDate(e.target.value)}
               />
             </div>
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-              <button
-                type="button"
-                className="daily-report-gen-btn"
-                disabled={genLoading || !listLoaded || !selectedDate}
-                onClick={handleGenerate}
-              >
-                {genLoading ? '生成中…' : '生成日报'}
-              </button>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '8px' }}>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button
+                  type="button"
+                  className="daily-report-small-btn"
+                  onClick={() => setShowSettings((v: boolean) => !v)}
+                  title="偏好设置"
+                >
+                  <SettingsGearGlyph />
+                  偏好
+                </button>
+                <button
+                  type="button"
+                  className="daily-report-gen-btn"
+                  disabled={genLoading || !listLoaded || !selectedDate}
+                  onClick={handleGenerate}
+                >
+                  {genLoading ? '生成中…' : '生成日报'}
+                </button>
+              </div>
               {genError ? <div className="daily-report-error">{genError}</div> : null}
             </div>
           </div>
+
+          {showSettings && (
+            <PreferencesPanel
+              prefs={prefs}
+              prefsSaving={prefsSaving}
+              soulLoading={soulLoading}
+              selectedDate={selectedDate}
+              onRefreshPrefs={refreshPrefs}
+              onSetPrefsSaving={handlePrefsSaving}
+              onUpdateDateGoal={handleUpdateDateGoal}
+              onGenerateSoul={handleGenerateSoul}
+            />
+          )}
 
           <div className="daily-report-card-wrap">
             {!listLoaded ? (
@@ -336,6 +663,38 @@ const DailyReportView: React.FC = () => {
                     )}
                   </div>
                 </section>
+
+                {/* Goal Coaching section */}
+                {gc && (
+                  <section style={{ marginTop: 'var(--spacing-lg)' }}>
+                    <h2 className="daily-report-section-title">目标教练</h2>
+                    <div className="daily-report-goal-coaching">
+                      {gc.progress_assessment && (
+                        <div className="daily-report-gc-block">
+                          <h4>目标进展评估</h4>
+                          <p style={{ fontSize: 'var(--font-size-base)', lineHeight: 1.5, color: 'var(--text-primary)' }}>
+                            {gc.progress_assessment}
+                          </p>
+                        </div>
+                      )}
+                      {gc.suggestions?.length > 0 && (
+                        <div className="daily-report-gc-block">
+                          <h4>行动计划</h4>
+                          <ul>
+                            {gc.suggestions.map((s, i) => (
+                              <li key={i}>{s}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {gc.push_message && (
+                        <div className="daily-report-gc-push">
+                          <strong>教练寄语：</strong>{gc.push_message}
+                        </div>
+                      )}
+                    </div>
+                  </section>
+                )}
               </div>
             )}
           </div>

@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VisualMem - Screen Summary</title>
+    <style>
+      :root {
+        --bg-panel: #1a1a1a;
+        --border-dim: #333333;
+        --accent-primary: #ffd700;
+        --accent-soft: rgba(255, 215, 0, 0.07);
+        --text-primary: #ffffff;
+        --text-secondary: #a0a0a0;
+        --text-accent: #ffd700;
+        --text-on-accent: #121212;
+        --shadow-elevated: 0 4px 20px rgba(0, 0, 0, 0.5);
+        --danger: #f87171;
+        --font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        --font-size-xs: 11px;
+        --font-size-sm: 12px;
+        --font-size-base: 14px;
+        --spacing-xs: 4px;
+        --spacing-sm: 8px;
+        --spacing-md: 16px;
+        --radius-sm: 6px;
+        --radius-lg: 8px;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font-family: var(--font-family-base);
+        background: transparent;
+        overflow: hidden;
+      }
+      .summary-popup-page {
+        width: 100vw;
+        height: 100vh;
+        overflow: hidden;
+      }
+      .summary-popup-window {
+        width: 100%;
+        height: 100%;
+        background-color: var(--bg-panel);
+        border: 1px solid var(--border-dim);
+        border-radius: var(--radius-lg);
+        box-shadow: var(--shadow-elevated);
+        animation: summaryPopupSlideIn 0.3s ease-out;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+      }
+      @keyframes summaryPopupSlideIn {
+        from { opacity: 0; transform: translateY(12px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .summary-popup-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: var(--spacing-sm) var(--spacing-md);
+        border-bottom: 1px solid var(--border-dim);
+        background-color: var(--accent-soft);
+        flex-shrink: 0;
+      }
+      .summary-popup-title {
+        font-size: var(--font-size-base);
+        font-weight: 600;
+        color: var(--text-accent);
+      }
+      .summary-popup-timer {
+        font-size: var(--font-size-xs);
+        color: var(--text-secondary);
+        font-variant-numeric: tabular-nums;
+      }
+      .summary-popup-body {
+        flex: 1;
+        padding: var(--spacing-md);
+        overflow-y: auto;
+        min-height: 0;
+      }
+      .summary-popup-text {
+        font-size: var(--font-size-base);
+        line-height: 1.6;
+        color: var(--text-primary);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .summary-popup-time {
+        margin-top: var(--spacing-sm);
+        font-size: var(--font-size-xs);
+        color: var(--text-secondary);
+        text-align: right;
+      }
+      .summary-popup-label {
+        margin-bottom: var(--spacing-sm);
+        font-size: var(--font-size-sm);
+        color: var(--text-accent);
+        font-weight: 600;
+      }
+      .summary-popup-error {
+        font-size: var(--font-size-base);
+        color: var(--danger);
+        line-height: 1.5;
+      }
+      .summary-popup-loading {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        height: 100%;
+        color: var(--text-secondary);
+        font-size: var(--font-size-base);
+      }
+      .loading-spinner {
+        width: 20px;
+        height: 20px;
+        border: 2px solid var(--border-dim);
+        border-top-color: var(--accent-primary);
+        border-radius: 50%;
+        animation: spin 0.8s linear infinite;
+        margin-right: 8px;
+      }
+      @keyframes spin {
+        to { transform: rotate(360deg); }
+      }
+      .summary-popup-actions {
+        display: flex;
+        gap: var(--spacing-sm);
+        padding: var(--spacing-sm) var(--spacing-md);
+        border-top: 1px solid var(--border-dim);
+        flex-shrink: 0;
+      }
+      .popup-btn {
+        flex: 1;
+        padding: var(--spacing-xs) var(--spacing-sm);
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--border-dim);
+        background-color: var(--bg-panel);
+        color: var(--text-primary);
+        cursor: pointer;
+        transition: all 0.2s ease;
+        font-size: var(--font-size-sm);
+        font-family: var(--font-family-base);
+        line-height: 1.4;
+      }
+      .popup-btn:hover {
+        background-color: var(--accent-soft);
+        border-color: var(--accent-primary);
+        color: var(--text-accent);
+      }
+      .popup-btn:active {
+        transform: scale(0.97);
+      }
+      .popup-btn.advice-mode {
+        background-color: var(--accent-primary);
+        color: var(--text-on-accent);
+        border-color: var(--accent-primary);
+      }
+      .popup-btn.advice-mode:hover {
+        background-color: #ffc700;
+        border-color: #ffc700;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="summary-popup-page">
+      <div class="summary-popup-window">
+        <div class="summary-popup-header">
+          <span class="summary-popup-title" id="popupTitle">📋 Screen Activity Summary</span>
+          <span class="summary-popup-timer" id="timer"></span>
+        </div>
+        <div class="summary-popup-body" id="body">
+          <div class="summary-popup-loading">
+            <div class="loading-spinner"></div>
+            Generating summary...
+          </div>
+        </div>
+        <div class="summary-popup-actions" id="actions" style="display:none;">
+          <button class="popup-btn" id="btnClose">✕ Close</button>
+          <button class="popup-btn" id="btnAdvice">💡 Suggestions</button>
+        </div>
+      </div>
+    </div>
+    <script>
+      let countdownSeconds = 30;
+      let countdownInterval = null;
+      var currentSummary = '';
+      var currentAdvice = '';
+      var currentTimeRange = '';
+      var showActions = true;
+      var adviceRequested = false;
+
+      function resetCountdown() {
+        countdownSeconds = 30;
+        if (countdownInterval) clearInterval(countdownInterval);
+        countdownInterval = setInterval(updateTimer, 1000);
+        updateTimer();
+      }
+
+      function updateTimer() {
+        var el = document.getElementById('timer');
+        var mins = Math.floor(countdownSeconds / 60);
+        var secs = countdownSeconds % 60;
+        el.textContent = mins + ':' + String(secs).padStart(2, '0') + ' remaining';
+        if (countdownSeconds <= 0) {
+          clearInterval(countdownInterval);
+          if (window.electronAPI && window.electronAPI.closeSummaryPopup) {
+            window.electronAPI.closeSummaryPopup();
+          }
+        }
+        countdownSeconds--;
+      }
+
+      function showSummaryPopup(summary, timeRange) {
+        currentSummary = summary;
+        currentTimeRange = timeRange || '';
+        currentAdvice = '';
+        adviceRequested = false;
+        document.getElementById('popupTitle').textContent = '📋 Screen Activity Summary';
+
+        var body = document.getElementById('body');
+        var html = '<div class="summary-popup-label">Activity Summary</div>' +
+          '<div class="summary-popup-text">' + escapeHtml(summary) + '</div>';
+        if (currentTimeRange) {
+          html += '<div class="summary-popup-time">' + escapeHtml(currentTimeRange) + '</div>';
+        }
+        body.innerHTML = html;
+
+        if (showActions) {
+          var btnAdvice = document.getElementById('btnAdvice');
+          btnAdvice.textContent = '💡 Suggestions';
+          btnAdvice.className = 'popup-btn';
+          document.getElementById('actions').style.display = 'flex';
+        }
+        resetCountdown();
+      }
+
+      function showAdvicePopup(advice) {
+        currentAdvice = advice;
+        adviceRequested = true;
+        document.getElementById('popupTitle').textContent = '💡 Work Suggestions';
+
+        var body = document.getElementById('body');
+        var html = '<div class="summary-popup-label">Work Suggestions</div>' +
+          '<div class="summary-popup-text">' + escapeHtml(advice) + '</div>';
+        if (currentTimeRange) {
+          html += '<div class="summary-popup-time">' + escapeHtml(currentTimeRange) + '</div>';
+        }
+        body.innerHTML = html;
+
+        if (showActions) {
+          var btnAdvice = document.getElementById('btnAdvice');
+          btnAdvice.textContent = '📋 Back to Summary';
+          btnAdvice.className = 'popup-btn advice-mode';
+          document.getElementById('actions').style.display = 'flex';
+        }
+        resetCountdown();
+      }
+
+      function showError(msg) {
+        var body = document.getElementById('body');
+        body.innerHTML = '<div class="summary-popup-error">' + escapeHtml(msg) + '</div>';
+        document.getElementById('actions').style.display = 'none';
+      }
+
+      function showLoading(text) {
+        var body = document.getElementById('body');
+        body.innerHTML = '<div class="summary-popup-loading"><div class="loading-spinner"></div>' + escapeHtml(text) + '</div>';
+      }
+
+      function escapeHtml(text) {
+        var div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+      }
+
+      document.getElementById('btnClose').addEventListener('click', function() {
+        if (window.electronAPI && window.electronAPI.closeSummaryPopup) {
+          window.electronAPI.closeSummaryPopup();
+        }
+      });
+
+      document.getElementById('btnAdvice').addEventListener('click', function() {
+        if (adviceRequested) {
+          showSummaryPopup(currentSummary, currentTimeRange);
+          return;
+        }
+        if (currentAdvice) {
+          showAdvicePopup(currentAdvice);
+          return;
+        }
+        if (window.electronAPI && window.electronAPI.requestAdvice) {
+          showLoading('Generating suggestions...');
+          document.getElementById('actions').style.display = 'none';
+          window.electronAPI.requestAdvice(currentSummary);
+        }
+      });
+
+      if (window.electronAPI && window.electronAPI.onSummaryData) {
+        window.electronAPI.onSummaryData(function(data) {
+          if (data.type === 'summary') {
+            showSummaryPopup(data.summary, data.time_range);
+          } else if (data.type === 'advice') {
+            if (data.error) {
+              showError(data.error);
+            } else {
+              if (data.time_range) currentTimeRange = data.time_range;
+              showAdvicePopup(data.advice);
+            }
+          } else if (data.error) {
+            showError(data.error);
+          } else {
+            showSummaryPopup(data.summary, data.time_range);
+          }
+        });
+      }
+
+      if (window.electronAPI && window.electronAPI.onPopupConfig) {
+        window.electronAPI.onPopupConfig(function(config) {
+          showActions = config.showActions !== false;
+        });
+      }
+    </script>
+  </body>
+</html>

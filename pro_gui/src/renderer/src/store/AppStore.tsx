@@ -2,6 +2,7 @@ import React, { createContext, useContext, useState, useEffect, useCallback, use
 import { apiClient } from '../services/api'
 import type { FrontendTheme } from '../services/api'
 import { recordingService, RecordingMode, RecordingStatus } from '../services/recording'
+import { summaryPopupService } from '../services/summaryPopupService'
 
 export type ViewType = 'timeline' | 'realtime' | 'tags' | 'settings' | 'daily'
 
@@ -247,6 +248,15 @@ export const AppStoreProvider: React.FC<AppStoreProviderProps> = ({ children }) 
       return () => clearInterval(refreshInterval)
     }
   }, [isRecording, isWarmingUp, refreshTimeline])
+
+  // 录制开始时启动摘要弹窗定时任务，录制停止时终止
+  useEffect(() => {
+    if (isRecording) {
+      summaryPopupService.start()
+    } else {
+      summaryPopupService.stop()
+    }
+  }, [isRecording])
 
   const value: AppStoreContextType = {
     themeMode,

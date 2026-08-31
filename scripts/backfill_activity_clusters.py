@@ -1043,7 +1043,7 @@ def phase_label(args):
                 })
             _save_label_results()
 
-            time.sleep(0.5)  # Rate limit
+            time.sleep(10.0)  # Rate limit
 
     act_conn.close()
     print(f"\nLabel results saved to: {label_results_path}")

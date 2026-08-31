@@ -24,11 +24,18 @@ export interface LifeModule {
   intervention_suggestions?: string[]
 }
 
+export interface GoalCoaching {
+  progress_assessment: string
+  suggestions: string[]
+  push_message: string
+}
+
 export interface ReportBody {
   date: string
   work_module: WorkModule
   life_module: LifeModule
   today_summary: string[]
+  goal_coaching?: GoalCoaching
   raw_markdown?: string
 }
 
@@ -56,4 +63,33 @@ export interface DailyReportListResponse {
 export interface GenerateDailyReportResponse extends DailyReportPayload {
   ok: boolean
   date: string
+}
+
+/* ------------------------------------------------------------------ */
+/* Report preferences                                                 */
+/* ------------------------------------------------------------------ */
+
+export type AssistantTone = 'soft' | 'normal' | 'push'
+export type PlanningStyle = 'detailed-present' | 'rough-overall'
+
+export interface ReportPreferences {
+  long_term_goals: string[]
+  date_goals: Record<string, string>
+  assistant_tone: AssistantTone
+  planning_style: PlanningStyle
+  soul_updated_at: string | null
+  soul_md?: string
+}
+
+export interface PreferencesPatch {
+  long_term_goals?: string[]
+  date_goals?: Record<string, string>
+  assistant_tone?: AssistantTone
+  planning_style?: PlanningStyle
+}
+
+export interface GenerateSoulResponse {
+  ok: boolean
+  content: string
+  updated_at: string
 }

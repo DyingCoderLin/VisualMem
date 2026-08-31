@@ -359,3 +359,304 @@
   font-size: var(--font-size-base);
   line-height: 1.6;
 }
+
+/* ------------------------------------------------------------------ */
+/* Small buttons                                                       */
+/* ------------------------------------------------------------------ */
+
+.daily-report-small-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  border: 1px solid var(--border-dim);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  transition: background 0.15s ease, border-color 0.15s ease;
+  white-space: nowrap;
+}
+
+.daily-report-small-btn:hover:not(:disabled) {
+  background: var(--bg-panel-hover);
+  border-color: var(--accent-primary);
+}
+
+.daily-report-small-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.daily-report-small-btn svg {
+  flex-shrink: 0;
+}
+
+.daily-report-tiny-btn {
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  cursor: pointer;
+  border: 1px solid var(--border-dim);
+  background: transparent;
+  color: var(--text-secondary);
+  transition: color 0.15s ease;
+}
+
+.daily-report-tiny-btn:hover {
+  color: var(--accent-primary);
+  border-color: var(--accent-primary);
+}
+
+.daily-report-save-btn {
+  padding: var(--spacing-xs) var(--spacing-lg);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid var(--accent-primary);
+  background: transparent;
+  color: var(--accent-primary);
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.daily-report-save-btn:hover:not(:disabled) {
+  background: var(--accent-hover-bg);
+}
+
+.daily-report-save-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ------------------------------------------------------------------ */
+/* Preferences panel                                                   */
+/* ------------------------------------------------------------------ */
+
+.daily-report-settings-panel {
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-lg);
+  margin-bottom: var(--spacing-md);
+  max-width: 960px;
+}
+
+.daily-report-settings-header {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+  padding-bottom: var(--spacing-sm);
+  border-bottom: 1px solid var(--border-dim);
+}
+
+.daily-report-settings-title {
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  color: var(--accent-primary);
+}
+
+.daily-report-setting-group {
+  margin-bottom: var(--spacing-md);
+}
+
+.daily-report-setting-label {
+  display: block;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--spacing-xs);
+}
+
+.daily-report-setting-hint {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  margin-bottom: var(--spacing-sm);
+  line-height: 1.5;
+}
+
+.daily-report-textarea {
+  width: 100%;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+  font-family: inherit;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.daily-report-textarea:focus {
+  border-color: var(--accent-primary);
+}
+
+.daily-report-date-goal-row {
+  display: flex;
+  gap: var(--spacing-sm);
+  align-items: center;
+}
+
+.daily-report-date-goal-input {
+  flex: 1;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.daily-report-date-goal-input:focus {
+  border-color: var(--accent-primary);
+}
+
+.daily-report-option-group {
+  display: flex;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+}
+
+.daily-report-option-btn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+  min-width: 100px;
+}
+
+.daily-report-option-btn:hover {
+  border-color: var(--accent-primary);
+  color: var(--text-primary);
+}
+
+.daily-report-radio-hidden {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.daily-report-radio-hidden:checked + span,
+.daily-report-radio-hidden:checked ~ .daily-report-option-desc {
+  color: var(--accent-primary);
+}
+
+.daily-report-radio-hidden:checked ~ span {
+  color: var(--accent-primary);
+  font-weight: 600;
+}
+
+.daily-report-option-btn:has(.daily-report-radio-hidden:checked) {
+  border-color: var(--accent-primary);
+  background: var(--accent-soft);
+}
+
+.daily-report-option-btn > span:first-child {
+  font-weight: 500;
+}
+
+.daily-report-option-desc {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  opacity: 0.7;
+  margin-top: 2px;
+}
+
+.daily-report-setting-actions {
+  display: flex;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+}
+
+/* Soul.md */
+.daily-report-soul-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-xs);
+}
+
+.daily-report-soul-time {
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+}
+
+.daily-report-soul-content {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-md);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* ------------------------------------------------------------------ */
+/* Goal coaching                                                       */
+/* ------------------------------------------------------------------ */
+
+.daily-report-goal-coaching {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-md);
+}
+
+.daily-report-gc-block {
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-md);
+  background-color: var(--daily-panel-bg);
+}
+
+.daily-report-gc-block h4 {
+  font-size: var(--font-size-sm);
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: var(--spacing-sm);
+}
+
+.daily-report-gc-block ul {
+  margin: 0;
+  padding-left: var(--spacing-lg);
+}
+
+.daily-report-gc-block li {
+  margin-bottom: var(--spacing-xs);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  line-height: 1.45;
+}
+
+.daily-report-gc-push {
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-left: 3px solid var(--accent-primary);
+  border-radius: var(--radius-sm);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+  font-size: var(--font-size-base);
+  line-height: 1.55;
+  margin-top: var(--spacing-sm);
+}

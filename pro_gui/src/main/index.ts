@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut } from 'electron'
+import { app, BrowserWindow, ipcMain, desktopCapturer, globalShortcut, screen } from 'electron'
 import { spawn, execSync, ChildProcess } from 'child_process'
 import { join, dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -11,6 +11,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 
 let mainWindow: BrowserWindow | null = null
+let summaryPopupWindow: BrowserWindow | null = null
+let summaryAutoCloseTimeout: NodeJS.Timeout | null = null
 let pythonProcess: ChildProcess | null = null
 let isDownloading = false
 let isLoadingModel = false  // 模型正在加载到内存
@@ -48,6 +50,97 @@ function setupIPC(): void {
   // 获取项目根目录
   ipcMain.handle('get-project-root', () => {
     return findProjectRoot()
+  })
+
+  const SUMMARY_POPUP_WIDTH = 380
+  const SUMMARY_POPUP_HEIGHT = 260
+  const SUMMARY_AUTO_CLOSE_SECONDS = 30
+
+  function createSummaryPopup(): BrowserWindow | null {
+    if (summaryPopupWindow && !summaryPopupWindow.isDestroyed()) {
+      summaryPopupWindow.focus()
+      return summaryPopupWindow
+    }
+
+    const display = screen.getPrimaryDisplay()
+    const { width: screenWidth, height: screenHeight } = display.workArea
+    const x = screenWidth - SUMMARY_POPUP_WIDTH - 16
+    const y = screenHeight - SUMMARY_POPUP_HEIGHT - 16
+
+    summaryPopupWindow = new BrowserWindow({
+      width: SUMMARY_POPUP_WIDTH,
+      height: SUMMARY_POPUP_HEIGHT,
+      x,
+      y,
+      frame: false,
+      alwaysOnTop: true,
+      transparent: true,
+      resizable: false,
+      skipTaskbar: true,
+      focusable: true,
+      hasShadow: true,
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.js'),
+        nodeIntegration: false,
+        contextIsolation: true,
+      }
+    })
+
+    summaryPopupWindow.setAlwaysOnTop(true, 'screen-saver')
+
+    if (isDev) {
+      summaryPopupWindow.loadURL('http://localhost:5173/summary-popup.html')
+    } else {
+      summaryPopupWindow.loadFile(join(__dirname, '../../renderer/summary-popup.html'))
+    }
+
+    summaryPopupWindow.on('closed', () => {
+      summaryPopupWindow = null
+    })
+
+    clearTimeoutIfExists()
+    summaryAutoCloseTimeout = setTimeout(() => {
+      closeSummaryPopup()
+    }, SUMMARY_AUTO_CLOSE_SECONDS * 1000)
+
+    return summaryPopupWindow
+  }
+
+  function closeSummaryPopup(): void {
+    clearTimeoutIfExists()
+    if (summaryPopupWindow && !summaryPopupWindow.isDestroyed()) {
+      summaryPopupWindow.close()
+      summaryPopupWindow = null
+    }
+  }
+
+  function clearTimeoutIfExists(): void {
+    if (summaryAutoCloseTimeout) {
+      clearTimeout(summaryAutoCloseTimeout)
+      summaryAutoCloseTimeout = null
+    }
+  }
+
+  function sendSummaryToPopup(data: any): void {
+    if (!summaryPopupWindow || summaryPopupWindow.isDestroyed()) return
+    summaryPopupWindow.webContents.send('summary-data', data)
+  }
+
+  ipcMain.on('show-summary-popup', (_event, data) => {
+    const popup = createSummaryPopup()
+    if (popup) {
+      sendSummaryToPopup(data)
+    }
+  })
+
+  ipcMain.on('close-summary-popup', () => {
+    closeSummaryPopup()
+  })
+
+  ipcMain.on('request-advice', (_event, summary) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('advice-requested', summary)
+    }
   })
 }
 
@@ -263,7 +356,37 @@ function startPythonBackend(): Promise<void> {
       console.log(`Backend logs are written directly by Python to: ${join(rootDir, 'logs', 'backend_server.log')}`)
       backendFailureLogPrinted = false
 
-      pythonProcess = spawn('python', [pythonScript], {
+      // Resolve correct Python interpreter.
+      // On Windows, 'python' may point to the MS Store stub; prefer known conda paths or VISUALMEM_PYTHON env.
+      let pythonCmd = 'python'
+      if (process.platform === 'win32') {
+        const visualmemPython = process.env.VISUALMEM_PYTHON
+        if (visualmemPython && existsSync(visualmemPython)) {
+          pythonCmd = visualmemPython
+        } else {
+          // Common Miniconda / conda visualmem env paths
+          const condaCandidates = [
+            join(process.env.USERNAME ? process.env.USERNAME : '', 'miniconda3', 'envs', 'visualmem', 'python.exe'),
+          ]
+          // Build against actual USERPROFILE
+          if (process.env.USERPROFILE) {
+            condaCandidates.unshift(
+              join(process.env.USERPROFILE, 'miniconda3', 'envs', 'visualmem', 'python.exe')
+            )
+            condaCandidates.unshift(
+              join(process.env.USERPROFILE, 'anaconda3', 'envs', 'visualmem', 'python.exe')
+            )
+          }
+          for (const c of condaCandidates) {
+            if (existsSync(c)) {
+              pythonCmd = c
+              break
+            }
+          }
+        }
+      }
+
+      pythonProcess = spawn(pythonCmd, [pythonScript], {
         cwd: rootDir,
         stdio: ['ignore', 'pipe', 'pipe'],
         shell: process.platform !== 'win32',

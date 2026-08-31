@@ -23,6 +23,35 @@ logger = setup_logger("api.daily_report")
 
 router = APIRouter(prefix="/api", tags=["daily-reports"])
 
+
+# ---------------------------------------------------------------------------
+# Preferences helpers
+# ---------------------------------------------------------------------------
+
+def _get_prefs():
+    from apps.reporting.report.preferences import report_preferences
+    return report_preferences
+
+
+class PreferencesPatchBody(BaseModel):
+    """Body for PATCH /api/report-preferences."""
+    long_term_goals: Optional[list[str]] = None
+    date_goals: Optional[dict[str, str]] = None
+    assistant_tone: Optional[str] = None
+    planning_style: Optional[str] = None
+
+
+class SetDateGoalBody(BaseModel):
+    """Body for POST /api/report-preferences/date-goal."""
+
+    date: str
+    goal: str
+
+
+class GenerateSoulBody(BaseModel):
+    """Body for POST /api/report-preferences/soul/generate."""
+    pass
+
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -127,7 +156,8 @@ async def generate_daily_report(body: GenerateDailyReportBody) -> Dict[str, Any]
     from apps.reporting.pipeline import ReportPipeline
     from apps.reporting.report.llm_caller import drain_litellm_async_logging
 
-    goal = (config.REPORT_DAILY_GOAL or "").strip()
+    from apps.reporting.report.preferences import report_preferences
+    goal = report_preferences.resolve_daily_goal(date) or (config.REPORT_DAILY_GOAL or "").strip()
     pipeline = ReportPipeline()
     try:
         try:
@@ -154,3 +184,60 @@ async def generate_daily_report(body: GenerateDailyReportBody) -> Dict[str, Any]
             await pipeline.fetcher.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Preferences endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/report-preferences")
+def get_report_preferences() -> Dict[str, Any]:
+    """Get current preferences: goals, tone, planning style, soul content."""
+    prefs = _get_prefs()
+    data = prefs.get_all()
+    data["soul_md"] = prefs.read_soul()
+    return data
+
+
+@router.patch("/report-preferences")
+def patch_report_preferences(body: PreferencesPatchBody) -> Dict[str, Any]:
+    """Update preferences (partial patch)."""
+    prefs = _get_prefs()
+    patch: Dict[str, Any] = {}
+    if body.long_term_goals is not None:
+        patch["long_term_goals"] = body.long_term_goals
+    if body.date_goals is not None:
+        patch["date_goals"] = body.date_goals
+    if body.assistant_tone is not None:
+        patch["assistant_tone"] = body.assistant_tone
+    if body.planning_style is not None:
+        patch["planning_style"] = body.planning_style
+    data = prefs.update(patch)
+    data["soul_md"] = prefs.read_soul()
+    return data
+
+
+@router.post("/report-preferences/date-goal")
+def set_date_goal(body: SetDateGoalBody) -> Dict[str, Any]:
+    """Set or clear a single date-specific goal."""
+    prefs = _get_prefs()
+    prefs.set_date_goal(body.date, body.goal)
+    data = prefs.get_all()
+    data["soul_md"] = prefs.read_soul()
+    return data
+
+
+@router.post("/report-preferences/soul/generate")
+async def generate_soul_endpoint(_body: GenerateSoulBody) -> Dict[str, Any]:
+    """Regenerate soul.md from current goals and personality settings."""
+    from apps.reporting.report.soul_builder import generate_soul_md
+    try:
+        result = await generate_soul_md()
+        return {
+            "ok": True,
+            "content": result.get("content", ""),
+            "updated_at": result.get("updated_at"),
+        }
+    except Exception as e:
+        logger.exception("soul.md generation failed: %s", e)
+        raise HTTPException(status_code=502, detail=f"生成 soul.md 失败: {e}") from e

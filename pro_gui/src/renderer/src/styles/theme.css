@@ -59,6 +59,8 @@
   
   /* ---------- Typography ---------- */
   --font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --font-size-xxs: 10px;
+  --font-size-xs: 11px;
   --font-size-sm: 12px;
   --font-size-base: 14px;
   --font-size-md: 14px;
@@ -347,4 +349,97 @@ body {
   background-color: var(--accent-primary);
   color: var(--text-on-accent);
   border-color: var(--accent-primary);
+}
+
+/* ---------- Summary Popup (standalone window) ---------- */
+
+.summary-popup-page {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+}
+
+.summary-popup-window {
+  width: 100%;
+  height: 100%;
+  background-color: var(--bg-panel);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-elevated);
+  animation: summaryPopupSlideIn 0.3s ease-out;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+@keyframes summaryPopupSlideIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.summary-popup-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border-bottom: 1px solid var(--border-dim);
+  background-color: var(--accent-soft);
+  -webkit-app-region: no-drag;
+}
+
+.summary-popup-title {
+  font-size: var(--font-size-base);
+  font-weight: 600;
+  color: var(--text-accent);
+}
+
+.summary-popup-close {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  transition: color 0.2s ease;
+}
+
+.summary-popup-close:hover {
+  color: var(--text-primary);
+}
+
+.summary-popup-body {
+  flex: 1;
+  padding: var(--spacing-md);
+  overflow-y: auto;
+}
+
+.summary-popup-text {
+  font-size: var(--font-size-base);
+  line-height: 1.6;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.summary-popup-time {
+  margin-top: var(--spacing-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.summary-popup-error {
+  font-size: var(--font-size-base);
+  color: var(--danger);
+  line-height: 1.5;
 }

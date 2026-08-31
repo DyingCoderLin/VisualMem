@@ -3096,6 +3096,135 @@ def get_recent_frames(minutes: int = 5):
         return {"frames": []}
 
 
+class SummarizeRecentRequest(BaseModel):
+    minutes: int = 5
+
+
+class SummarizeRecentResponse(BaseModel):
+    summary: str
+    time_range: str
+
+
+@app.post("/api/summarize_recent", response_model=SummarizeRecentResponse)
+def summarize_recent(req: SummarizeRecentRequest = SummarizeRecentRequest()):
+    """
+    根据最近 N 分钟的截图内容生成工作摘要。
+    收集该时间段内的 OCR 文本和时间线，调用 VLM 纯文本总结。
+    """
+    if sqlite_storage is None:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+    if vlm is None:
+        raise HTTPException(status_code=503, detail="VLM not initialized")
+
+    try:
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(minutes=req.minutes)
+
+        frames = sqlite_storage.get_frames_in_timerange(
+            start_time=start_time,
+            end_time=end_time,
+            only_full_screen=True,
+        )
+
+        if not frames:
+            return SummarizeRecentResponse(
+                summary="这段时间内没有截屏记录。",
+                time_range=f"{_to_local(start_time)} ~ {_to_local(end_time)}",
+            )
+
+        # Build a text timeline from OCR results, sampling at most 30 frames
+        # to stay within context window.
+        total = len(frames)
+        step = max(1, total // 30)
+        sampled = frames[::step]
+
+        lines = []
+        for f in sampled:
+            ts = _to_local(f.get("timestamp"))
+            ocr = (f.get("ocr_text") or "").strip()
+            app = f.get("app_name") or f.get("device_name", "")
+            line = f"[{ts}] App: {app}"
+            if ocr:
+                truncated = ocr[:500]
+                line += f" | OCR: {truncated}"
+            lines.append(line)
+
+        timeline_text = "\n".join(lines)
+        start_local = _to_local(start_time)
+        end_local = _to_local(end_time)
+
+        prompt = (
+            f"以下是用户在 {start_local} ~ {end_local} 期间屏幕截屏的OCR文本和时间线。"
+            f"请根据这些内容简要总结用户在这段时间内主要在做什么事情。"
+            f"要求：\n"
+            f"1. 用中文回答，不超过150字\n"
+            f"2. 概括主要活动和使用的主要应用\n"
+            f"3. 如果内容有编程相关活动，指出具体在做什么\n\n"
+            f"时间线：\n{timeline_text}"
+        )
+
+        logger.info(f"SummarizeRecent: sending timeline ({len(lines)} entries) to VLM...")
+        summary = vlm._call_vlm_text_only(prompt)
+
+        # Strip markdown code fences if present
+        import re
+        summary = re.sub(r'^```[\w]*\n?', '', summary)
+        summary = re.sub(r'\n?```$', '', summary).strip()
+
+        logger.info(f"SummarizeRecent: summary generated ({len(summary)} chars)")
+        return SummarizeRecentResponse(
+            summary=summary,
+            time_range=f"{start_local} ~ {end_local}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to summarize recent frames: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Summarize failed: {str(e)}")
+
+
+class SuggestAdviceRequest(BaseModel):
+    summary: str
+
+
+class SuggestAdviceResponse(BaseModel):
+    advice: str
+
+
+@app.post("/api/summarize_recent_advice", response_model=SuggestAdviceResponse)
+def summarize_recent_advice(req: SuggestAdviceRequest):
+    """
+    基于已有屏幕活动摘要，调用 VLM 生成针对性工作建议。
+    """
+    if vlm is None:
+        raise HTTPException(status_code=503, detail="VLM not initialized")
+
+    try:
+        prompt = (
+            f"以下是用户最近5分钟的屏幕活动摘要：\n\n{req.summary}\n\n"
+            f"请根据这段摘要，给出简明的工作效率建议。"
+            f"要求：\n"
+            f"1. 用中文回答，不超过150字\n"
+            f"2. 针对摘要中反映的活动给出1-3条实用建议\n"
+            f"3. 语气友好、简洁"
+        )
+
+        logger.info("SummarizeRecentAdvice: sending to VLM...")
+        advice = vlm._call_vlm_text_only(prompt)
+
+        import re
+        advice = re.sub(r'^```[\w]*\n?', '', advice)
+        advice = re.sub(r'\n?```$', '', advice).strip()
+
+        logger.info(f"SummarizeRecentAdvice: advice generated ({len(advice)} chars)")
+        return SuggestAdviceResponse(advice=advice)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate advice: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Advice failed: {str(e)}")
+
+
 @app.get("/api/date-range")
 def get_date_range():
     """

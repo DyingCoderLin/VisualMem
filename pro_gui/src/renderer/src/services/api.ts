@@ -1,7 +1,10 @@
 import type {
   DailyReportListResponse,
   DailyReportPayload,
-  GenerateDailyReportResponse
+  GenerateDailyReportResponse,
+  ReportPreferences,
+  PreferencesPatch,
+  GenerateSoulResponse
 } from '../types/dailyReport'
 
 const API_BASE_URL = 'http://localhost:18080'
@@ -312,6 +315,55 @@ class ApiClient {
         body: JSON.stringify({ date })
       },
       900000
+    )
+  }
+
+  /* ---------- Report preferences ---------- */
+
+  async getReportPreferences(): Promise<ReportPreferences> {
+    return this.request<ReportPreferences>('/api/report-preferences')
+  }
+
+  async patchReportPreferences(patch: PreferencesPatch): Promise<ReportPreferences> {
+    return this.request<ReportPreferences>('/api/report-preferences', {
+      method: 'PATCH',
+      body: JSON.stringify(patch)
+    })
+  }
+
+  async setDateGoal(date: string, goal: string): Promise<ReportPreferences> {
+    return this.request<ReportPreferences>('/api/report-preferences/date-goal', {
+      method: 'POST',
+      body: JSON.stringify({ date, goal })
+    })
+  }
+
+  async generateSoul(): Promise<GenerateSoulResponse> {
+    return this.request<GenerateSoulResponse>('/api/report-preferences/soul/generate', {
+      method: 'POST',
+      body: JSON.stringify({})
+    }, 120000)
+  }
+
+  async summarizeRecent(minutes: number = 5): Promise<{ summary: string; time_range: string }> {
+    return this.request<{ summary: string; time_range: string }>(
+      '/api/summarize_recent',
+      {
+        method: 'POST',
+        body: JSON.stringify({ minutes })
+      },
+      120000
+    )
+  }
+
+  async suggestAdvice(summary: string): Promise<{ advice: string }> {
+    return this.request<{ advice: string }>(
+      '/api/summarize_recent_advice',
+      {
+        method: 'POST',
+        body: JSON.stringify({ summary })
+      },
+      120000
     )
   }
 }
